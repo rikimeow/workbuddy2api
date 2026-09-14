@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from admin import backend, platform
+from admin import backend
 from admin.config import settings
 from admin.db import get_db
 from admin.models import Account
@@ -53,9 +53,6 @@ def _apply_meta(acc: Account, auth_json: str):
         acc.enterprise_id = meta["enterprise_id"]
     if meta.get("domain"):
         acc.domain = meta["domain"]
-    # 平台归属：auth.domain 是唯一可靠信号（www.workbuddy.ai → ai，其余 → cn）。
-    # 注意 www.workbuddy.cn 是 CN 的另一个域，不能按 "workbuddy" 子串误判为 AI。
-    acc.platform = platform.detect(meta.get("domain"))
     # 号池名称：真实昵称 → uid → 兜底（昵称为 null/空串/"null" 视为缺失）
     nick = meta.get("nickname")
     if isinstance(nick, str):
@@ -87,9 +84,6 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
             "uid": a.uid,
             "enterprise_id": a.enterprise_id,
             "domain": a.domain,
-            # platform 列为空（存量行）时由 domain 实时推断，前端永远拿到有效值
-            "platform": a.platform or platform.detect(a.domain),
-            "platform_label": platform.label(a.platform or platform.detect(a.domain)),
             "status": a.status,
             "balance_total": a.balance_total,
             "balance_remain": a.balance_remain,
@@ -105,10 +99,6 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
         "available": sum(1 for i in items if i["status"] == "active" and i["balance_remain"] > 0),
         "balance_total": sum(i["balance_total"] for i in items),
         "balance_remain": sum(i["balance_remain"] for i in items),
-        "by_platform": {
-            platform.CN: sum(1 for i in items if i["platform"] == platform.CN),
-            platform.AI: sum(1 for i in items if i["platform"] == platform.AI),
-        },
     }
     return {"items": items, "summary": summary}
 
@@ -355,16 +345,13 @@ def cat_travel(acc_id: int, _: bool = Depends(require_admin), db: Session = Depe
     return {
         "id": acc.id,
         "account": acc.name,
-        "platform": acc.platform or platform.detect(acc.domain),
         "balance_remain": acc.balance_remain,
         **result,
     }
 
 
 class CatTravelBatchIn(BaseModel):
-    ids: list[int] = []              # 指定账号；为空则按 platform 过滤
-    platform: Optional[str] = None   # cn | ai | None(全部)
-    only_with_cat: bool = False      # 只处理已有猫的账号（跳过领养，仅派猫/领奖）
+    ids: list[int] = []  # 指定账号；为空则对全部启用账号执行
 
 
 @router.post("/cat-travel/batch")
@@ -378,9 +365,6 @@ def cat_travel_batch(
     if body.ids:
         q = q.filter(Account.id.in_(body.ids))
     rows = q.order_by(Account.id).all()
-    if body.platform:
-        want = platform.normalize(body.platform)
-        rows = [a for a in rows if (a.platform or platform.detect(a.domain)) == want]
 
     results = []
     total_credits = 0
@@ -401,7 +385,6 @@ def cat_travel_batch(
         results.append({
             "id": acc.id,
             "account": acc.name,
-            "platform": acc.platform or platform.detect(acc.domain),
             "balance_remain": acc.balance_remain,
             **res,
         })
@@ -427,11 +410,6 @@ def patch_account(
         acc.name = body["name"]
     if "status" in body and body["status"] in ("active", "disabled"):
         acc.status = body["status"]
-    if "platform" in body:
-        # 手动纠正平台归属（例：同 domain 下的特殊账号）；非法值忽略
-        p = str(body["platform"] or "").strip().lower()
-        if p in platform.PLATFORMS:
-            acc.platform = p
     db.commit()
     return {"id": acc.id, "ok": True}
 

@@ -111,21 +111,15 @@
       <div class="flex flex-wrap justify-between items-center mb-3 gap-2 panel-toolbar">
         <h2 class="font-semibold">账号池</h2>
         <div class="flex flex-wrap gap-2 tools">
-          <button onclick="catTravelBatch('cn')" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部 CN 账号执行：领养(+300) → 派猫 → 领奖"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 猫猫旅行(CN)</button>
-          <button onclick="catTravelBatch('ai')" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部 AI 账号执行猫猫旅行"><i class="fa-solid fa-cat mr-1 text-sky-600"></i> 猫猫旅行(AI)</button>
+          <button onclick="catTravelBatch()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部账号执行：领养(+300) → 派猫 → 领奖"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 猫猫旅行</button>
           <button onclick="scanLocal()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-magnifying-glass mr-1"></i> 扫描本机</button>
           <button onclick="refreshAll()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-rotate mr-1"></i> 全部刷新</button>
           <button onclick="openUpload()" class="text-sm px-3 py-1.5 rounded-lg btn-primary"><i class="fa-solid fa-file-import mr-1"></i> 批量上传</button>
           <button onclick="openAddAccount()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-plus mr-1"></i> 单个添加</button>
         </div>
       </div>
-      <div class="flex gap-2 mb-3 items-center">
+      <div class="flex gap-2 mb-3">
         <input id="accSearch" oninput="renderAccPage(1)" placeholder="搜索名称 / UID" class="w-full border rounded-lg px-3 py-2 text-sm" />
-        <select id="accPlatform" onchange="renderAccPage(1)" class="border rounded-lg px-3 py-2 text-sm whitespace-nowrap">
-          <option value="">全部平台</option>
-          <option value="cn">CN 国内版</option>
-          <option value="ai">AI 国外版</option>
-        </select>
       </div>
       <div class="card overflow-x-auto max-h-[70vh]">
         <table class="w-full text-sm min-w">
@@ -441,18 +435,10 @@ function pagerHtml(total, page, totalPages, fn) {
 }
 
 /* ==================== 账号 ==================== */
-/* 平台徽标：CN 国内版 / AI 国外版 */
-function platBadge(p) {
-  const isAI = p === "ai";
-  const cls = isAI ? "bg-sky-100 text-sky-700" : "bg-slate-100 text-slate-600";
-  return `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold ${cls}">${isAI ? "AI" : "CN"}</span>`;
-}
-
 function accRow(a) {
-  const plat = a.platform || "cn";
   return `
     <tr class="border-t hover:bg-slate-50">
-      <td class="px-4 py-3">${esc(a.name || "未命名")} ${platBadge(plat)}</td>
+      <td class="px-4 py-3">${esc(a.name || "未命名")}</td>
       <td class="px-4 py-3 text-slate-500 font-mono text-xs">${esc(a.uid || "-")}</td>
       <td class="px-4 py-3">${badge(a.status)}</td>
       <td class="px-4 py-3">${a.balance_total}</td>
@@ -473,11 +459,9 @@ async function loadAccounts() {
   const r = await api("/api/accounts"); if (!r.ok) return;
   const d = await r.json();
   const s = d.summary;
-  const bp = s.by_platform || { cn: 0, ai: 0 };
   $("#overview").innerHTML = `
     ${card("账号总数", s.total, "fa-users", "text-indigo-600")}
     ${card("可用账号", s.available, "fa-circle-check", "text-emerald-600")}
-    ${card("CN / AI", `${bp.cn} / ${bp.ai}`, "fa-layer-group", "text-sky-600")}
     ${card("总积分", s.balance_total, "fa-coins", "text-amber-600")}
     ${card("总剩余", s.balance_remain, "fa-wallet", "text-rose-600")}`;
   _accData = d.items || [];
@@ -485,15 +469,12 @@ async function loadAccounts() {
 }
 function renderAccPage(p) {
   const term = (_accTerm = ($("#accSearch") ? $("#accSearch").value : "").trim().toLowerCase());
-  const plat = $("#accPlatform") ? $("#accPlatform").value : "";
-  let data = _accData;
-  if (plat) data = data.filter(a => (a.platform || "cn") === plat);
-  if (term) data = data.filter(a => (a.name||"").toLowerCase().includes(term) || (a.uid||"").toLowerCase().includes(term));
+  const data = term ? _accData.filter(a => (a.name||"").toLowerCase().includes(term) || (a.uid||"").toLowerCase().includes(term)) : _accData;
   const total = data.length, totalPages = Math.max(1, Math.ceil(total / PS));
   p = Math.min(Math.max(1, p), totalPages);
   const slice = data.slice((p - 1) * PS, p * PS);
   $("#accBody").innerHTML = slice.map(accRow).join("") ||
-    `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">${term || plat ? "无匹配的账号" : "还没有账号，点「批量上传」"}</td></tr>`;
+    `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">${term ? "无匹配的账号" : "还没有账号，点「批量上传」"}</td></tr>`;
   $("#accPager").innerHTML = pagerHtml(total, p, totalPages, "renderAccPage");
 }
 async function refreshAcc(id){ const r=await api("/api/accounts/"+id+"/refresh",{method:"POST"}); toast(r.ok?"余额已刷新":"刷新失败", r.ok?"ok":"err"); if(r.ok) loadAccounts(); }
@@ -551,20 +532,19 @@ async function catTravel(id) {
   }
 }
 
-/* 猫猫旅行：批量执行（默认仅 CN；AI 需显式选择） */
-async function catTravelBatch(platformFilter) {
-  const list = _accData.filter(a => a.status === "active" && (!platformFilter || (a.platform||"cn") === platformFilter));
-  if (!list.length) { toast("没有符合条件的账号", "err"); return; }
-  const scope = platformFilter ? (platformFilter === "ai" ? "AI" : "CN") : "全部";
-  if (!confirm(`确认对 ${list.length} 个${scope}账号执行猫猫旅行？\n流程：同意协议 → 首次领养(+300) → 派出 → 领奖`)) return;
-  openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 批量猫猫旅行（${scope}）</h3>
+/* 猫猫旅行：批量执行 */
+async function catTravelBatch() {
+  const list = _accData.filter(a => a.status === "active");
+  if (!list.length) { toast("没有可执行的账号", "err"); return; }
+  if (!confirm(`确认对 ${list.length} 个账号执行猫猫旅行？\n流程：同意协议 → 首次领养(+300) → 派出 → 领奖`)) return;
+  openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 批量猫猫旅行</h3>
     <p class="text-xs text-slate-400 mb-3">共 ${list.length} 个账号，执行中请勿关闭...</p>
     <div id="catBatchBody" class="text-sm text-slate-500">执行中...</div>
     <div class="flex justify-end mt-4"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
   try {
     const r = await api("/api/accounts/cat-travel/batch", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ platform: platformFilter || null }),
+      body: JSON.stringify({}),
     });
     const { ok, data: d } = await safeJson(r);
     if (!r.ok) { $("#catBatchBody").innerHTML = `<span class="text-red-500">执行失败: ${esc(d.detail||"未知错误")}</span>`; return; }

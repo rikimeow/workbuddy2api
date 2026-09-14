@@ -16,8 +16,6 @@ class Account(Base):
     uid = Column(String(120), default="")
     enterprise_id = Column(String(120), default="")
     domain = Column(String(120), default="")
-    # 平台归属（cn | ai）。存量行为空，读取时由 domain 回退推断（见 admin.platform.detect）。
-    platform = Column(String(16), default="")
     auth_json = Column(Text, nullable=False)  # 原始 .info 内容（含 token）
     status = Column(String(16), default="active")  # active | disabled
     balance_total = Column(Integer, default=0)

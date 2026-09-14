@@ -11,7 +11,7 @@ from pathlib import Path
 
 import httpx
 
-from converter import CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
+from converter import BACKEND, CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
 
 # 连接池：减少 TLS 握手，与 Go 项目 MaxIdleConnsPerHost=20 对齐。
 HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
@@ -44,14 +44,6 @@ class AccountSession:
 
     def get_headers(self, extra: dict | None = None) -> dict:
         return self.cm.get_headers(extra=extra)
-
-    def platform(self) -> str:
-        """该账号归属平台（cn | ai）。"""
-        return self.cm.platform()
-
-    def chat_base(self) -> str:
-        """该账号的 chat / growth 域 base URL。"""
-        return self.cm.chat_base()
 
     def fetch_models(self) -> list:
         return self.cm.fetch_models()
@@ -153,7 +145,7 @@ class AccountSession:
         等业务失败走 HTTP 400，需要调用方读取 msg 判定，故这里把结果结构化返回。
         """
         headers = self.cm.get_headers()
-        url = f"{self.cm.chat_base()}{path}"
+        url = f"{BACKEND}{path}"
         try:
             with httpx.Client(timeout=15, limits=HTTP_LIMITS) as c:
                 if method.upper() == "GET":
