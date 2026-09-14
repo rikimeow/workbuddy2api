@@ -1246,6 +1246,7 @@ async function growthRunBatch(){
     label: x => x.name || x.account_id,
     detail: x => {
       if (!x.ok) return x.msg || "失败";
+      if (x.noop) return x.noop_reason || "无可做任务";
       const done = (x.tasks || []).filter(t => t.ok && !t.skipped).length;
       return done ? `完成 ${done} 个任务` : "无可做任务";
     },
@@ -1261,15 +1262,26 @@ async function growthRunBatch(){
     },
     summaryHtml: d => {
       const r = d.result || {};
+      const items = d.items || [];
+      const noopN = items.filter(x => x.noop).length;
       const parts = [`完成任务 <b>${r.tasks_done || 0}</b> 个`];
       if (r.credit) parts.push(`<b class="text-amber-600">+${r.credit} 积分</b>`);
       if (r.energy) parts.push(`+${r.energy} 能量`);
+      // 全部无可做时要说清原因，否则只有一句「完成 0 个」看着像执行失败
+      if (noopN) {
+        parts.push(noopN === d.total
+          ? `<span class="text-slate-600">${noopN} 个账号的任务已全部领完，本次无新任务</span>`
+          : `${noopN} 个账号无可做任务`);
+      }
       if (r.failed && r.failed.length) parts.push(`<span class="text-red-600">失败 ${r.failed.length} 个账号</span>`);
       return parts.join(" · ");
     },
     doneToast: d => {
       const r = d.result || {};
-      return (r.credit > 0) ? `批量完成，共获得 ${r.credit} 积分` : "批量完成，无新增积分";
+      const noopN = (d.items || []).filter(x => x.noop).length;
+      if (r.credit > 0) return `批量完成，共获得 ${r.credit} 积分`;
+      if (noopN && noopN === d.total) return `批量完成：${noopN} 个账号的任务均已领完，无新任务`;
+      return "批量完成，无新增积分";
     },
     onFinish: () => loadAccounts(),
   });

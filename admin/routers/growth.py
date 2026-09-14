@@ -151,7 +151,11 @@ def growth_accept(payload: AcceptIn, db: Session = Depends(get_db)):
 
 
 def _find_task(session, task_code: str) -> dict | None:
-    """重新读取单个任务的最新状态（accept 后刷新用）。"""
+    """重新读取单个任务的最新状态（accept 后刷新用）。
+
+    注意：每次调用都会拉一次完整任务列表（上游约 1.3~2.4 秒）。
+    轮询场景下调用频繁，因此轮询间隔不能太小，且应尽量复用已有数据。
+    """
     try:
         for t in session.growth_tasks():
             if t.get("task_code") == task_code:
@@ -198,6 +202,7 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
 
         acc_log = {"account_id": aid, "name": acc.name, "model": model,
                    "ok": True, "tasks": []}
+        snapshot = None
         try:
             with backend.AccountSession(acc.auth_json) as s:
                 tasks = s.growth_tasks()
@@ -208,6 +213,42 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                     if growth_plans.plan_for(t.get("task_code") or "").actionable
                     and t.get("accept_status") not in ("claimed", "completed")
                 ]
+
+                # 快速通道：没有可做的任务、也没有待领取的奖励时，
+                # 直接返回。拉一次列表已经是全部开销，不再多打任何请求。
+                # （号池做完后就是这种状态，10 个账号应秒过而不是等几十秒）
+                claimable = [t.get("task_code") for t in tasks
+                             if t.get("accept_status") == "completed"]
+                if not wanted and not claimable:
+                    auto_total = claimed_n = 0
+                    for t in tasks:
+                        plan = growth_plans.plan_for(t.get("task_code") or "")
+                        if not plan.actionable:
+                            continue
+                        auto_total += 1
+                        if t.get("accept_status") == "claimed":
+                            claimed_n += 1
+                    acc_log["tasks"] = [
+                        {"task_code": t.get("task_code"),
+                         "title": t.get("title") or t.get("task_code"),
+                         "level": growth_plans.plan_for(t.get("task_code") or "").level,
+                         "ok": True, "skipped": "无可做任务"}
+                        for t in tasks
+                        if growth_plans.plan_for(t.get("task_code") or "").actionable
+                    ]
+                    acc_log["noop"] = True
+                    # 把「为什么没得做」说清楚，否则界面只有一句「无可做任务」，
+                    # 看不出是「已全部领完」还是「任务被卡住了」
+                    acc_log["noop_reason"] = (
+                        f"可自动化的 {auto_total} 个任务已全部领取" if auto_total
+                        else "该账号没有可自动化的任务"
+                    )
+                    if auto_total:
+                        acc_log["skipped_claimed"] = claimed_n
+                    out.append(acc_log)
+                    if on_done:
+                        on_done(acc_log)
+                    continue
 
                 for code in wanted:
                     info = by_code.get(code) or {}
@@ -220,7 +261,9 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                         acc_log["tasks"].append(item)
                         continue
                     if not plan.actionable:
-                        item.update({"ok": False, "skipped": plan.reason or "需人工完成"})
+                        # 需人工完成的任务直接跳过，绝不发请求：
+                        # 之前这里也会走完整流程（含拉列表复查），是纯浪费
+                        item.update({"ok": True, "skipped": plan.reason or "需人工完成"})
                         acc_log["tasks"].append(item)
                         continue
 
@@ -271,7 +314,8 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                     jobrunner.wait_for(_advanced, _VERIFY_TIMEOUT, _POLL_INTERVAL)
 
                     try:
-                        now = {t.get("task_code"): t for t in s.growth_tasks()}
+                        snapshot = s.growth_tasks()
+                        now = {t.get("task_code"): t for t in snapshot}
                         cur_task = now.get(code) or {}
                         np_ = cur_task.get("progress") or {}
                         item["progress"] = f"{np_.get('current')}/{np_.get('target')}"
@@ -283,10 +327,15 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                         item["model"] = plan.model
                     acc_log["tasks"].append(item)
 
-                # 本账号跑完顺手领取，避免用户还要再点一次「领奖」
+                # 本账号跑完顺手领取，避免用户还要再点一次「领奖」。
+                # 复用最后那次复查拿到的快照，不再额外拉一次列表。
                 try:
-                    done_codes = [t.get("task_code") for t in s.growth_tasks()
-                                  if t.get("accept_status") == "completed"]
+                    if snapshot is not None:
+                        done_codes = [t.get("task_code") for t in snapshot
+                                      if t.get("accept_status") == "completed"]
+                    else:
+                        done_codes = [t.get("task_code") for t in s.growth_tasks()
+                                      if t.get("accept_status") == "completed"]
                     claimed = []
                     for code in done_codes:
                         try:
@@ -297,7 +346,9 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                                             "energy": d.get("energy") or 0})
                         except Exception:
                             pass
-                        time.sleep(_EVENT_GAP)
+                        # 只在真要领多个时才留间隔
+                        if len(done_codes) > 1:
+                            time.sleep(_EVENT_GAP)
                     if claimed:
                         acc_log["claimed"] = claimed
                         acc_log["credit"] = sum(c.get("credit") or 0 for c in claimed)
@@ -309,6 +360,10 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
         except Exception as e:
             acc_log.update({"ok": False, "msg": str(e)})
         out.append(acc_log)
+        # 每跑完一个账号就上报进度。之前只在「账号不存在」分支调用，
+        # 正常路径从不回调，前端因此一直停在 0/N，直到全部跑完才跳到 N/N。
+        if on_done:
+            on_done(acc_log)
         time.sleep(_ACCOUNT_GAP)
 
     db.commit()
