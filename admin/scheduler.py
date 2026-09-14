@@ -34,7 +34,37 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         return models_router._do_sync_models(db)
     if task == "daily_checkin":
         return run_daily_checkin(db, schedule)
+    if task == "refresh_growth_tasks":
+        return run_refresh_growth_tasks()
     return {"task": task, "error": "未知任务类型"}
+
+
+def run_refresh_growth_tasks() -> dict:
+    """刷新成长任务定义缓存。
+
+    任务定义对所有账号一致，所以只需一个可用登录态即可（不遍历账号，
+    避免无谓的上游请求）。失败时保留旧缓存，不影响面板使用。
+    """
+    from admin.routers import growth as growth_router
+
+    try:
+        db = SessionLocal()
+        try:
+            data = growth_router.growth_tasks(refresh=True, db=db)
+        finally:
+            db.close()
+    except Exception as e:
+        return {"task": "refresh_growth_tasks", "ok": False, "error": str(e)}
+
+    tasks = data.get("tasks") or []
+    return {
+        "task": "refresh_growth_tasks",
+        "ok": True,
+        "total": len(tasks),
+        "actionable": sum(1 for t in tasks if t.get("actionable")),
+        "synced_at": data.get("synced_at"),
+        "source_account_id": data.get("source_account_id"),
+    }
 
 
 def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
@@ -136,6 +166,8 @@ def seed_defaults(db):
                         interval_minutes=1440, enabled=1, next_run_at=now))
         db.add(Schedule(name="每日签到领取积分", task="daily_checkin",
                         interval_minutes=1440, enabled=1, next_run_at=now))
+        db.add(Schedule(name="每日更新成长任务列表", task="refresh_growth_tasks",
+                        interval_minutes=1440, enabled=1, next_run_at=now))
         db.commit()
 
 
@@ -152,12 +184,26 @@ def ensure_daily_checkin(db):
         db.commit()
 
 
+def ensure_growth_tasks_schedule(db):
+    """缺「每日更新成长任务列表」时补上（幂等）。
+
+    任务列表会随运营活动上下线而变化（如 black_cat 这类限时活动），
+    每天刷新一次可让面板与策略分级跟上上游变化。
+    """
+    if db.query(Schedule).filter(Schedule.task == "refresh_growth_tasks").count() == 0:
+        now = datetime.utcnow()
+        db.add(Schedule(name="每日更新成长任务列表", task="refresh_growth_tasks",
+                        interval_minutes=1440, enabled=1, next_run_at=now))
+        db.commit()
+
+
 def start_scheduler():
     """在 FastAPI 启动时调用：播种默认任务并拉起守护线程。"""
     try:
         db = SessionLocal()
         seed_defaults(db)
         ensure_daily_checkin(db)
+        ensure_growth_tasks_schedule(db)
         db.close()
     except Exception:
         pass

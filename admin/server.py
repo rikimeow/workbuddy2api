@@ -11,7 +11,8 @@ from pydantic import BaseModel
 from admin.config import settings
 from admin.db import ensure_database, init_db, SessionLocal
 from admin.models import SystemSetting
-from admin.routers import accounts, groups, keys, logs, models, proxy, schedules, stats, sync
+from admin.routers import (accounts, groups, growth, keys, logs, models, proxy,
+                           schedules, stats, sync)
 from admin.ratelimit import clear_failures, get_client_ip, is_locked, record_failure
 from admin.security import (
     create_admin_token,
@@ -66,6 +67,7 @@ app.include_router(schedules.router)
 app.include_router(logs.router)
 app.include_router(groups.router)
 app.include_router(stats.router)
+app.include_router(growth.router)
 
 
 @app.on_event("startup")

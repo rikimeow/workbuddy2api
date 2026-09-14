@@ -182,6 +182,7 @@
       <div class="flex flex-wrap justify-between items-center mb-3 gap-2 panel-toolbar">
         <h2 class="font-semibold">账号池</h2>
         <div class="flex flex-wrap gap-2 tools">
+          <button onclick="growthRunBatch()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部账号：自动参与并完成可自动化的成长任务，然后领奖"><i class="fa-solid fa-seedling mr-1 text-emerald-600"></i> 批量做任务</button>
           <button onclick="catTravelBatch()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部账号执行：领养(+300) → 派猫 → 领奖"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 猫猫旅行</button>
           <button onclick="scanLocal()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-magnifying-glass mr-1"></i> 扫描本机</button>
           <button onclick="refreshAll()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-rotate mr-1"></i> 全部刷新</button>
@@ -656,7 +657,15 @@ function toast(msg, type = "ok") {
   $("#toasts").appendChild(el);
   setTimeout(() => el.remove(), 3200);
 }
-function openModal(html) { $("#modalBox").innerHTML = html; $("#modal").classList.remove("hidden"); $("#modal").classList.add("flex"); }
+function openModal(html, widthClass) {
+  const box = $("#modalBox");
+  // 只移除「上一次 openModal 设置的」宽度类，保留模板里的默认 max-w-6xl
+  box.classList.remove("max-w-6xl", "max-w-4xl", "max-w-3xl", "max-w-2xl");
+  box.classList.add(widthClass || "max-w-6xl");
+  box.innerHTML = html;
+  $("#modal").classList.remove("hidden");
+  $("#modal").classList.add("flex");
+}
 function closeModal() { $("#modal").classList.add("hidden"); $("#modal").classList.remove("flex"); }
 function copyText(sel){ const i = $(sel); if(!i) return; i.select(); navigator.clipboard?.writeText(i.value) || document.execCommand("copy"); toast("已复制"); }
 
@@ -764,6 +773,7 @@ function accRow(a) {
       <td class="px-4 py-3 font-medium ${a.balance_remain>0?'text-emerald-600':'text-red-500'}">${a.balance_remain}</td>
       <td class="px-4 py-3 text-slate-400 text-xs whitespace-nowrap">${fmtTime(a.last_sync_at)}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
+        <button onclick="growthTasks(${a.id},'${esc(a.name||'')}')" class="text-emerald-600 hover:text-emerald-800 mr-1" title="成长任务（查看/完成/领奖）"><i class="fa-solid fa-seedling"></i></button>
         <button onclick="catTravel(${a.id})" class="text-pink-600 hover:text-pink-800 mr-1" title="猫猫旅行（领养/派猫/领奖）"><i class="fa-solid fa-cat"></i></button>
         <button onclick="viewCreditDetails(${a.id},'${esc(a.name||'')}')" class="text-amber-600 hover:text-amber-800 mr-1" title="查看积分明细"><i class="fa-solid fa-list-ul"></i></button>
         <button onclick="viewRequestUsage(${a.id},'${esc(a.name||'')}')" class="text-blue-600 hover:text-blue-800 mr-1" title="请求用量"><i class="fa-solid fa-chart-line"></i></button>
@@ -888,6 +898,268 @@ async function catTravelBatch() {
   } catch (e) {
     $("#catBatchBody").innerHTML = `<span class="text-red-500">执行异常: ${esc(String(e))}</span>`;
   }
+}
+
+/* ==========================================================================
+   成长任务
+   --------------------------------------------------------------------------
+   任务进度由「模型请求体里的 extra_vars.growthEvent」驱动，走的是与正常
+   对话完全相同的接口，因此不需要客户端参与、可全自动完成。
+   已实测可自动完成的任务见后端 admin/growth_plans.py 的策略表；其余任务
+   在面板上标为「复杂」，仍可点击尝试，失败会自动说明原因。
+   ========================================================================== */
+
+/* 难度标签样式 */
+function growthLevelBadge(level, label){
+  const cls = {
+    auto:  "bg-emerald-50 text-emerald-700 border-emerald-200",
+    multi: "bg-sky-50 text-sky-700 border-sky-200",
+    manual:"bg-amber-50 text-amber-700 border-amber-200",
+    skip:  "bg-slate-100 text-slate-500 border-slate-200",
+  }[level] || "bg-slate-100 text-slate-500 border-slate-200";
+  return `<span class="text-xs px-1.5 py-0.5 rounded border ${cls} whitespace-nowrap">${esc(label||level)}</span>`;
+}
+
+/* 任务状态标签 */
+function growthStatusBadge(status){
+  const map = {
+    claimed:      ["已领取", "text-slate-400"],
+    completed:    ["待领取", "text-amber-600 font-semibold"],
+    in_progress:  ["进行中", "text-sky-600"],
+    accepted:     ["已参与", "text-slate-500"],
+    not_accepted: ["未参与", "text-slate-400"],
+  };
+  const [label, cls] = map[status] || [status || "-", "text-slate-400"];
+  return `<span class="text-xs ${cls}">${esc(label)}</span>`;
+}
+
+/* 单账号任务弹窗 */
+async function growthTasks(id, name){
+  openModal(
+    `<h3 class="font-bold mb-1"><i class="fa-solid fa-seedling mr-1 text-emerald-600"></i> 成长任务 — ${esc(name)}</h3>
+     <p class="text-xs text-slate-400 mb-3">加载中...</p>
+     <div id="growthBody" class="text-sm"></div>`, "max-w-4xl");
+
+  try {
+    const r = await api("/api/growth/accounts/" + id + "/tasks");
+    const { ok, data: d } = await safeJson(r);
+    if (!r.ok) {
+      $("#growthBody").innerHTML =
+        `<p class="text-red-500">获取失败: ${esc(d.detail || "未知错误")}</p>
+         <div class="flex justify-end mt-4"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`;
+      return;
+    }
+    window._growthTaskAccount = id;
+    renderGrowthTasks(d);
+  } catch (e) {
+    $("#growthBody").innerHTML = `<p class="text-red-500">请求异常: ${esc(String(e))}</p>`;
+  }
+}
+
+function renderGrowthTasks(d){
+  const s = d.summary || {};
+  const tasks = d.tasks || [];
+  // 可执行 = 标为可自动 且 未领取
+  const runnable = tasks.filter(t => t.actionable && t.accept_status !== "claimed");
+  const claimable = tasks.filter(t => t.accept_status === "completed");
+
+  const rows = tasks.map(t => {
+    const pr = t.progress || {};
+    const prog = (pr.target != null) ? `${pr.current || 0}/${pr.target}` : "-";
+    const canRun = t.actionable && t.accept_status !== "claimed";
+    const canClaim = t.accept_status === "completed";
+    return `<tr class="border-b hover:bg-slate-50">
+      <td class="px-3 py-2">
+        <div class="font-medium">${esc(t.title || t.task_code)}</div>
+        <div class="text-xs text-slate-400">${esc(t.task_code)}</div>
+      </td>
+      <td class="px-3 py-2">${growthLevelBadge(t.level, t.level_label)}</td>
+      <td class="px-3 py-2">${growthStatusBadge(t.accept_status)}</td>
+      <td class="px-3 py-2 text-slate-500 text-xs">${esc(prog)}</td>
+      <td class="px-3 py-2 text-amber-600 font-medium">${t.reward_credit || 0}</td>
+      <td class="px-3 py-2 text-xs text-slate-400 max-w-[16rem]">${esc(t.strategy || "")}</td>
+      <td class="px-3 py-2 text-right whitespace-nowrap">
+        ${canClaim ? `<button onclick="growthDoClaim(${d.account_id},'${esc(t.task_code)}')" class="text-xs px-2 py-1 rounded border border-amber-300 text-amber-700 hover:bg-amber-50">领奖</button>` : ""}
+        ${canRun ? `<button onclick="growthDoRun(${d.account_id},'${esc(t.task_code)}')" class="text-xs px-2 py-1 rounded border border-emerald-300 text-emerald-700 hover:bg-emerald-50 ml-1">完成</button>` : ""}
+      </td>
+    </tr>`;
+  }).join("");
+
+  $("#growthBody").innerHTML = `
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+      <div class="rounded-lg border px-3 py-2"><div class="text-xs text-slate-400">总任务</div><div class="font-semibold">${s.total || 0}</div></div>
+      <div class="rounded-lg border px-3 py-2"><div class="text-xs text-slate-400">已完成</div><div class="font-semibold text-emerald-600">${s.done || 0}</div></div>
+      <div class="rounded-lg border px-3 py-2"><div class="text-xs text-slate-400">待领取</div><div class="font-semibold text-amber-600">${s.claimable || 0}</div></div>
+      <div class="rounded-lg border px-3 py-2"><div class="text-xs text-slate-400">可领积分</div><div class="font-semibold text-amber-600">${s.claimable_credit || 0}</div></div>
+    </div>
+    <div class="text-xs text-slate-400 mb-2">
+      等级 ${(d.profile && d.profile.level) || "-"} · 已自动完成 ${s.actionable || 0} 个可自动化任务
+    </div>
+    <div class="flex flex-wrap gap-2 mb-3">
+      <button onclick="growthDoRun(${d.account_id})" ${runnable.length ? "" : "disabled"}
+        class="text-sm px-3 py-1.5 rounded-lg border border-emerald-300 text-emerald-700 hover:bg-emerald-50 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i class="fa-solid fa-bolt mr-1"></i> 完成可自动化任务 (${runnable.length})</button>
+      <button onclick="growthDoClaim(${d.account_id})" ${claimable.length ? "" : "disabled"}
+        class="text-sm px-3 py-1.5 rounded-lg border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i class="fa-solid fa-gift mr-1"></i> 领取全部奖励 (${claimable.length})</button>
+      <button onclick="growthTasks(${d.account_id},'${esc(d.name || "")}')" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50">
+        <i class="fa-solid fa-rotate mr-1"></i> 刷新</button>
+    </div>
+    <div class="card overflow-auto max-h-[55vh]">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-left sticky top-0">
+          <tr>
+            <th class="px-3 py-2">任务</th><th class="px-3 py-2">难度</th>
+            <th class="px-3 py-2">状态</th><th class="px-3 py-2">进度</th>
+            <th class="px-3 py-2">积分</th><th class="px-3 py-2">说明</th>
+            <th class="px-3 py-2"></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="flex justify-between items-center mt-3">
+      <p class="text-xs text-slate-400">「完成」只对已实测可自动化的任务开放；标为「复杂」的任务需在客户端手动完成。</p>
+      <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button>
+    </div>`;
+}
+
+/* 执行任务（taskCode 为空 = 全部可自动化任务） */
+async function growthDoRun(id, taskCode){
+  const label = taskCode ? `任务 ${taskCode}` : "全部可自动化任务";
+  if (!await uiConfirm({kind:"info", danger:false, title:"执行成长任务",
+      message:`确认对账号执行「${label}」？\n将自动参与并触发完成，随后可领奖。`,
+      okText:"开始执行"})) return;
+
+  toast("执行中，请稍候...", "ok");
+  try {
+    const r = await api("/api/growth/run", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_ids: [id], task_codes: taskCode ? [taskCode] : null }),
+    });
+    const { ok, data: d } = await safeJson(r);
+    if (!r.ok) { toast("执行失败: " + (d.detail || "未知错误"), "err"); return; }
+    const a = (d.results || [])[0] || {};
+    const lines = (a.tasks || []).map(t => {
+      const icon = t.skipped ? '<i class="fa-solid fa-minus-circle text-slate-400"></i>'
+                             : t.ok ? '<i class="fa-solid fa-circle-check text-emerald-500"></i>'
+                                    : '<i class="fa-solid fa-circle-xmark text-red-500"></i>';
+      const note = t.skipped ? esc(t.skipped)
+                             : `触发 ${t.fired}/${t.times} 次 · ${esc(t.progress || "")} ${esc(t.status || "")}`;
+      return `<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
+                ${icon}<span class="flex-1">${esc(t.title || t.task_code)}</span>
+                <span class="text-xs text-slate-500">${note}</span></div>`;
+    }).join("") || '<div class="text-slate-400 py-2">没有可自动完成的任务</div>';
+
+    // 完成任务后自动领奖，形成闭环
+    let claimMsg = "";
+    try {
+      const r2 = await api("/api/growth/claim", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account_ids: [id] }),
+      });
+      const { data: d2 } = await safeJson(r2);
+      const a2 = (d2.results || [])[0] || {};
+      if (a2.total_credit > 0) claimMsg = `，并自动领取 ${a2.total_credit} 积分`;
+    } catch(e){}
+
+    openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-seedling mr-1 text-emerald-600"></i> 执行结果</h3>
+      <p class="text-xs text-slate-400 mb-3">使用模型 ${esc(d.model || "-")}（免费 0 倍率，成本为 0）</p>
+      <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto">${lines}</div>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="growthTasks(${id},'')" class="px-3 py-1.5 rounded-lg border text-sm">查看任务</button>
+        <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg btn-primary text-sm">知道了</button>
+      </div>`);
+    toast("任务执行完成" + claimMsg, "ok");
+    loadAccounts();
+  } catch (e) {
+    toast("执行异常: " + String(e), "err");
+  }
+}
+
+/* 领取奖励（taskCode 为空 = 所有已完成待领取） */
+async function growthDoClaim(id, taskCode){
+  try {
+    const r = await api("/api/growth/claim", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_ids: [id], task_codes: taskCode ? [taskCode] : null }),
+    });
+    const { ok, data: d } = await safeJson(r);
+    if (!r.ok) { toast("领取失败: " + (d.detail || "未知错误"), "err"); return; }
+    const a = (d.results || [])[0] || {};
+    const got = a.total_credit || 0;
+    if (got > 0) toast(`领取成功，获得 ${got} 积分`, "ok");
+    else if ((a.claimed || []).every(c => c.already)) toast("奖励此前已领取", "ok");
+    else toast("没有可领取的奖励", "ok");
+    loadAccounts();
+    // 刷新弹窗内容
+    const cur = window._growthTaskAccount;
+    if (cur === id) growthTasks(id, "");
+  } catch (e) {
+    toast("领取异常: " + String(e), "err");
+  }
+}
+
+/* 批量做任务：所有 active 账号，逐个执行 + 领奖 */
+async function growthRunBatch(){
+  const r0 = await api("/api/accounts");
+  if (!r0.ok) { toast("获取账号列表失败", "err"); return; }
+  const d0 = await r0.json();
+  const list = (d0.accounts || d0.items || []).filter(a => a.status === "active");
+  if (!list.length) { toast("没有可用账号", "err"); return; }
+
+  if (!await uiConfirm({kind:"warn", danger:true, title:"批量做成长任务",
+      message:`确认对 ${list.length} 个账号批量执行？\n流程：自动参与 → 触发完成 → 领取奖励。\n仅处理已实测可自动化的任务，其余跳过。`,
+      okText:"开始执行"})) return;
+
+  openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-seedling mr-1 text-emerald-600"></i> 批量做任务</h3>
+    <p class="text-xs text-slate-400 mb-3">共 ${list.length} 个账号，串行执行中请勿关闭...</p>
+    <div id="growthBatchBody" class="text-sm text-slate-500">执行中...</div>
+    <div class="flex justify-end mt-4"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
+
+  let totalCredit = 0, okCount = 0;
+  const rows = [];
+  for (const a of list) {
+    let credit = 0, note = "";
+    try {
+      const r1 = await api("/api/growth/run", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ account_ids: [a.id] }),
+      });
+      const { data: d1 } = await safeJson(r1);
+      const ran = (d1.results || [])[0] || {};
+      const done = (ran.tasks || []).filter(t => t.ok && !t.skipped).length;
+      note = `完成 ${done} 个`;
+
+      const r2 = await api("/api/growth/claim", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ account_ids: [a.id] }),
+      });
+      const { data: d2 } = await safeJson(r2);
+      credit = ((d2.results || [])[0] || {}).total_credit || 0;
+      totalCredit += credit;
+      if (credit > 0) okCount++;
+    } catch (e) {
+      note = "异常: " + String(e).slice(0, 40);
+    }
+    rows.push(`<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
+        ${credit > 0 ? '<i class="fa-solid fa-circle-check text-emerald-500"></i>'
+                     : '<i class="fa-solid fa-minus-circle text-slate-400"></i>'}
+        <span class="flex-1">${esc(a.name || a.uid || a.id)}</span>
+        <span class="text-xs text-slate-500">${esc(note)}</span>
+        ${credit > 0 ? `<span class="font-semibold text-amber-600">+${credit}</span>` : ""}
+      </div>`);
+    $("#growthBatchBody").innerHTML =
+      `<div class="mb-2 font-semibold ${totalCredit>0?'text-emerald-600':'text-slate-500'}">
+         已处理 ${rows.length}/${list.length}，合计获得 ${totalCredit} 积分</div>
+       <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto">${rows.join("")}</div>`;
+  }
+  $("#growthBatchBody").innerHTML =
+    `<div class="mb-2 font-semibold ${totalCredit>0?'text-emerald-600':'text-slate-500'}">
+       共 ${list.length} 个账号，${okCount} 个有收益，合计获得 ${totalCredit} 积分</div>
+     <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto">${rows.join("")}</div>`;
+  toast(totalCredit > 0 ? `批量完成，共获得 ${totalCredit} 积分` : "批量完成，无新增积分", "ok");
+  loadAccounts();
 }
 
 /* 积分明细 */
