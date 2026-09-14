@@ -43,6 +43,38 @@ class ExportIn(BaseModel):
     include_disabled: bool = False
 
 
+def _uid_of(auth_json: str) -> str:
+    """从 auth_json 里取 uid；取不到返回空串。"""
+    try:
+        return (backend.parse_auth_meta(auth_json) or {}).get("uid") or ""
+    except Exception:
+        return ""
+
+
+def _existing_uid_index(db: Session) -> dict[str, Account]:
+    """uid -> 已存在的账号记录（同 uid 有多条时保留 id 最小的那条）。
+
+    历史遗留的重复记录不影响导入：无论哪条都会命中，从而跳过重复导入。
+    """
+    idx: dict[str, Account] = {}
+    for a in db.query(Account).order_by(Account.id.asc()).all():
+        if not a.uid:
+            continue
+        idx.setdefault(a.uid, a)   # 先到先得 = id 最小
+    return idx
+
+
+def _find_dup(db: Session, auth_json: str) -> Account | None:
+    """按 uid 查这个凭据是否已在号池里。"""
+    uid = _uid_of(auth_json)
+    if not uid:
+        return None
+    return (db.query(Account)
+            .filter(Account.uid == uid)
+            .order_by(Account.id.asc())
+            .first())
+
+
 def _export_items(rows: list[Account]) -> list[str]:
     """把账号记录还原成 .info 原文列表。
 
@@ -169,6 +201,13 @@ def add_account(body: AccountIn, _: bool = Depends(require_admin), db: Session =
         json.loads(body.auth_json)
     except Exception:
         raise HTTPException(status_code=400, detail="auth_json 不是合法 JSON")
+    # 按 uid 去重：同一个人重复添加只会产生垃圾记录，
+    # 而且会让批量任务对同一个号跑多次（白等、看起来像卡住）
+    dup = _find_dup(db, body.auth_json)
+    if dup:
+        return {"id": dup.id, "name": dup.name, "ok": True,
+                "duplicated": True,
+                "message": f"该账号已存在（id={dup.id}），未重复添加"}
     acc = Account(name=body.name) if body.name else Account()
     _apply_meta(acc, body.auth_json)
     db.add(acc)
@@ -176,13 +215,17 @@ def add_account(body: AccountIn, _: bool = Depends(require_admin), db: Session =
     db.refresh(acc)
     _refresh_balance(acc)
     db.commit()
-    return {"id": acc.id, "name": acc.name, "ok": True}
+    return {"id": acc.id, "name": acc.name, "ok": True, "duplicated": False}
 
 
 @router.post("/batch")
 def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
     added = 0
+    skipped = 0
     errors = []
+    # 一次性取出已有 uid，避免每条都查库；
+    # 同时把自己刚加进去的 uid 也塞进去，这样同一批里的重复项也能拦住
+    seen = _existing_uid_index(db)
     for it in body.items:
         if not it.auth_json or not it.auth_json.strip():
             continue
@@ -191,17 +234,78 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
         except Exception:
             errors.append("跳过一条：auth_json 非法 JSON")
             continue
+        uid = _uid_of(it.auth_json)
+        if uid and uid in seen:
+            skipped += 1
+            continue
         acc = Account(name=it.name) if it.name else Account()
         _apply_meta(acc, it.auth_json)
         db.add(acc)
         db.commit()
         db.refresh(acc)
+        if uid:
+            seen[uid] = acc
         if _refresh_balance(acc):
             added += 1
         else:
             errors.append(f"账号 {acc.id} 余额刷新失败（凭据可能失效）")
         db.commit()
-    return {"added": added, "errors": errors}
+    return {"added": added, "skipped": skipped, "errors": errors}
+
+
+@router.get("/duplicates")
+def list_duplicates(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """列出 uid 重复的账号组（每组保留一条，其余是可清理的冗余）。"""
+    rows = db.query(Account).order_by(Account.id.asc()).all()
+    groups: dict[str, list[Account]] = {}
+    for a in rows:
+        if a.uid:
+            groups.setdefault(a.uid, []).append(a)
+
+    out = []
+    for uid, grp in groups.items():
+        if len(grp) < 2:
+            continue
+        keep = grp[0]                      # id 最小 = 最早创建，通常历史记录最全
+        out.append({
+            "uid": uid,
+            "keep": {"id": keep.id, "name": keep.name,
+                     "created_at": _dt(keep.created_at)},
+            "remove": [{"id": a.id, "name": a.name,
+                        "created_at": _dt(a.created_at)} for a in grp[1:]],
+        })
+    return {
+        "total": len(rows),
+        "unique": len(groups),
+        "groups": out,
+        "redundant": sum(len(g["remove"]) for g in out),
+    }
+
+
+@router.post("/dedupe")
+def dedupe_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """清理重复账号：同一 uid 只保留 id 最小（最早创建）的那条。
+
+    为什么保留最早的那条：使用记录（last_used_at）与既有关联数据都挂在
+    老记录上，重复导入产生的新记录这些字段都是空的，删掉损失最小。
+    """
+    rows = db.query(Account).order_by(Account.id.asc()).all()
+    groups: dict[str, list[Account]] = {}
+    for a in rows:
+        if a.uid:
+            groups.setdefault(a.uid, []).append(a)
+
+    removed: list[dict] = []
+    for uid, grp in groups.items():
+        for a in grp[1:]:
+            removed.append({"id": a.id, "name": a.name, "uid": uid})
+            db.delete(a)
+    db.commit()
+    return {"removed": len(removed), "kept": len(groups), "items": removed}
+
+
+def _dt(v) -> str:
+    return v.strftime("%Y-%m-%d %H:%M:%S") if v else ""
 
 
 @router.get("/scan-local")
@@ -270,8 +374,9 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
             if not (f.endswith(".bak") or ".bak-" in f)
         ]
     added = 0
+    skipped = 0
     errors = []
-    seen = {a.uid for a in db.query(Account).all()}  # 已存在的 uid 跳过，避免重复导入
+    seen = _existing_uid_index(db)   # 已存在的 uid 跳过；同批内也去重
     for name in names:
         path = os.path.join(d, name)
         if not os.path.isfile(path):
@@ -286,19 +391,21 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
         meta = backend.parse_auth_meta(auth)
         uid = meta.get("uid")
         if uid and uid in seen:
+            skipped += 1
             continue  # 同 uid 多文件 / 已存在，只导入一次
-        seen.add(uid)
         acc = Account()
         _apply_meta(acc, auth)
         db.add(acc)
         db.commit()
         db.refresh(acc)
+        if uid:
+            seen[uid] = acc
         if _refresh_balance(acc):
             added += 1
         else:
             errors.append(f"账号 {acc.id}({acc.name}) 余额刷新失败（凭据可能失效）")
         db.commit()
-    return {"added": added, "errors": errors}
+    return {"added": added, "skipped": skipped, "errors": errors}
 
 
 @router.get("/{acc_id}/export")

@@ -1514,13 +1514,23 @@ async function scanLocal(){
 async function importOne(file){
   const r = await api("/api/accounts/import-local",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({files:[decodeURIComponent(file)]})});
   const d = await r.json().catch(()=>({}));
-  if(r.ok){ toast(`已导入 ${d.added||0} 个`); closeModal(); loadAccounts(); }
+  if(r.ok){
+    toast(d.skipped ? `该账号已在号池，已跳过` : `已导入 ${d.added||0} 个`,
+          d.skipped ? "err" : "ok");
+    closeModal(); loadAccounts();
+  }
   else toast("导入失败","err");
 }
 async function importAll(){
   const r = await api("/api/accounts/import-local",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({all:true})});
   const d = await r.json().catch(()=>({}));
-  if(r.ok){ toast(`已导入 ${d.added||0} 个${d.errors&&d.errors.length?`（${d.errors.length} 个失败）`:''}`); closeModal(); loadAccounts(); }
+  if(r.ok){
+    const parts = [`已导入 ${d.added||0} 个`];
+    if(d.skipped) parts.push(`跳过 ${d.skipped} 个重复`);
+    if(d.errors && d.errors.length) parts.push(`${d.errors.length} 个失败`);
+    toast(parts.join("，"));
+    closeModal(); loadAccounts();
+  }
   else toast("导入失败","err");
   if(d.errors) console.warn(d.errors);
 }
@@ -1590,7 +1600,15 @@ async function submitUpload(){
   const body = { items: allItems.map(x => ({ name: x.account?.nickname || x.name || "", auth_json: JSON.stringify(x) })) };
   const r = await api("/api/accounts/batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const d = await r.json().catch(()=>({}));
-  closeModal(); toast(r.ok?`已添加 ${d.added||0} 个账号${d.errors&&d.errors.length?`（${d.errors.length} 个失败）`:''}`:"上传失败", r.ok?"ok":"err");
+  if(r.ok){
+    // 去重跳过要说清楚，否则「导入 20 个只加了 14 个」会让人以为丢数据
+    const parts = [`已添加 ${d.added||0} 个账号`];
+    if(d.skipped) parts.push(`跳过 ${d.skipped} 个重复`);
+    if(d.errors && d.errors.length) parts.push(`${d.errors.length} 个失败`);
+    toast(parts.join("，"), "ok");
+  } else {
+    toast("上传失败", "err");
+  }
   if(d.errors && d.errors.length) console.warn(d.errors);
   loadAccounts();
 }
@@ -1712,7 +1730,12 @@ async function submitAddAccount(){
   const auth_json = $("#accJson").value.trim();
   if(!auth_json){ toast("请粘贴 JSON","err"); return; }
   const r = await api("/api/accounts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:$("#accName").value||"",auth_json})});
-  closeModal(); toast(r.ok?"已添加":"添加失败", r.ok?"ok":"err"); if(r.ok) loadAccounts();
+  const d = await r.json().catch(()=>({}));
+  closeModal();
+  if(!r.ok){ toast("添加失败", "err"); return; }
+  // 按 uid 去重：已存在时不再新增记录，并明确告诉用户
+  if(d.duplicated){ toast(d.message || "该账号已存在，未重复添加", "err"); return; }
+  toast("已添加", "ok"); loadAccounts();
 }
 
 /* ==================== Keys ==================== */

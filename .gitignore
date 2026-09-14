@@ -39,10 +39,15 @@ logs/
 ssh_exec.py
 ssh_run.py
 ssh_sync.py
+ssh_probe_backup.py
 sync_auth.py
 sync_auth.bat
 start_admin.bat
 start_converter.bat
+
+# ===== 数据库备份（含真实账号凭据 token，禁止提交） =====
+backup_*.sql
+*.sql.gz
 
 # ===== 测试文件（不提交到仓库；本地可保留用于回归测试） =====
 test_anthropic_adapter.py
