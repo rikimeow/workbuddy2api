@@ -86,7 +86,8 @@ TASK_PLANS: dict[str, TaskPlan] = {
     ),
     "expert_5": TaskPlan(
         "expert_5", MANUAL, [],
-        "召唤专家：未找到有效事件，可能需真实专家会话",
+        "召唤专家：召唤=本地专家包的下载+激活（ExpertSummonService），"
+        "非服务端事件；埋点 expert_summoned 不驱动进度，后端无 summon 接口",
     ),
     "expert_5_paid": TaskPlan(
         "expert_5_paid", MANUAL, [],
@@ -98,7 +99,7 @@ TASK_PLANS: dict[str, TaskPlan] = {
     ),
     "Hp_Appearance": TaskPlan(
         "Hp_Appearance", MANUAL, [],
-        "和平精英主题：未找到有效事件",
+        "和平精英主题：需桌面端「菜单-外观」切换主题，纯客户端本地状态",
     ),
     "template_5": TaskPlan(
         "template_5", MANUAL, ["agent_task_created_with_template"],
