@@ -21,7 +21,7 @@ converter 已在 admin/server.py 中挂载到 /gw 前缀，因此无需再单独
 环境变量（可选，覆盖默认；部署务必设置）:
   ADMIN_PORT / ADMIN_HOST
   ADMIN_JWT_SECRET  : 生产务必覆盖为 >=32 字节随机串（默认是弱密钥，会报警）
-  ADMIN_USERNAME / ADMIN_PASSWORD     : 后台登录凭据（默认 admin / admin123）
+  ADMIN_USERNAME / ADMIN_PASSWORD     : 后台登录凭据（**必填**，无默认值；未配置则登录 503）
   CONVERTER_DESENSITIZE / CONVERTER_LOG : 内嵌网关的脱敏开关与日志路径
 """
 from __future__ import annotations
@@ -129,8 +129,9 @@ def main() -> None:
     secret = os.getenv("ADMIN_JWT_SECRET", "")
     if not secret or secret.startswith("workbuddy-admin-jwt-secret-please-change"):
         _log("⚠️  未设置强 ADMIN_JWT_SECRET，将使用默认弱密钥 —— 部署请务必通过环境变量覆盖！")
-    if os.getenv("ADMIN_PASSWORD", "") in ("", "admin123"):
-        _log("⚠️  ADMIN_PASSWORD 仍为默认弱口令，部署请通过环境变量设置强密码。")
+    if not os.getenv("ADMIN_PASSWORD", "") or not os.getenv("ADMIN_USERNAME", ""):
+        _log("⚠️  未配置 ADMIN_USERNAME / ADMIN_PASSWORD，后台登录将返回 503。")
+        _log("    请在 .env 中设置这两项后重启（已不再提供 admin/admin123 默认口令）。")
 
     procs: list[tuple[str, subprocess.Popen]] = []
     stop = threading.Event()

@@ -39,8 +39,15 @@ class Settings:
     )
 
     # 管理后台登录
-    ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+    #
+    # 不设默认值：留空表示「必须由部署方显式配置」。
+    # 之前默认 admin / admin123，服务又默认监听 0.0.0.0，等于把号池额度
+    # 向整个网络开放。现在未配置时登录会直接失败，而不是退化成一个
+    # 众所周知的口令（见 admin/server.py 的启动校验与 login）。
+    ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
+    # 显式配置的环境变量优先于数据库中的历史密码。这样改 .env 后无需手动改库。
+    ADMIN_PASSWORD_FROM_ENV = "ADMIN_PASSWORD" in os.environ
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
     # 生产环境务必在 .env 中设置 ADMIN_JWT_SECRET 为 >=32 字节的随机串；
     # 未设置时回退到开发弱密钥并输出告警。
     _jwt = os.getenv("ADMIN_JWT_SECRET")

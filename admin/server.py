@@ -21,6 +21,8 @@ from admin.security import (
     verify_password,
 )
 
+logger = logging.getLogger("admin.server")
+
 # 可选内嵌独立网关 converter：把它挂到 /gw 前缀下，实现「单端口单进程」部署。
 # converter 用本机桌面登录态直连后端，并额外提供 /v1/responses、/v1/messages（Anthropic）、
 # /v1/balance 等协议；与管理后台自带的 /v1/chat/completions、/v1/models（带 Key 配额托管）
@@ -72,6 +74,15 @@ app.include_router(growth.router)
 
 @app.on_event("startup")
 def _startup():
+    # 未配置登录凭据时给出醒目告警：此时后台登录一律 503，不会退化成空口令
+    if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
+        logger.warning(
+            "未配置 ADMIN_USERNAME / ADMIN_PASSWORD，后台登录已禁用；"
+            "请在 .env 中设置后重启（不再提供 admin/admin123 这类默认口令）"
+        )
+    else:
+        if settings.ADMIN_USERNAME == "admin" and settings.ADMIN_PASSWORD == "admin123":
+            logger.warning("仍在使用 admin/admin123 弱口令，且服务可能监听 0.0.0.0，请尽快更换")
     ensure_database()
     init_db()
     from admin.scheduler import start_scheduler
@@ -79,7 +90,14 @@ def _startup():
 
 
 def _get_stored_hash() -> str:
-    """读取密码哈希；显式配置 ADMIN_PASSWORD 时以 env 为准并同步数据库。"""
+    """读取密码哈希；显式配置 ADMIN_PASSWORD 时以 env 为准并同步数据库。
+
+    返回空串表示「未配置登录凭据」——此时 login 一律拒绝，绝不允许空口令登录。
+    """
+    # 未配置密码：直接拒绝，且不往库里写任何东西
+    if not settings.ADMIN_PASSWORD:
+        return ""
+
     db = None
     try:
         db = SessionLocal()
@@ -107,7 +125,7 @@ def _get_stored_hash() -> str:
     finally:
         if db is not None:
             db.close()
-    # 无记录：用配置默认密码并持久化哈希
+    # 无记录：用配置密码并持久化哈希
     h = hash_password(settings.ADMIN_PASSWORD)
     db = None
     try:
@@ -138,6 +156,12 @@ def login(
             status_code=429,
             detail=f"登录尝试过于频繁，请 {wait} 秒后再试",
             headers={"Retry-After": str(wait)},
+        )
+    # 未配置凭据时直接拒绝（不能退化成「空口令可登录」）
+    if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=503,
+            detail="后台未配置登录凭据，请在 .env 中设置 ADMIN_USERNAME 与 ADMIN_PASSWORD 后重启",
         )
     if username != settings.ADMIN_USERNAME or not verify_password(password, _get_stored_hash()):
         record_failure(ip)
