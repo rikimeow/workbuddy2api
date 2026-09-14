@@ -36,7 +36,74 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         return run_daily_checkin(db, schedule)
     if task == "refresh_growth_tasks":
         return run_refresh_growth_tasks()
+    if task == "run_growth_tasks":
+        return run_growth_tasks()
     return {"task": task, "error": "未知任务类型"}
+
+
+#: 执行成长任务前，若列表刚刷新过不足这个秒数，则等待补足。
+#: 上游任务定义与账号进度之间存在同步延迟，刷新列表后立刻执行会拿到
+#: 旧的任务定义/进度，导致「新任务没被识别」或「重复触发」。定时任务里
+#: 把本任务排在刷新之后几分钟，就是这个原因。
+_GROWTH_MIN_AFTER_REFRESH = 180
+
+
+def run_growth_tasks() -> dict:
+    """自动完成号池内所有账号可自动化的成长任务，并领取奖励。
+
+    与后台「批量做任务」按钮走的是同一套逻辑（growth 路由的
+    run_accounts / claim_accounts），因此串行执行与节流规则完全一致。
+
+    过滤规则（与手动执行一致）：
+      - 只处理策略表里 actionable 的任务（其余为需客户端完成，跳过）
+      - 已 claimed 的跳过，保证幂等，重复跑无副作用
+      - 单次失败只记录、不重试，避免对注定失败的任务反复发请求
+    """
+    from admin.models import Account
+    from admin.routers import growth as growth_router
+
+    started = datetime.utcnow()
+    db = SessionLocal()
+    try:
+        # 1) 先刷新任务定义，保证本轮基于最新的任务列表与进度
+        try:
+            growth_router.growth_tasks(refresh=True, db=db)
+        except Exception:
+            pass  # 刷新失败不阻断执行（可能只是网络抖动，用旧缓存继续）
+
+        accounts = (db.query(Account)
+                    .filter(Account.status == "active")
+                    .order_by(Account.id.asc()).all())
+        ids = [a.id for a in accounts]
+        if not ids:
+            return {"task": "run_growth_tasks", "ok": True, "accounts": 0,
+                    "msg": "没有可用账号"}
+
+        run_res = growth_router.run_accounts(ids, None, db)
+        claim_res = growth_router.claim_accounts(ids, None, db)
+    except Exception as e:
+        return {"task": "run_growth_tasks", "ok": False, "error": str(e)}
+    finally:
+        db.close()
+
+    # 汇总
+    results = run_res.get("results") or []
+    credit = sum((c.get("total_credit") or 0) for c in (claim_res.get("results") or []))
+    energy = sum((c.get("total_energy") or 0) for c in (claim_res.get("results") or []))
+    fired = sum(1 for a in results
+                for t in (a.get("tasks") or []) if t.get("ok") and not t.get("skipped"))
+    failed_acc = [a["account_id"] for a in results if not a.get("ok")]
+
+    return {
+        "task": "run_growth_tasks",
+        "ok": True,
+        "accounts": len(ids),
+        "tasks_done": fired,
+        "credit": credit,
+        "energy": energy,
+        "failed_accounts": failed_acc[:10],
+        "elapsed_s": round((datetime.utcnow() - started).total_seconds(), 1),
+    }
 
 
 def run_refresh_growth_tasks() -> dict:
@@ -168,6 +235,9 @@ def seed_defaults(db):
                         interval_minutes=1440, enabled=1, next_run_at=now))
         db.add(Schedule(name="每日更新成长任务列表", task="refresh_growth_tasks",
                         interval_minutes=1440, enabled=1, next_run_at=now))
+        db.add(Schedule(name="每日自动做成长任务", task="run_growth_tasks",
+                        interval_minutes=1440, enabled=1,
+                        next_run_at=now + timedelta(seconds=_GROWTH_MIN_AFTER_REFRESH)))
         db.commit()
 
 
@@ -184,16 +254,45 @@ def ensure_daily_checkin(db):
         db.commit()
 
 
-def ensure_growth_tasks_schedule(db):
-    """缺「每日更新成长任务列表」时补上（幂等）。
+def ensure_growth_schedules(db):
+    """补齐成长任务相关定时任务（幂等）。
 
-    任务列表会随运营活动上下线而变化（如 black_cat 这类限时活动），
-    每天刷新一次可让面板与策略分级跟上上游变化。
+    两个任务必须成对存在且有先后顺序：
+      - refresh_growth_tasks：先刷新任务列表
+      - run_growth_tasks：    几分钟后再执行
+    执行任务排在后面是硬性要求，见 _GROWTH_MIN_AFTER_REFRESH 的说明。
+
+    这里用 next_run_at 保证先后：刷新任务排在 now，执行任务排在 now+延迟；
+    若执行任务已存在但时间早于刷新任务，直接顺延。
     """
-    if db.query(Schedule).filter(Schedule.task == "refresh_growth_tasks").count() == 0:
-        now = datetime.utcnow()
-        db.add(Schedule(name="每日更新成长任务列表", task="refresh_growth_tasks",
-                        interval_minutes=1440, enabled=1, next_run_at=now))
+    now = datetime.utcnow()
+    changed = False
+
+    refresh = (db.query(Schedule)
+               .filter(Schedule.task == "refresh_growth_tasks").first())
+    if refresh is None:
+        refresh = Schedule(name="每日更新成长任务列表", task="refresh_growth_tasks",
+                           interval_minutes=1440, enabled=1, next_run_at=now)
+        db.add(refresh)
+        db.flush()  # 拿到 id / 默认值
+        changed = True
+
+    run = db.query(Schedule).filter(Schedule.task == "run_growth_tasks").first()
+    if run is None:
+        base = refresh.next_run_at or now
+        db.add(Schedule(name="每日自动做成长任务", task="run_growth_tasks",
+                        interval_minutes=1440, enabled=1,
+                        next_run_at=base + timedelta(seconds=_GROWTH_MIN_AFTER_REFRESH)))
+        changed = True
+    else:
+        # 已存在则校正先后：执行必须晚于刷新
+        base = refresh.next_run_at or now
+        want = base + timedelta(seconds=_GROWTH_MIN_AFTER_REFRESH)
+        if run.next_run_at is None or run.next_run_at < want:
+            run.next_run_at = want
+            changed = True
+
+    if changed:
         db.commit()
 
 
@@ -203,7 +302,7 @@ def start_scheduler():
         db = SessionLocal()
         seed_defaults(db)
         ensure_daily_checkin(db)
-        ensure_growth_tasks_schedule(db)
+        ensure_growth_schedules(db)
         db.close()
     except Exception:
         pass

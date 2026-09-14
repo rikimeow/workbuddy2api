@@ -164,15 +164,16 @@ def _updated(session, acc: Account) -> str:
         return acc.auth_json
 
 
-@router.post("/run")
-def growth_run(payload: RunIn, db: Session = Depends(get_db)):
-    """执行任务：自动参与 + 触发完成事件。
+def run_accounts(account_ids: list[int], task_codes: list[str] | None,
+                 db: Session) -> dict:
+    """对一批账号执行「自动参与 + 触发完成」。供接口与定时任务共用。
 
-    只处理策略表里标记为可自动的任务；其它任务跳过并在返回里说明原因。
+    这里沉淀了串行执行与节流逻辑，定时任务必须复用本函数，
+    避免绕过 accept 落库等待而出现「任务不成功」的问题。
     """
     model = _pick_free_model(db)
     out = []
-    for aid in payload.account_ids:
+    for aid in account_ids:
         acc = db.query(Account).get(aid)
         if not acc:
             out.append({"account_id": aid, "ok": False, "msg": "账号不存在"})
@@ -185,20 +186,12 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
                 tasks = s.growth_tasks()
                 by_code = {t.get("task_code"): t for t in tasks}
 
-                # 1) 决定要处理哪些任务
-                wanted = payload.task_codes or [
+                wanted = task_codes or [
                     t.get("task_code") for t in tasks
                     if growth_plans.plan_for(t.get("task_code") or "").actionable
                     and t.get("accept_status") != "claimed"
                 ]
 
-                # 2) 逐个任务串行处理。
-                #
-                # 关键：accept 与 trigger 必须成对、串行、且中间留出间隔。
-                # 早期版本把所有任务的 accept 批量做完再统一触发，实测会出现
-                # 「已 accept 但首次触发不计数」——上游的参与状态是异步落库的，
-                # 紧接着发事件会被判定为「未参与」而丢弃。所以这里每个任务都
-                # 走「accept → 确认 → 触发」的完整闭环。
                 for code in wanted:
                     info = by_code.get(code) or {}
                     plan = growth_plans.plan_for(code)
@@ -214,7 +207,7 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
                         acc_log["tasks"].append(item)
                         continue
 
-                    # 2a) 参与（未参与的任务不计进度）
+                    # 参与（未参与的任务不计进度）
                     if info.get("accept_status") == "not_accepted":
                         try:
                             s.growth_accept([code])
@@ -226,12 +219,9 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
                     prog = info.get("progress") or {}
                     target = prog.get("target")
                     current = prog.get("current") or 0
-                    # 需要触发的次数：按任务 target 与当前进度的差额
                     times = (target - current) if isinstance(target, int) and target > current else 1
-                    times = max(1, min(times, _MAX_TIMES))  # 加上限，避免异常任务打爆
+                    times = max(1, min(times, _MAX_TIMES))
 
-                    # 2b) 触发。若任务要求使用特定模型（如「体验 GLM-5.2」），
-                    # 用指定模型真实调用；否则用免费模型发事件包。
                     fire_model = plan.model or model
                     fired = 0
                     for _ in range(times):
@@ -242,7 +232,6 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
                             item["last_error"] = r.get("msg")
                         time.sleep(_EVENT_GAP)
 
-                    # 2c) 复查进度
                     time.sleep(_VERIFY_WAIT)
                     try:
                         now = {t.get("task_code"): t for t in s.growth_tasks()}
@@ -266,14 +255,11 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
     return {"results": out, "model": model}
 
 
-@router.post("/claim")
-def growth_claim(payload: ClaimIn, db: Session = Depends(get_db)):
-    """批量领取奖励。
-
-    task_codes 为空时，自动领取所有「已完成但未领取」（completed）的任务。
-    """
+def claim_accounts(account_ids: list[int], task_codes: list[str] | None,
+                   db: Session) -> dict:
+    """对一批账号领取奖励。供接口与定时任务共用。"""
     out = []
-    for aid in payload.account_ids:
+    for aid in account_ids:
         acc = db.query(Account).get(aid)
         if not acc:
             out.append({"account_id": aid, "ok": False, "msg": "账号不存在"})
@@ -283,8 +269,8 @@ def growth_claim(payload: ClaimIn, db: Session = Depends(get_db)):
                    "claimed": [], "total_credit": 0, "total_energy": 0}
         try:
             with backend.AccountSession(acc.auth_json) as s:
-                if payload.task_codes:
-                    codes = list(payload.task_codes)
+                if task_codes:
+                    codes = list(task_codes)
                 else:
                     tasks = s.growth_tasks()
                     codes = [t.get("task_code") for t in tasks
@@ -318,6 +304,24 @@ def growth_claim(payload: ClaimIn, db: Session = Depends(get_db)):
 
     db.commit()
     return {"results": out}
+
+
+@router.post("/run")
+def growth_run(payload: RunIn, db: Session = Depends(get_db)):
+    """执行任务：自动参与 + 触发完成事件。
+
+    只处理策略表里标记为可自动的任务；其它任务跳过并在返回里说明原因。
+    """
+    return run_accounts(payload.account_ids, payload.task_codes, db)
+
+
+@router.post("/claim")
+def growth_claim(payload: ClaimIn, db: Session = Depends(get_db)):
+    """批量领取奖励。
+
+    task_codes 为空时，自动领取所有「已完成但未领取」（completed）的任务。
+    """
+    return claim_accounts(payload.account_ids, payload.task_codes, db)
 
 
 @router.get("/accounts/{account_id}/tasks")

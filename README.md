@@ -33,6 +33,7 @@
 <img src="./images/img_1.png">
 <img src="./images/img_2.png">
 <img src="./images/img_3.png">
+<img src="./images/img_4.png">
 
 ## 目录
 
@@ -569,7 +570,27 @@ curl -X POST -H "X-Admin-Token: <jwt>" -H "Content-Type: application/json" \
      -d '{"account_ids":[<id>]}' http://127.0.0.1:8790/api/growth/claim
 ```
 
-**定时刷新**：默认自带「每日更新成长任务列表」（`refresh_growth_tasks`，1440 分钟）。任务定义对所有账号一致，所以只用**一个**可用登录态拉取，不遍历账号；失败时保留旧缓存，不影响面板使用。
+**定时自动化**：默认自带两个任务，**每天自动把新任务做掉并领奖**。
+
+| 任务 | 间隔 | 说明 |
+|------|------|------|
+| `refresh_growth_tasks` 每日更新成长任务列表 | 1440 分钟 | 刷新任务定义缓存，让分级与面板跟上上游活动变化 |
+| `run_growth_tasks` 每日自动做成长任务 | 1440 分钟 | 遍历号池 → 先刷新列表 → 自动参与 → 触发完成 → **自动领奖** |
+
+**两个任务的先后顺序是硬性要求**：执行必须排在刷新之后**至少 3 分钟**（`_GROWTH_MIN_AFTER_REFRESH = 180` 秒）。上游的任务定义与账号进度之间存在同步延迟，刷新后立刻执行会拿到旧数据，导致新任务识别不到或重复触发。调度器启动时会自动校正二者时间（`ensure_growth_schedules`），即便手工改过也会被顺延回正确区间。
+
+执行任务与你手动点「批量做任务」走的是**同一套代码**（`run_accounts` / `claim_accounts`），因此串行规则与节流完全一致。筛选规则：
+
+- 只做策略表里 `actionable` 的任务（需客户端完成的自动跳过）
+- `claimed` 的跳过 —— **幂等**，重复跑不会重复领、不会白发请求
+- 单次失败只记录、不重试，避免对注定失败的任务反复请求
+
+因此运营上了新任务，**当天就会自动完成并领到积分**，无需人工干预。执行结果写入调度记录的 `last_result`：
+
+```json
+{"task":"run_growth_tasks","ok":true,"accounts":9,"tasks_done":4,
+ "credit":400,"energy":20,"failed_accounts":[],"elapsed_s":61.5}
+```
 
 ### 6.9 实测结果
 
@@ -713,7 +734,7 @@ workbuddy2api/
 │   ├── security.py           # JWT、Key 哈希、配额拦截
 │   ├── backend.py            # 复用 converter.CredentialManager 操作单账号（含签到 / 成长任务）
 │   ├── growth_plans.py       # 成长任务分级与完成策略表（实测结论沉淀处）
-│   ├── scheduler.py          # 轻量定时任务：refresh_balances / sync_models / daily_checkin / refresh_growth_tasks
+│   ├── scheduler.py          # 轻量定时任务：refresh_balances / sync_models / daily_checkin / refresh_growth_tasks / run_growth_tasks
 │   ├── turing_token.py       # Python 侧 X-Device-Token 提供器（subprocess 调 helper）
 │   ├── routers/              # accounts / groups / growth / keys / proxy / schedules / logs / stats / sync / models
 │   └── static/index.html     # 纯 HTML + TailwindCSS + FontAwesome 管理大屏
