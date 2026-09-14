@@ -15,9 +15,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from admin import backend, growth_plans
+from admin import backend, growth_plans, jobrunner
 from admin.config import settings
-from admin.db import get_db
+from admin.db import SessionLocal, get_db
 from admin.models import Account
 
 router = APIRouter(prefix="/api/growth", tags=["growth"])
@@ -27,9 +27,14 @@ _task_cache: dict = {}
 
 #: 执行节流（秒）
 _EVENT_GAP = 1.2          # 同一任务内两次触发之间
-_ACCOUNT_GAP = 2.0        # 两个账号之间
-_ACCEPT_SETTLE = 3.0      # accept 之后等参与状态落库，再触发
-_VERIFY_WAIT = 1.5        # 触发后等计数落库，再复查
+_ACCOUNT_GAP = 1.0        # 两个账号之间
+
+#: 轮询参数：等上游落库时用「轮询到就绪」，而不是固定 sleep。
+#: 超时只是兜底上限，正常情况远早于它返回。
+_POLL_INTERVAL = 0.5      # 轮询间隔
+_ACCEPT_TIMEOUT = 8.0     # 等 accept 参与状态落库
+_VERIFY_TIMEOUT = 8.0     # 等触发后进度落库
+
 _MAX_TIMES = 10           # 单任务最多触发次数上限
 
 #: 触发事件时优先使用的免费模型（0 倍率），用完再退回低倍率
@@ -71,7 +76,7 @@ class AcceptIn(BaseModel):
 
 
 class RunIn(BaseModel):
-    account_ids: list[int]
+    account_ids: list[int] = []           # 空 = 全部可用账号
     task_codes: list[str] | None = None   # 为空表示「所有可自动完成的任务」
 
 
@@ -165,18 +170,30 @@ def _updated(session, acc: Account) -> str:
 
 
 def run_accounts(account_ids: list[int], task_codes: list[str] | None,
-                 db: Session) -> dict:
-    """对一批账号执行「自动参与 + 触发完成」。供接口与定时任务共用。
+                 db: Session, on_done=None) -> dict:
+    """对一批账号执行「自动参与 + 触发完成 + 领取」。供接口与定时任务共用。
 
     这里沉淀了串行执行与节流逻辑，定时任务必须复用本函数，
     避免绕过 accept 落库等待而出现「任务不成功」的问题。
+
+    与早期版本的差别：不再用固定 sleep 死等上游落库，改成**轮询到就绪为止**
+    （`jobrunner.wait_for`）。固定 sleep 在两种情况下都吃亏：
+      * 上游快时白等（原本每账号约 27 秒，大半是干等）
+      * 上游慢时不够（复查时进度还没落库，于是报「已完成未领取」，
+        用户得再点一次才领到 —— 就是体感上的「分成两三步」）
+
+    Args:
+        on_done: 每完成一个账号回调一次，用于上报进度（可为 None）。
     """
     model = _pick_free_model(db)
     out = []
     for aid in account_ids:
         acc = db.query(Account).get(aid)
         if not acc:
-            out.append({"account_id": aid, "ok": False, "msg": "账号不存在"})
+            item = {"account_id": aid, "ok": False, "msg": "账号不存在"}
+            out.append(item)
+            if on_done:
+                on_done(item)
             continue
 
         acc_log = {"account_id": aid, "name": acc.name, "model": model,
@@ -189,7 +206,7 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                 wanted = task_codes or [
                     t.get("task_code") for t in tasks
                     if growth_plans.plan_for(t.get("task_code") or "").actionable
-                    and t.get("accept_status") != "claimed"
+                    and t.get("accept_status") not in ("claimed", "completed")
                 ]
 
                 for code in wanted:
@@ -207,11 +224,19 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                         acc_log["tasks"].append(item)
                         continue
 
-                    # 参与（未参与的任务不计进度）
+                    # 参与（未参与的任务不计进度）：
+                    # 轮询等 accept 落库，而不是固定 sleep 3 秒
                     if info.get("accept_status") == "not_accepted":
                         try:
                             s.growth_accept([code])
-                            time.sleep(_ACCEPT_SETTLE)  # 等参与状态落库
+
+                            def _accepted(c=code):
+                                t = _find_task(s, c)
+                                return bool(t and t.get("accept_status") not in
+                                            (None, "", "not_accepted"))
+
+                            jobrunner.wait_for(_accepted, _ACCEPT_TIMEOUT,
+                                               _POLL_INTERVAL)
                             info = _find_task(s, code) or info
                         except Exception as e:
                             item["accept_error"] = str(e)
@@ -232,18 +257,53 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                             item["last_error"] = r.get("msg")
                         time.sleep(_EVENT_GAP)
 
-                    time.sleep(_VERIFY_WAIT)
+                    # 复查：轮询到进度变化为止，避免「已完成但没领」的假象
+                    def _advanced(c=code, tgt=target, cur=current):
+                        n = _find_task(s, c)
+                        if not n:
+                            return False
+                        st = n.get("accept_status")
+                        if st in ("completed", "claimed"):
+                            return True
+                        np_ = (n.get("progress") or {}).get("current")
+                        return isinstance(np_, int) and isinstance(cur, int) and np_ > cur
+
+                    jobrunner.wait_for(_advanced, _VERIFY_TIMEOUT, _POLL_INTERVAL)
+
                     try:
                         now = {t.get("task_code"): t for t in s.growth_tasks()}
-                        np_ = (now.get(code) or {}).get("progress") or {}
+                        cur_task = now.get(code) or {}
+                        np_ = cur_task.get("progress") or {}
                         item["progress"] = f"{np_.get('current')}/{np_.get('target')}"
-                        item["status"] = (now.get(code) or {}).get("accept_status")
+                        item["status"] = cur_task.get("accept_status")
                     except Exception:
                         pass
                     item.update({"ok": fired > 0, "fired": fired, "times": times})
                     if plan.model:
                         item["model"] = plan.model
                     acc_log["tasks"].append(item)
+
+                # 本账号跑完顺手领取，避免用户还要再点一次「领奖」
+                try:
+                    done_codes = [t.get("task_code") for t in s.growth_tasks()
+                                  if t.get("accept_status") == "completed"]
+                    claimed = []
+                    for code in done_codes:
+                        try:
+                            r = s.growth_claim(code)
+                            d = r.get("data") or {}
+                            claimed.append({"task_code": code, "ok": bool(r.get("ok")),
+                                            "credit": d.get("credit") or 0,
+                                            "energy": d.get("energy") or 0})
+                        except Exception:
+                            pass
+                        time.sleep(_EVENT_GAP)
+                    if claimed:
+                        acc_log["claimed"] = claimed
+                        acc_log["credit"] = sum(c.get("credit") or 0 for c in claimed)
+                        acc_log["energy"] = sum(c.get("energy") or 0 for c in claimed)
+                except Exception:
+                    pass
 
                 acc.auth_json = _updated(s, acc)
         except Exception as e:
@@ -313,6 +373,69 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
     只处理策略表里标记为可自动的任务；其它任务跳过并在返回里说明原因。
     """
     return run_accounts(payload.account_ids, payload.task_codes, db)
+
+
+#: 后台任务 key：同 key 同时只允许一个在跑
+JOB_KEY = "growth_run"
+
+
+def _resolve_ids(payload_ids: list[int] | None) -> list[int]:
+    """把请求里的 ids 解析成实际要处理的账号 id 列表（空 = 全部 active）。"""
+    db = SessionLocal()
+    try:
+        if payload_ids:
+            return list(payload_ids)
+        rows = (db.query(Account)
+                .filter(Account.status == "active")
+                .order_by(Account.id.asc()).all())
+        return [a.id for a in rows]
+    finally:
+        db.close()
+
+
+@router.post("/run-async")
+def growth_run_async(payload: RunIn):
+    """异步批量做任务：立即返回 job_id，前端轮询进度。
+
+    为什么异步：一个账号约 27 秒（串行 + 限速），13 个账号要 6 分钟以上，
+    同步等会让 nginx 先超时（默认 60s）→ 前端吃 504、体感「点了没反应」。
+
+    重复点击不会叠起并发批量：同 key 已有任务在跑时直接返回现有 job。
+    """
+    running = jobrunner.RUNNER.get(JOB_KEY)
+    if running and running.status == "running":
+        return {"reused": True, **running.snapshot()}
+
+    ids = payload.account_ids or _resolve_ids(None)
+    tasks = payload.task_codes
+
+    def worker(job: jobrunner.Job) -> dict:
+        db = SessionLocal()
+        try:
+            job.set_phase("执行中")
+            res = run_accounts(ids, tasks, db, on_done=job.add_item)
+        finally:
+            db.close()
+        results = res.get("results") or []
+        credit = sum((r.get("credit") or 0) for r in results)
+        energy = sum((r.get("energy") or 0) for r in results)
+        done = sum(1 for r in results for t in (r.get("tasks") or [])
+                   if t.get("ok") and not t.get("skipped"))
+        return {"accounts": len(ids), "tasks_done": done,
+                "credit": credit, "energy": energy,
+                "failed": [r["account_id"] for r in results if not r.get("ok")]}
+
+    job = jobrunner.RUNNER.start(JOB_KEY, len(ids), worker, title="批量做任务")
+    return job.snapshot()
+
+
+@router.get("/job/{job_id}")
+def growth_job(job_id: str):
+    """查询后台任务进度。"""
+    job = jobrunner.RUNNER.by_id(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在或已过期")
+    return job.snapshot()
 
 
 @router.post("/claim")

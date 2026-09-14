@@ -51,8 +51,8 @@ _GROWTH_MIN_AFTER_REFRESH = 180
 def run_growth_tasks() -> dict:
     """自动完成号池内所有账号可自动化的成长任务，并领取奖励。
 
-    与后台「批量做任务」按钮走的是同一套逻辑（growth 路由的
-    run_accounts / claim_accounts），因此串行执行与节流规则完全一致。
+    与后台「批量做任务」按钮走的是同一套逻辑（growth 路由的 run_accounts），
+    因此串行执行、节流规则与「执行后自动领取」的行为完全一致。
 
     过滤规则（与手动执行一致）：
       - 只处理策略表里 actionable 的任务（其余为需客户端完成，跳过）
@@ -80,16 +80,15 @@ def run_growth_tasks() -> dict:
                     "msg": "没有可用账号"}
 
         run_res = growth_router.run_accounts(ids, None, db)
-        claim_res = growth_router.claim_accounts(ids, None, db)
     except Exception as e:
         return {"task": "run_growth_tasks", "ok": False, "error": str(e)}
     finally:
         db.close()
 
-    # 汇总
+    # 汇总（run_accounts 内部已逐个账号执行 + 领取，无需再单独 claim 一遍）
     results = run_res.get("results") or []
-    credit = sum((c.get("total_credit") or 0) for c in (claim_res.get("results") or []))
-    energy = sum((c.get("total_energy") or 0) for c in (claim_res.get("results") or []))
+    credit = sum((r.get("credit") or 0) for r in results)
+    energy = sum((r.get("energy") or 0) for r in results)
     fired = sum(1 for a in results
                 for t in (a.get("tasks") or []) if t.get("ok") and not t.get("skipped"))
     failed_acc = [a["account_id"] for a in results if not a.get("ok")]

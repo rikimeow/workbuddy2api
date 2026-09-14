@@ -4,15 +4,16 @@ import json
 import os
 import shutil
 from datetime import datetime
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from admin import backend
+from admin import backend, jobrunner
 from admin.config import settings
-from admin.db import get_db
+from admin.db import SessionLocal, get_db
 from admin.models import Account
 from admin.security import require_admin
 
@@ -439,6 +440,90 @@ def cat_travel(acc_id: int, _: bool = Depends(require_admin), db: Session = Depe
 
 class CatTravelBatchIn(BaseModel):
     ids: list[int] = []  # 指定账号；为空则对全部启用账号执行
+
+
+#: 猫猫旅行后台任务 key
+CAT_JOB_KEY = "cat_travel"
+
+
+@router.post("/cat-travel/batch-async")
+def cat_travel_batch_async(
+    body: CatTravelBatchIn,
+    _: bool = Depends(require_admin),
+):
+    """异步批量猫猫旅行：立即返回 job_id，前端轮询进度。
+
+    每个账号要串行做「同意协议 → 补门槛对话 → 领养 → 派猫 → 领奖」，
+    同步等容易让 nginx 先超时（默认 60s），所以放到后台线程跑。
+    重复点击复用同一个 job，不会叠起并发批量。
+    """
+    running = jobrunner.RUNNER.get(CAT_JOB_KEY)
+    if running and running.status == "running":
+        return {"reused": True, **running.snapshot()}
+
+    db = SessionLocal()
+    try:
+        q = db.query(Account).filter(Account.status == "active")
+        if body.ids:
+            q = q.filter(Account.id.in_(body.ids))
+        ids = [a.id for a in q.order_by(Account.id).all()]
+    finally:
+        db.close()
+
+    def worker(job: jobrunner.Job) -> dict:
+        db = SessionLocal()
+        buckets = {"adopted": 0, "adopt_credits": 0,
+                   "travel_claimed": 0, "travel_credits": 0,
+                   "travel_none": 0, "traveling": 0,
+                   "gate_blocked": 0, "error": 0}
+        try:
+            job.set_phase("执行中")
+            for aid in ids:
+                acc = db.query(Account).get(aid)
+                if not acc:
+                    continue
+                try:
+                    with backend.AccountSession(acc.auth_json) as sess:
+                        res = sess.run_cat_travel()
+                        acc.auth_json = sess.updated_json()
+                        db.commit()
+                except Exception as e:
+                    item = {"id": aid, "account": acc.name, "ok": False,
+                            "credits": 0, "summary": f"执行异常: {e}",
+                            "steps": [], "outcome": "error"}
+                    buckets["error"] += 1
+                    job.add_item(item)
+                    continue
+
+                if res.get("credits"):
+                    _refresh_balance(acc)
+                    db.commit()
+                outcome = res.get("outcome") or ("error" if not res.get("ok") else "travel_none")
+                if outcome == "adopted":
+                    buckets["adopted"] += 1
+                    buckets["adopt_credits"] += res.get("credits") or 0
+                elif outcome == "travel_claimed":
+                    buckets["travel_claimed"] += 1
+                    buckets["travel_credits"] += res.get("credits") or 0
+                elif outcome in buckets:
+                    buckets[outcome] += 1
+                else:
+                    buckets["travel_none"] += 1
+
+                job.add_item({"id": aid, "account": acc.name,
+                              "balance_remain": acc.balance_remain, **res})
+                time.sleep(0.5)   # 账号之间留一点间隔，避免打太快
+        finally:
+            db.close()
+        return {
+            "total": len(ids),
+            "credits": buckets["adopt_credits"] + buckets["travel_credits"],
+            "succeeded": sum(1 for r in job.items if r.get("ok")),
+            "buckets": buckets,
+        }
+
+    job = jobrunner.RUNNER.start(CAT_JOB_KEY, len(ids), worker, title="批量猫猫旅行")
+    return job.snapshot()
 
 
 @router.post("/cat-travel/batch")

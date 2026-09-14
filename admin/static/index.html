@@ -875,54 +875,146 @@ async function catTravel(id) {
   }
 }
 
+/* ==========================================================================
+   后台任务进度（批量做任务 / 猫猫旅行）
+   --------------------------------------------------------------------------
+   这类批量是串行 + 限速的，一个账号要好几秒，全量跑完可能几分钟。
+   同步等会让 nginx 先超时（默认 60s）→ 504。所以：
+     1. 请求只负责「提交」，立即拿到 job_id；
+     2. 弹窗每 1.5 秒轮询一次进度，实时追加已完成账号；
+     3. 关掉弹窗不会中断后台执行（线程还在跑），重新点按钮能看到进度。
+   ========================================================================== */
+let _jobTimer = null;
+
+/** 关闭进度弹窗时停止轮询（后台任务不受影响，仍在跑）。 */
+function stopJobPoll() {
+  if (_jobTimer) { clearInterval(_jobTimer); _jobTimer = null; }
+}
+
+/** 进度条 + 已完成列表的 HTML。 */
+function jobProgressHtml(d, opts) {
+  const pct = d.percent || 0;
+  const done = d.status !== "running";
+  const rows = (d.items || []).map(x => {
+    const label = opts.label(x);
+    const detail = opts.detail(x);
+    const amount = opts.amount(x);
+    const icon = opts.icon(x);
+    return `<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
+      ${icon}
+      <span class="flex-1 truncate">${esc(label)}</span>
+      <span class="text-slate-500 text-xs truncate max-w-[45%]">${esc(detail)}</span>
+      ${amount}
+    </div>`;
+  }).join("") || `<div class="text-slate-400 text-xs py-2">等待第一个账号完成...</div>`;
+
+  const head = done
+    ? `<div class="mb-2 font-semibold ${d.status === "failed" ? "text-red-500" : "text-emerald-600"}">
+         ${d.status === "failed" ? "执行失败：" + esc(d.error || "") : esc(opts.doneText(d))}</div>`
+    : `<div class="mb-2 text-slate-600 font-semibold">
+         <i class="fa-solid fa-spinner fa-spin mr-1"></i>
+         ${esc(d.phase || "执行中")} ${d.done}/${d.total}
+         <span class="text-slate-400 font-normal text-xs ml-1">已用 ${d.elapsed_s}s</span>
+       </div>`;
+
+  return `${head}
+    <div class="h-2 rounded-full bg-slate-100 overflow-hidden mb-2">
+      <div class="h-full rounded-full transition-all duration-300 ${done ? "bg-emerald-500" : "bg-sky-500"}"
+           style="width:${pct}%"></div>
+    </div>
+    ${done ? `<div class="text-xs text-slate-500 mb-2">${opts.summaryHtml ? opts.summaryHtml(d) : ""}</div>` : ""}
+    <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto">${rows}</div>`;
+}
+
+/** 提交后台任务并开始轮询进度。 */
+async function runJob(opts) {
+  stopJobPoll();
+  openModal(`<h3 class="font-bold mb-1">${opts.iconHtml || ""} ${esc(opts.title)}</h3>
+    <div id="jobBody" class="text-sm text-slate-500">正在提交...</div>
+    <div class="flex justify-end gap-2 mt-4">
+      <button onclick="stopJobPoll(); closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button>
+    </div>`);
+
+  let d;
+  try {
+    const r = await api(opts.submitUrl, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(opts.body || {}),
+    });
+    const j = await safeJson(r);
+    if (!r.ok) {
+      $("#jobBody").innerHTML = `<span class="text-red-500">提交失败: ${esc(j.data?.detail || "未知错误")}</span>`;
+      return;
+    }
+    d = j.data;
+  } catch (e) {
+    $("#jobBody").innerHTML = `<span class="text-red-500">提交异常: ${esc(String(e))}</span>`;
+    return;
+  }
+
+  if (d.reused) toast("已有批量任务在执行，显示其进度", "ok");
+  $("#jobBody").innerHTML = jobProgressHtml(d, opts);
+
+  _jobTimer = setInterval(async () => {
+    try {
+      const r = await api(`/api/growth/job/${d.job_id}`);
+      const j = await safeJson(r);
+      if (!r.ok || !j.data) return;
+      const cur = j.data;
+      const box = $("#jobBody");
+      if (!box) { stopJobPoll(); return; }   // 弹窗被关掉了
+      box.innerHTML = jobProgressHtml(cur, opts);
+      if (cur.status !== "running") {
+        stopJobPoll();
+        if (cur.status === "failed") toast("批量执行失败：" + (cur.error || ""), "err");
+        else toast(opts.doneToast(cur), "ok");
+        opts.onFinish && opts.onFinish(cur);
+      }
+    } catch (e) { /* 轮询失败忽略，下次再试 */ }
+  }, 1500);
+}
+
 /* 猫猫旅行：批量执行 */
 async function catTravelBatch() {
   const list = _accData.filter(a => a.status === "active");
   if (!list.length) { toast("没有可执行的账号", "err"); return; }
   if (!await uiConfirm({kind:"info", danger:false, title:"批量猫猫旅行",
       message:`确认对 ${list.length} 个账号执行猫猫旅行？\n流程：同意协议 → 首次领养(+300) → 派出 → 领奖`, okText:"开始执行"})) return;
-  openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 批量猫猫旅行</h3>
-    <p class="text-xs text-slate-400 mb-3">共 ${list.length} 个账号，执行中请勿关闭...</p>
-    <div id="catBatchBody" class="text-sm text-slate-500">执行中...</div>
-    <div class="flex justify-end mt-4"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
-  try {
-    const r = await api("/api/accounts/cat-travel/batch", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    const { ok, data: d } = await safeJson(r);
-    if (!r.ok) { $("#catBatchBody").innerHTML = `<span class="text-red-500">执行失败: ${esc(d.detail||"未知错误")}</span>`; return; }
-    const rows = (d.results || []).map(x =>
-      `<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
-         ${x.credits > 0 ? '<i class="fa-solid fa-circle-check text-emerald-500"></i>'
-                         : x.ok ? '<i class="fa-solid fa-minus-circle text-slate-400"></i>'
-                                : '<i class="fa-solid fa-circle-xmark text-red-500"></i>'}
-         <span class="flex-1">${esc(x.account||x.id)}</span>
-         <span class="text-slate-500 text-xs">${esc(x.summary||"")}</span>
-         ${x.credits > 0 ? `<span class="font-semibold text-amber-600">+${x.credits}</span>` : ""}
-       </div>`).join("");
-    // 分类展示：领养 +300 与旅行返现量级差几十倍，合并会让人以为白干了
-    const b = d.buckets || {};
-    const parts = [];
-    if (b.adopted) parts.push(`首次领养 <b class="text-emerald-600">${b.adopted}</b> 个（+${b.adopt_credits}）`);
-    if (b.travel_claimed) parts.push(`旅行返现 <b class="text-amber-600">${b.travel_claimed}</b> 个（+${b.travel_credits}）`);
-    if (b.travel_none) parts.push(`无新增 ${b.travel_none} 个`);
-    if (b.traveling) parts.push(`旅行中 ${b.traveling} 个`);
-    if (b.gate_blocked) parts.push(`<span class="text-orange-600">门槛未达标 ${b.gate_blocked} 个</span>`);
-    if (b.error) parts.push(`<span class="text-red-600">失败 ${b.error} 个</span>`);
-    const detail = parts.length ? `<div class="text-xs text-slate-500 font-normal mt-0.5">${parts.join(" · ")}</div>` : "";
-    $("#catBatchBody").innerHTML =
-      `<div class="mb-2 font-semibold ${d.credits>0?'text-emerald-600':'text-slate-500'}">
-         共 ${d.total} 个账号，合计获得 ${d.credits} 积分${detail}</div>
-       <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-80 overflow-auto">${rows}</div>`;
-    toast(d.credits > 0
-            ? `批量完成：${b.adopted?`领养 ${b.adopted} 个（+${b.adopt_credits}）`:""}${b.adopted&&b.travel_claimed?"，":""}${b.travel_claimed?`旅行返现 ${b.travel_claimed} 个（+${b.travel_credits}）`:"（无新增）"}`
-            : "批量完成，无新增积分",
-          "ok");
-    loadAccounts();
-  } catch (e) {
-    $("#catBatchBody").innerHTML = `<span class="text-red-500">执行异常: ${esc(String(e))}</span>`;
-  }
+
+  await runJob({
+    title: "批量猫猫旅行",
+    iconHtml: '<i class="fa-solid fa-cat mr-1 text-pink-600"></i>',
+    submitUrl: "/api/accounts/cat-travel/batch-async",
+    body: {},
+    label: x => x.account || x.id,
+    detail: x => x.summary || "",
+    amount: x => x.credits > 0 ? `<span class="font-semibold text-amber-600 shrink-0">+${x.credits}</span>` : "",
+    icon: x => x.credits > 0 ? '<i class="fa-solid fa-circle-check text-emerald-500 shrink-0"></i>'
+             : x.ok ? '<i class="fa-solid fa-minus-circle text-slate-400 shrink-0"></i>'
+                    : '<i class="fa-solid fa-circle-xmark text-red-500 shrink-0"></i>',
+    doneText: d => {
+      const b = (d.result && d.result.buckets) || {};
+      const tot = (d.result && d.result.credits) || 0;
+      return `完成，共 ${d.total} 个账号，合计获得 ${tot} 积分`;
+    },
+    summaryHtml: d => {
+      const b = (d.result && d.result.buckets) || {};
+      const parts = [];
+      if (b.adopted) parts.push(`首次领养 <b class="text-emerald-600">${b.adopted}</b> 个（+${b.adopt_credits}）`);
+      if (b.travel_claimed) parts.push(`旅行返现 <b class="text-amber-600">${b.travel_claimed}</b> 个（+${b.travel_credits}）`);
+      if (b.travel_none) parts.push(`无新增 ${b.travel_none} 个`);
+      if (b.traveling) parts.push(`旅行中 ${b.traveling} 个`);
+      if (b.gate_blocked) parts.push(`<span class="text-orange-600">门槛未达标 ${b.gate_blocked} 个</span>`);
+      if (b.error) parts.push(`<span class="text-red-600">失败 ${b.error} 个</span>`);
+      return parts.join(" · ") || "";
+    },
+    doneToast: d => {
+      const b = (d.result && d.result.buckets) || {};
+      const tot = (d.result && d.result.credits) || 0;
+      return tot > 0 ? `批量完成，共获得 ${tot} 积分` : "批量完成，无新增积分";
+    },
+    onFinish: () => loadAccounts(),
+  });
 }
 
 /* ==========================================================================
@@ -1140,57 +1232,47 @@ async function growthRunBatch(){
   if (!list.length) { toast("没有可用账号", "err"); return; }
 
   if (!await uiConfirm({kind:"warn", danger:true, title:"批量做成长任务",
-      message:`确认对 ${list.length} 个账号批量执行？\n流程：自动参与 → 触发完成 → 领取奖励。\n仅处理已实测可自动化的任务，其余跳过。`,
+      message:`确认对 ${list.length} 个账号批量执行？\n流程：自动参与 → 触发完成 → 自动领取。\n仅处理已实测可自动化的任务，其余跳过。`,
       okText:"开始执行"})) return;
 
-  openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-seedling mr-1 text-emerald-600"></i> 批量做任务</h3>
-    <p class="text-xs text-slate-400 mb-3">共 ${list.length} 个账号，串行执行中请勿关闭...</p>
-    <div id="growthBatchBody" class="text-sm text-slate-500">执行中...</div>
-    <div class="flex justify-end mt-4"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
-
-  let totalCredit = 0, okCount = 0;
-  const rows = [];
-  for (const a of list) {
-    let credit = 0, note = "";
-    try {
-      const r1 = await api("/api/growth/run", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ account_ids: [a.id] }),
-      });
-      const { data: d1 } = await safeJson(r1);
-      const ran = (d1.results || [])[0] || {};
-      const done = (ran.tasks || []).filter(t => t.ok && !t.skipped).length;
-      note = `完成 ${done} 个`;
-
-      const r2 = await api("/api/growth/claim", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ account_ids: [a.id] }),
-      });
-      const { data: d2 } = await safeJson(r2);
-      credit = ((d2.results || [])[0] || {}).total_credit || 0;
-      totalCredit += credit;
-      if (credit > 0) okCount++;
-    } catch (e) {
-      note = "异常: " + String(e).slice(0, 40);
-    }
-    rows.push(`<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
-        ${credit > 0 ? '<i class="fa-solid fa-circle-check text-emerald-500"></i>'
-                     : '<i class="fa-solid fa-minus-circle text-slate-400"></i>'}
-        <span class="flex-1">${esc(a.name || a.uid || a.id)}</span>
-        <span class="text-xs text-slate-500">${esc(note)}</span>
-        ${credit > 0 ? `<span class="font-semibold text-amber-600">+${credit}</span>` : ""}
-      </div>`);
-    $("#growthBatchBody").innerHTML =
-      `<div class="mb-2 font-semibold ${totalCredit>0?'text-emerald-600':'text-slate-500'}">
-         已处理 ${rows.length}/${list.length}，合计获得 ${totalCredit} 积分</div>
-       <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto">${rows.join("")}</div>`;
-  }
-  $("#growthBatchBody").innerHTML =
-    `<div class="mb-2 font-semibold ${totalCredit>0?'text-emerald-600':'text-slate-500'}">
-       共 ${list.length} 个账号，${okCount} 个有收益，合计获得 ${totalCredit} 积分</div>
-     <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto">${rows.join("")}</div>`;
-  toast(totalCredit > 0 ? `批量完成，共获得 ${totalCredit} 积分` : "批量完成，无新增积分", "ok");
-  loadAccounts();
+  // 交给后台线程串行跑，前端只轮询进度：
+  // 原先前端逐个账号发两轮请求（run + claim），13 个账号要 6 分钟以上，
+  // nginx 默认 60s 就超时，体感是「点了没反应」。现在点完立刻有进度条。
+  await runJob({
+    title: "批量做成长任务",
+    iconHtml: '<i class="fa-solid fa-seedling mr-1 text-emerald-600"></i>',
+    submitUrl: "/api/growth/run-async",
+    body: { account_ids: [], task_codes: null },
+    label: x => x.name || x.account_id,
+    detail: x => {
+      if (!x.ok) return x.msg || "失败";
+      const done = (x.tasks || []).filter(t => t.ok && !t.skipped).length;
+      return done ? `完成 ${done} 个任务` : "无可做任务";
+    },
+    amount: x => (x.credit > 0)
+      ? `<span class="font-semibold text-amber-600 shrink-0">+${x.credit}</span>` : "",
+    icon: x => (x.credit > 0)
+      ? '<i class="fa-solid fa-circle-check text-emerald-500 shrink-0"></i>'
+      : x.ok ? '<i class="fa-solid fa-minus-circle text-slate-400 shrink-0"></i>'
+             : '<i class="fa-solid fa-circle-xmark text-red-500 shrink-0"></i>',
+    doneText: d => {
+      const r = d.result || {};
+      return `完成，共 ${r.accounts || d.total} 个账号，合计获得 ${r.credit || 0} 积分`;
+    },
+    summaryHtml: d => {
+      const r = d.result || {};
+      const parts = [`完成任务 <b>${r.tasks_done || 0}</b> 个`];
+      if (r.credit) parts.push(`<b class="text-amber-600">+${r.credit} 积分</b>`);
+      if (r.energy) parts.push(`+${r.energy} 能量`);
+      if (r.failed && r.failed.length) parts.push(`<span class="text-red-600">失败 ${r.failed.length} 个账号</span>`);
+      return parts.join(" · ");
+    },
+    doneToast: d => {
+      const r = d.result || {};
+      return (r.credit > 0) ? `批量完成，共获得 ${r.credit} 积分` : "批量完成，无新增积分";
+    },
+    onFinish: () => loadAccounts(),
+  });
 }
 
 /* 积分明细 */
