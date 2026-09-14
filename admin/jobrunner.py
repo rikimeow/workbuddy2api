@@ -45,6 +45,8 @@ class Job:
         self.result: dict | None = None
         self.error: str | None = None
         self.items: list[dict] = []      # 每个账号的实时结果
+        self.current: str = ""           # 正在处理的账号名（心跳）
+        self.beat_at: datetime | None = None
         self._lock = threading.Lock()
 
     def add_item(self, item: dict) -> None:
@@ -52,6 +54,17 @@ class Job:
         with self._lock:
             self.items.append(item)
             self.done = len(self.items)
+            self.current = ""
+
+    def beat(self, account: str = "") -> None:
+        """心跳：表示「还活着，正在处理某个账号」。
+
+        慢账号（上游要等几秒）如果什么都不上报，前端会一直显示同一个
+        进度，看起来像卡死。心跳让界面能显示「正在处理 xxx」。
+        """
+        with self._lock:
+            self.current = account
+            self.beat_at = datetime.utcnow()
 
     def set_phase(self, phase: str) -> None:
         self.phase = phase
@@ -70,6 +83,7 @@ class Job:
             "done": self.done,
             "elapsed_s": round(elapsed, 1),
             "percent": int(self.done / self.total * 100) if self.total else 0,
+            "current": self.current,
             "items": list(self.items),
             "result": self.result,
             "error": self.error,

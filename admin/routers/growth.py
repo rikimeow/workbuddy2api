@@ -32,10 +32,16 @@ _ACCOUNT_GAP = 1.0        # 两个账号之间
 #: 轮询参数：等上游落库时用「轮询到就绪」，而不是固定 sleep。
 #: 超时只是兜底上限，正常情况远早于它返回。
 _POLL_INTERVAL = 0.5      # 轮询间隔
-_ACCEPT_TIMEOUT = 8.0     # 等 accept 参与状态落库
-_VERIFY_TIMEOUT = 8.0     # 等触发后进度落库
+_ACCEPT_TIMEOUT = 6.0     # 等 accept 参与状态落库
+_VERIFY_TIMEOUT = 6.0     # 等触发后进度落库
 
 _MAX_TIMES = 10           # 单任务最多触发次数上限
+
+#: 单个账号的总时间预算（秒）。
+#: 上游慢或某任务一直不达标时，各阶段的超时虽然都有上限，但会累加：
+#: 4 个任务 × (accept 6s + 触发 N×1.2s + 复查 6s) 就可能到几分钟。
+#: 一个异常账号足以让整个批量看起来「卡住不动」，所以再加一道账号级兜底。
+_ACCOUNT_BUDGET = 45.0
 
 #: 触发事件时优先使用的免费模型（0 倍率），用完再退回低倍率
 _PREFERRED_MODELS = ["hy3", "hunyuan-chat"]
@@ -153,8 +159,10 @@ def growth_accept(payload: AcceptIn, db: Session = Depends(get_db)):
 def _find_task(session, task_code: str) -> dict | None:
     """重新读取单个任务的最新状态（accept 后刷新用）。
 
-    注意：每次调用都会拉一次完整任务列表（上游约 1.3~2.4 秒）。
-    轮询场景下调用频繁，因此轮询间隔不能太小，且应尽量复用已有数据。
+    注意：每次调用都会拉一次完整任务列表（上游 1.3~2.4 秒）。
+    因此**绝不能**把它放进高频轮询里——否则轮询间隔会被单次请求耗时
+    顶到几秒，8 秒的上限内反复拉列表，账号一多就非常慢。
+    轮询应改用 _task_state（带缓存）。
     """
     try:
         for t in session.growth_tasks():
@@ -163,6 +171,43 @@ def _find_task(session, task_code: str) -> dict | None:
     except Exception:
         pass
     return None
+
+
+class _TaskState:
+    """轮询用的任务状态缓存：在 min_interval 内复用上一次的列表结果。
+
+    上游拉一次列表要 1~2 秒，如果轮询里每次都重新拉，既慢又浪费，
+    还会让「8 秒超时」变成实际十几秒。这里缓存一个短窗口（默认 1 秒），
+    既能看到状态变化，又不会把上游打爆。
+    """
+
+    def __init__(self, session, min_interval: float = 1.0):
+        self._s = session
+        self._min = min_interval
+        self._ts = 0.0
+        self._snapshot: list | None = None
+
+    def _list(self, force: bool = False) -> list:
+        now = time.monotonic()
+        if force or self._snapshot is None or (now - self._ts) >= self._min:
+            try:
+                self._snapshot = self._s.growth_tasks()
+                self._ts = now
+            except Exception:
+                if self._snapshot is None:
+                    self._snapshot = []
+                # 拉取失败时保留旧快照，等下次窗口再试
+        return self._snapshot or []
+
+    def get(self, task_code: str) -> dict | None:
+        for t in self._list():
+            if t.get("task_code") == task_code:
+                return t
+        return None
+
+    def refresh(self) -> list:
+        """强制拉一次最新列表（需要精确状态时用）。"""
+        return self._list(force=True)
 
 
 def _updated(session, acc: Account) -> str:
@@ -174,7 +219,7 @@ def _updated(session, acc: Account) -> str:
 
 
 def run_accounts(account_ids: list[int], task_codes: list[str] | None,
-                 db: Session, on_done=None) -> dict:
+                 db: Session, on_done=None, on_beat=None) -> dict:
     """对一批账号执行「自动参与 + 触发完成 + 领取」。供接口与定时任务共用。
 
     这里沉淀了串行执行与节流逻辑，定时任务必须复用本函数，
@@ -200,9 +245,21 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                 on_done(item)
             continue
 
+        # 开始处理这个账号时先报一次心跳，界面才能显示「正在处理 xxx」，
+        # 否则慢账号期间进度条纹丝不动，看起来像卡死
+        if on_beat:
+            try:
+                on_beat(acc.name or str(aid))
+            except Exception:
+                pass
+
         acc_log = {"account_id": aid, "name": acc.name, "model": model,
                    "ok": True, "tasks": []}
         snapshot = None
+        # 单账号总预算：无论上游多慢、任务多少，超过就收尾进入下一个账号。
+        # 没有这个兜底时，一个异常账号可能把整个批量拖住很久（表现为
+        # 「卡在 N/M 不动了」）。达到预算会记录超时提示，不会静默丢弃。
+        acc_deadline = time.monotonic() + _ACCOUNT_BUDGET
         try:
             with backend.AccountSession(acc.auth_json) as s:
                 tasks = s.growth_tasks()
@@ -266,21 +323,30 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                         item.update({"ok": True, "skipped": plan.reason or "需人工完成"})
                         acc_log["tasks"].append(item)
                         continue
+                    if time.monotonic() >= acc_deadline:
+                        # 单账号预算用完：如实标记，不静默跳过
+                        item.update({"ok": False, "skipped": "本账号超时，剩余任务留待下次"})
+                        acc_log["tasks"].append(item)
+                        acc_log["budget_exceeded"] = True
+                        continue
 
                     # 参与（未参与的任务不计进度）：
-                    # 轮询等 accept 落库，而不是固定 sleep 3 秒
+                    # 轮询等 accept 落库，而不是固定 sleep 3 秒。
+                    # 用缓存轮询：上游拉一次列表要 1~2 秒，直接放在轮询里
+                    # 会把「8 秒上限」拖成实际十几秒。
+                    state = _TaskState(s)
                     if info.get("accept_status") == "not_accepted":
                         try:
                             s.growth_accept([code])
 
                             def _accepted(c=code):
-                                t = _find_task(s, c)
+                                t = state.get(c)
                                 return bool(t and t.get("accept_status") not in
                                             (None, "", "not_accepted"))
 
                             jobrunner.wait_for(_accepted, _ACCEPT_TIMEOUT,
                                                _POLL_INTERVAL)
-                            info = _find_task(s, code) or info
+                            info = state.refresh() and state.get(code) or info
                         except Exception as e:
                             item["accept_error"] = str(e)
 
@@ -301,8 +367,8 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                         time.sleep(_EVENT_GAP)
 
                     # 复查：轮询到进度变化为止，避免「已完成但没领」的假象
-                    def _advanced(c=code, tgt=target, cur=current):
-                        n = _find_task(s, c)
+                    def _advanced(c=code, cur=current):
+                        n = state.get(c)
                         if not n:
                             return False
                         st = n.get("accept_status")
@@ -314,7 +380,7 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                     jobrunner.wait_for(_advanced, _VERIFY_TIMEOUT, _POLL_INTERVAL)
 
                     try:
-                        snapshot = s.growth_tasks()
+                        snapshot = state.refresh()
                         now = {t.get("task_code"): t for t in snapshot}
                         cur_task = now.get(code) or {}
                         np_ = cur_task.get("progress") or {}
@@ -468,7 +534,8 @@ def growth_run_async(payload: RunIn):
         db = SessionLocal()
         try:
             job.set_phase("执行中")
-            res = run_accounts(ids, tasks, db, on_done=job.add_item)
+            res = run_accounts(ids, tasks, db, on_done=job.add_item,
+                               on_beat=job.beat)
         finally:
             db.close()
         results = res.get("results") or []

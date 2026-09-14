@@ -915,7 +915,11 @@ function jobProgressHtml(d, opts) {
          <i class="fa-solid fa-spinner fa-spin mr-1"></i>
          ${esc(d.phase || "执行中")} ${d.done}/${d.total}
          <span class="text-slate-400 font-normal text-xs ml-1">已用 ${d.elapsed_s}s</span>
-       </div>`;
+       </div>
+       ${d.current ? `<div class="text-xs text-slate-500 mb-2">
+           <i class="fa-solid fa-circle-notch fa-spin mr-1 text-sky-500"></i>
+           正在处理 <b class="text-slate-700">${esc(d.current)}</b>
+         </div>` : ""}`;
 
   return `${head}
     <div class="h-2 rounded-full bg-slate-100 overflow-hidden mb-2">
