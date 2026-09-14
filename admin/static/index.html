@@ -888,11 +888,23 @@ async function catTravelBatch() {
          <span class="text-slate-500 text-xs">${esc(x.summary||"")}</span>
          ${x.credits > 0 ? `<span class="font-semibold text-amber-600">+${x.credits}</span>` : ""}
        </div>`).join("");
+    // 分类展示：领养 +300 与旅行返现量级差几十倍，合并会让人以为白干了
+    const b = d.buckets || {};
+    const parts = [];
+    if (b.adopted) parts.push(`首次领养 <b class="text-emerald-600">${b.adopted}</b> 个（+${b.adopt_credits}）`);
+    if (b.travel_claimed) parts.push(`旅行返现 <b class="text-amber-600">${b.travel_claimed}</b> 个（+${b.travel_credits}）`);
+    if (b.travel_none) parts.push(`无新增 ${b.travel_none} 个`);
+    if (b.traveling) parts.push(`旅行中 ${b.traveling} 个`);
+    if (b.gate_blocked) parts.push(`<span class="text-orange-600">门槛未达标 ${b.gate_blocked} 个</span>`);
+    if (b.error) parts.push(`<span class="text-red-600">失败 ${b.error} 个</span>`);
+    const detail = parts.length ? `<div class="text-xs text-slate-500 font-normal mt-0.5">${parts.join(" · ")}</div>` : "";
     $("#catBatchBody").innerHTML =
       `<div class="mb-2 font-semibold ${d.credits>0?'text-emerald-600':'text-slate-500'}">
-         共 ${d.total} 个账号，成功 ${d.succeeded} 个，合计获得 ${d.credits} 积分</div>
+         共 ${d.total} 个账号，合计获得 ${d.credits} 积分${detail}</div>
        <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-80 overflow-auto">${rows}</div>`;
-    toast(d.credits > 0 ? `批量完成，共获得 ${d.credits} 积分` : "批量完成，无新增积分",
+    toast(d.credits > 0
+            ? `批量完成：${b.adopted?`领养 ${b.adopted} 个（+${b.adopt_credits}）`:""}${b.adopted&&b.travel_claimed?"，":""}${b.travel_claimed?`旅行返现 ${b.travel_claimed} 个（+${b.travel_credits}）`:"（无新增）"}`
+            : "批量完成，无新增积分",
           "ok");
     loadAccounts();
   } catch (e) {

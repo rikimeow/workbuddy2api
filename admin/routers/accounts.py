@@ -360,7 +360,11 @@ def cat_travel_batch(
     _: bool = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """批量执行猫猫旅行；逐个账号串行执行并返回每个账号的结果。"""
+    """批量执行猫猫旅行；逐个账号串行执行并返回每个账号的结果。
+
+    按结果分类统计，避免把「首次领养 +300」和「旅行到站返现 +7」混在一起 ——
+    两者量级差几十倍，合并成一个总数会让人误以为执行无效。
+    """
     q = db.query(Account).filter(Account.status == "active")
     if body.ids:
         q = q.filter(Account.id.in_(body.ids))
@@ -368,6 +372,11 @@ def cat_travel_batch(
 
     results = []
     total_credits = 0
+    #: 分类计数：首次领养 / 旅行返现 / 无新增 / 门槛未达标 / 失败
+    buckets = {"adopted": 0, "adopt_credits": 0,
+               "travel_claimed": 0, "travel_credits": 0,
+               "travel_none": 0, "traveling": 0,
+               "gate_blocked": 0, "error": 0}
     for acc in rows:
         try:
             with backend.AccountSession(acc.auth_json) as sess:
@@ -376,12 +385,27 @@ def cat_travel_batch(
                 db.commit()
         except Exception as e:
             results.append({"id": acc.id, "account": acc.name, "ok": False,
-                            "credits": 0, "summary": f"执行异常: {e}", "steps": []})
+                            "credits": 0, "summary": f"执行异常: {e}", "steps": [],
+                            "outcome": "error"})
+            buckets["error"] += 1
             continue
         if res.get("credits"):
             total_credits += res["credits"]
             _refresh_balance(acc)
             db.commit()
+
+        outcome = res.get("outcome") or ("error" if not res.get("ok") else "travel_none")
+        if outcome == "adopted":
+            buckets["adopted"] += 1
+            buckets["adopt_credits"] += res.get("credits") or 0
+        elif outcome == "travel_claimed":
+            buckets["travel_claimed"] += 1
+            buckets["travel_credits"] += res.get("credits") or 0
+        elif outcome in buckets:
+            buckets[outcome] += 1
+        else:
+            buckets["travel_none"] += 1
+
         results.append({
             "id": acc.id,
             "account": acc.name,
@@ -392,6 +416,7 @@ def cat_travel_batch(
         "total": len(results),
         "credits": total_credits,
         "succeeded": sum(1 for r in results if r.get("ok")),
+        "buckets": buckets,
         "results": results,
     }
 

@@ -6,6 +6,7 @@
 import json
 import os
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -209,16 +210,57 @@ class AccountSession:
             and self.BUDDY_TASK_INCOMPLETE_MARKER in str(res.get("msg", "")).lower()
         )
 
+    #: 领养门槛所需的最小对话次数。服务端原文为
+    #: "first_buddy task not completed yet (need at least one conversation)"，
+    #: 实测发 1 次 chat_request_send 事件即可让 first_buddy 变为 completed。
+    BUDDY_GATE_CHATS = 1
+
+    def _clear_buddy_gate(self) -> tuple[bool, str]:
+        """尝试清除领养门槛（first_buddy 任务）。
+
+        实测结论：发一次带 chat_request_send 的对话事件，first_buddy 即从
+        not_accepted 直接变为 completed，无需先调 accept。事件走的是正常的
+        /v2/chat/completions（免费模型 + max_tokens=1，HTTP 200，成本为 0）。
+
+        Returns:
+            (是否已达标, 说明文字)
+        """
+        for i in range(self.BUDDY_GATE_CHATS):
+            try:
+                r = self.growth_fire_event(["chat_request_send"])
+            except Exception as e:
+                return False, f"触发对话异常：{e}"
+            if not r.get("ok"):
+                return False, f"触发对话失败：{r.get('msg') or r.get('status')}"
+            if i + 1 < self.BUDDY_GATE_CHATS:
+                time.sleep(1.5)
+
+        # 复查任务是否达标
+        time.sleep(1.5)
+        try:
+            for t in self.growth_tasks():
+                if t.get("task_code") == "first_buddy":
+                    if t.get("accept_status") in ("completed", "claimed"):
+                        return True, "已完成首次对话，门槛达标"
+                    pr = t.get("progress") or {}
+                    return False, (f"对话后仍未达标（{pr.get('current')}/{pr.get('target')}）")
+        except Exception as e:
+            return False, f"复查任务状态异常：{e}"
+        return False, "未找到 first_buddy 任务"
+
     def run_cat_travel(self, location_id: int = 4) -> dict:
         """执行一趟猫猫旅行，返回结构化分步结果（供前端逐步提示）。
 
         步骤语义：
-          - adopt  : 无猫时才做（同意协议 → 首次领养），成功 +300 积分
-          - depart : 空闲时派出
-          - claim  : 到站时领奖，reward 为实发积分
+          - agreement : 无猫时才做，同意活动协议
+          - gate      : 无猫且门槛未达标时，补一次对话以解锁领养
+          - adopt     : 无猫时才做，首次领养，成功 +300 积分
+          - depart    : 空闲时派出
+          - claim     : 到站时领奖，reward 为实发积分
 
-        门槛未达标（first_buddy task not completed yet）不是失败，而是「本次
-        无法领养」，标记为 skipped 并说明原因，避免误报为错误。
+        领养门槛：领养要求 first_buddy 任务完成，该任务的条件是
+        「至少一次对话」。本流程会自动补上这次对话（免费模型、成本 0），
+        因此新手账号也能一次跑通，不需要人工先去聊一句。
         """
         steps: list[dict] = []
         credits = 0
@@ -237,7 +279,7 @@ class AccountSession:
         except Exception as e:
             add("info", False, str(e))
             return {"ok": False, "credits": credits, "steps": steps,
-                    "summary": "查询猫档案失败"}
+                    "summary": "查询猫档案失败", "outcome": "error"}
 
         # ── 2) 无猫则领养 ──────────────────────────────────────────────
         if buddy is None:
@@ -245,24 +287,44 @@ class AccountSession:
             if not agr["ok"]:
                 add("agreement", False, f"同意协议失败：{agr['msg'] or agr['status']}")
                 return {"ok": False, "credits": credits, "steps": steps,
-                        "summary": "同意协议失败"}
+                        "summary": "同意协议失败", "outcome": "error"}
             add("agreement", True, "已同意活动协议")
 
             first = self.buddy_first()
+
+            # 门槛未达标：自动补一次对话后再试，避免新手账号必然失败
+            if not first["ok"] and self._is_threshold_not_met(first):
+                add("gate", True, "领养门槛未达标，自动补一次对话以解锁")
+                gate_ok, gate_msg = self._clear_buddy_gate()
+                add("gate", gate_ok, gate_msg, skipped=not gate_ok)
+                if gate_ok:
+                    first = self.buddy_first()
+
             if first["ok"]:
-                # 领养成功即发放 300 积分（上游在 data 里可能回传余额）
-                add("adopt", True, "领养成功，已发放 300 积分", reward=300)
-            elif self._is_threshold_not_met(first):
-                add("adopt", True, "暂不可领养：对话门槛未达标（需先与 WorkBuddy 对话几次）",
-                    skipped=True)
+                # 领养成功发放 300 积分；上游在 data 里回传实际到账值
+                data = first.get("data") or {}
+                got = int(data.get("credit") or 0)
+                energy = int(data.get("energy") or 0)
+                reward = got if got > 0 else 300
+                msg = f"领养成功，已发放 {reward} 积分"
+                if energy:
+                    msg += f" + {energy} 能量"
+                badge = (data.get("badge") or {}).get("name")
+                if badge:
+                    msg += f"，解锁徽章「{badge}」"
+                add("adopt", True, msg, reward=reward)
                 return {"ok": True, "credits": credits, "steps": steps,
-                        "summary": "本次无法领养（对话门槛未达标）"}
-            else:
-                add("adopt", False, f"领养失败：{first['msg'] or first['status']}")
-                return {"ok": False, "credits": credits, "steps": steps,
-                        "summary": "领养失败"}
-        else:
-            add("adopt", True, f"已有猫：{buddy.get('name') or buddy.get('id')}", skipped=True)
+                        "summary": msg, "outcome": "adopted"}
+            if self._is_threshold_not_met(first):
+                add("adopt", True, "本次无法领养：对话门槛未达标", skipped=True)
+                return {"ok": True, "credits": credits, "steps": steps,
+                        "summary": "本次无法领养（对话门槛未达标）",
+                        "outcome": "gate_blocked"}
+            add("adopt", False, f"领养失败：{first['msg'] or first['status']}")
+            return {"ok": False, "credits": credits, "steps": steps,
+                    "summary": "领养失败", "outcome": "error"}
+
+        add("adopt", True, f"已有猫：{buddy.get('name') or buddy.get('id')}", skipped=True)
 
         # ── 3) 查旅行状态 ──────────────────────────────────────────────
         try:
@@ -270,7 +332,7 @@ class AccountSession:
         except Exception as e:
             add("status", False, str(e))
             return {"ok": False, "credits": credits, "steps": steps,
-                    "summary": "查询旅行状态失败"}
+                    "summary": "查询旅行状态失败", "outcome": "error"}
 
         state = str(st.get("state") or "").strip()
         record_id = int(st.get("record_id") or 0)
@@ -280,16 +342,18 @@ class AccountSession:
             if record_id <= 0:
                 add("claim", False, "已到站但缺少 record_id，无法领奖")
                 return {"ok": False, "credits": credits, "steps": steps,
-                        "summary": "领奖失败（缺少 record_id）"}
+                        "summary": "领奖失败（缺少 record_id）", "outcome": "error"}
             cl = self.travel_claim(record_id)
             if cl["ok"]:
                 reward = int((cl["data"] or {}).get("reward_credit") or 0)
                 add("claim", True, f"领奖成功，获得 {reward} 积分", reward=reward)
+                outcome = "travel_claimed" if reward > 0 else "travel_none"
             else:
                 add("claim", False, f"领奖失败：{cl['msg'] or cl['status']}")
                 return {"ok": False, "credits": credits, "steps": steps,
-                        "summary": "领奖失败"}
+                        "summary": "领奖失败", "outcome": "error"}
         elif state == "idle":
+            outcome = "travel_none"
             if st.get("daily_limit_reached"):
                 add("depart", True, "今日已派出过，明日 00:00 后可再次派出", skipped=True)
             else:
@@ -299,11 +363,13 @@ class AccountSession:
                 else:
                     add("depart", False, f"派出失败：{dp['msg'] or dp['status']}")
                     return {"ok": False, "credits": credits, "steps": steps,
-                            "summary": "派出失败"}
+                            "summary": "派出失败", "outcome": "error"}
         elif state == "traveling":
+            outcome = "traveling"
             add("depart", True, f"猫咪正在旅行中（record={record_id}），到站后可领奖",
                 skipped=True)
         else:
+            outcome = "unknown"
             add("status", True, f"未知旅行状态 {state!r}，未执行动作", skipped=True)
 
         total = sum(s["reward"] for s in steps)
@@ -311,7 +377,8 @@ class AccountSession:
             summary = f"完成，共获得 {total} 积分"
         else:
             summary = "完成，本次无新增积分"
-        return {"ok": True, "credits": credits, "steps": steps, "summary": summary}
+        return {"ok": True, "credits": credits, "steps": steps,
+                "summary": summary, "outcome": outcome}
 
     # -----------------------------------------------------------------------
     # 成长计划任务（/v2/activity/growth/tasks*）
