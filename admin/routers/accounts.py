@@ -37,6 +37,65 @@ class ImportLocalIn(BaseModel):
     all: bool = False
 
 
+class ExportIn(BaseModel):
+    ids: list[int] = []      # 空 = 全部
+    include_disabled: bool = False
+
+
+def _export_items(rows: list[Account]) -> list[str]:
+    """把账号记录还原成 .info 原文列表。
+
+    导出的是 auth_json 原文（与上传接受的格式完全一致），
+    因此导出文件可以直接再传回来，不需要额外转换。
+    """
+    items: list[str] = []
+    for a in rows:
+        raw = (a.auth_json or "").strip()
+        if not raw:
+            continue
+        try:
+            json.loads(raw)
+        except Exception:
+            continue  # 跳过损坏记录，避免整个导出失败
+        items.append(raw)
+    return items
+
+
+@router.post("/export")
+def export_accounts(
+    body: ExportIn,
+    _: bool = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """导出账号登录态。
+
+    返回 {items: [.info 原文...]}，与「批量上传」接受的格式一致，
+    导出的内容可以直接原样再传回来（round-trip）。
+
+    注意：导出内容含 token，等同账号凭据，请勿外传。
+    """
+    q = db.query(Account)
+    if body.ids:
+        q = q.filter(Account.id.in_(body.ids))
+    elif not body.include_disabled:
+        q = q.filter(Account.status == "active")
+    rows = q.order_by(Account.id).all()
+
+    items = _export_items(rows)
+    return {
+        "total": len(rows),
+        "count": len(items),
+        "skipped": len(rows) - len(items),
+        "items": items,
+        # 附带摘要供前端展示（不含凭据）
+        "summary": [
+            {"id": a.id, "name": a.name, "uid": a.uid, "status": a.status,
+             "balance_total": a.balance_total, "balance_remain": a.balance_remain}
+            for a in rows
+        ],
+    }
+
+
 def _client_auth_dir() -> str:
     d = settings.CLIENT_AUTH_DIR or os.path.expandvars(
         r"%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth"
@@ -239,6 +298,34 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
             errors.append(f"账号 {acc.id}({acc.name}) 余额刷新失败（凭据可能失效）")
         db.commit()
     return {"added": added, "errors": errors}
+
+
+@router.get("/{acc_id}/export")
+def export_one_account(
+    acc_id: int,
+    _: bool = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """导出单个账号的登录态（.info 原文）。
+
+    与批量导出格式一致，可直接用「批量上传」导回。
+    """
+    acc = db.query(Account).filter(Account.id == acc_id).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    raw = (acc.auth_json or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="该账号没有可导出的凭据")
+    try:
+        json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="凭据内容不是合法 JSON，无法导出")
+    return {
+        "id": acc.id,
+        "name": acc.name,
+        "uid": acc.uid,
+        "item": raw,
+    }
 
 
 @router.post("/{acc_id}/inject")

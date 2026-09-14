@@ -90,6 +90,17 @@
     .confirm-ico.info{ background:rgba(40,184,148,.12); color:var(--wb-primary-d); }
     table.min-w{ min-width:680px; }
     table.min-w-sm{ min-width:560px; }
+    table.min-w-lg{ min-width:940px; }
+    /* 状态胶囊：表格里被窄列挤压时不允许折行（「正常」竖成两行非常难看） */
+    .badge{
+      display:inline-flex; align-items:center; gap:.25rem;
+      padding:.125rem .5rem; border-radius:9999px;
+      font-size:.75rem; line-height:1.25rem;
+      white-space:nowrap; word-break:keep-all;
+      vertical-align:middle;
+    }
+    /* 状态/操作列不参与收缩，避免把胶囊压窄 */
+    td.col-status, th.col-status{ width:1%; white-space:nowrap; }
     /* tab 胶囊 */
     .tab-btn{ transition:.15s; }
     .tab-btn.active{ background:var(--wb-grad); color:#fff !important; box-shadow:0 4px 12px rgba(40,184,148,.35); }
@@ -187,6 +198,7 @@
           <button onclick="scanLocal()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-magnifying-glass mr-1"></i> 扫描本机</button>
           <button onclick="refreshAll()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-rotate mr-1"></i> 全部刷新</button>
           <button onclick="openUpload()" class="text-sm px-3 py-1.5 rounded-lg btn-primary"><i class="fa-solid fa-file-import mr-1"></i> 批量上传</button>
+          <button onclick="openExport()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="导出账号登录态（.info 原文），可直接再导入"><i class="fa-solid fa-file-export mr-1 text-sky-600"></i> 批量导出</button>
           <button onclick="openAddAccount()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-plus mr-1"></i> 单个添加</button>
         </div>
       </div>
@@ -194,7 +206,7 @@
         <input id="accSearch" oninput="renderAccPage(1)" placeholder="搜索名称 / UID" class="w-full border rounded-lg px-3 py-2 text-sm" />
       </div>
       <div class="card overflow-x-auto max-h-[70vh]">
-        <table class="w-full text-sm min-w">
+        <table class="w-full text-sm min-w-lg">
           <thead class="bg-slate-50 text-slate-500 text-left sticky top-0">
             <tr>
               <th class="px-4 py-3">名称</th><th class="px-4 py-3">UID</th><th class="px-4 py-3">状态</th>
@@ -384,7 +396,7 @@
       <p class="text-xs text-slate-400 mb-3">定时统计平台总积分、同步模型列表等。调度线程随服务启动运行，到点自动执行并回填结果。</p>
       <div class="card overflow-hidden">
         <div class="overflow-x-auto">
-          <table class="w-full text-sm min-w">
+          <table class="w-full text-sm min-w-lg">
             <thead class="bg-slate-50 text-slate-500 text-left"><tr>
               <th class="px-4 py-3">任务名</th><th class="px-4 py-3">类型</th><th class="px-4 py-3">间隔(分)</th>
               <th class="px-4 py-3">下次运行</th><th class="px-4 py-3">上次结果</th><th class="px-4 py-3">状态</th>
@@ -741,7 +753,7 @@ function card(t, v, ic, col) {
 }
 function badge(st) {
   const m = st === "active" ? ["bg-emerald-100 text-emerald-700","正常"] : ["bg-slate-100 text-slate-500","禁用"];
-  return `<span class="px-2 py-0.5 rounded-full text-xs ${m[0]}">${m[1]}</span>`;
+  return `<span class="badge ${m[0]}">${m[1]}</span>`;
 }
 
 /* 列表分页（移动端友好） */
@@ -766,11 +778,11 @@ function pagerHtml(total, page, totalPages, fn) {
 function accRow(a) {
   return `
     <tr class="border-t hover:bg-slate-50">
-      <td class="px-4 py-3">${esc(a.name || "未命名")}</td>
-      <td class="px-4 py-3 text-slate-500 font-mono text-xs">${esc(a.uid || "-")}</td>
-      <td class="px-4 py-3">${badge(a.status)}</td>
+      <td class="px-4 py-3 whitespace-nowrap">${esc(a.name || "未命名")}</td>
+      <td class="px-4 py-3 text-slate-500 font-mono text-xs whitespace-nowrap">${esc(a.uid || "-")}</td>
+      <td class="px-4 py-3 col-status">${badge(a.status)}</td>
       <td class="px-4 py-3">${a.balance_total}</td>
-      <td class="px-4 py-3 font-medium ${a.balance_remain>0?'text-emerald-600':'text-red-500'}">${a.balance_remain}</td>
+      <td class="px-4 py-3 font-medium whitespace-nowrap ${a.balance_remain>0?'text-emerald-600':'text-red-500'}">${a.balance_remain}</td>
       <td class="px-4 py-3 text-slate-400 text-xs whitespace-nowrap">${fmtTime(a.last_sync_at)}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
         <button onclick="growthTasks(${a.id},'${esc(a.name||'')}')" class="text-emerald-600 hover:text-emerald-800 mr-1" title="成长任务（查看/完成/领奖）"><i class="fa-solid fa-seedling"></i></button>
@@ -779,6 +791,7 @@ function accRow(a) {
         <button onclick="viewRequestUsage(${a.id},'${esc(a.name||'')}')" class="text-blue-600 hover:text-blue-800 mr-1" title="请求用量"><i class="fa-solid fa-chart-line"></i></button>
         <button onclick="injectAcc(${a.id})" class="text-violet-600 hover:text-violet-800 mr-1" title="注入到本机客户端"><i class="fa-solid fa-right-to-bracket"></i></button>
         <button onclick="refreshAcc(${a.id})" class="text-indigo-600 hover:text-indigo-800 mr-1" title="刷新余额"><i class="fa-solid fa-rotate"></i></button>
+        <button onclick="exportAcc(${a.id},'${esc(a.name||'')}')" class="text-sky-600 hover:text-sky-800 mr-1" title="导出该账号登录态（.info）"><i class="fa-solid fa-file-export"></i></button>
         <button onclick="toggleAcc(${a.id},'${a.status==='active'?'disabled':'active'}')" class="text-slate-500 hover:text-slate-800 mr-1" title="启用/禁用"><i class="fa-solid fa-power-off"></i></button>
         <button onclick="delAcc(${a.id})" class="text-red-500 hover:text-red-700" title="删除"><i class="fa-solid fa-trash"></i></button>
       </td>
@@ -1483,6 +1496,110 @@ async function submitUpload(){
   if(d.errors && d.errors.length) console.warn(d.errors);
   loadAccounts();
 }
+/* ==========================================================================
+   账号导出
+   --------------------------------------------------------------------------
+   导出的是 .info 原文（与「批量上传」接受的格式完全一致），
+   所以导出的文件可以直接再传回来，不需要任何转换。
+   ========================================================================== */
+
+/** 触发浏览器下载一个文本文件。 */
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** 导出时间戳，形如 20260914-1530。 */
+function exportStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+function openExport() {
+  const list = _accData || [];
+  const act = list.filter(a => a.status === "active").length;
+  openModal(`
+    <h3 class="font-bold mb-3"><i class="fa-solid fa-file-export mr-1 text-sky-600"></i> 批量导出账号</h3>
+    <div class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 mb-3">
+      <i class="fa-solid fa-triangle-exclamation mr-1"></i>
+      导出内容包含登录 token，等同账号凭据，请勿外传或提交到代码仓库。
+    </div>
+    <p class="text-xs text-slate-500 mb-2">
+      导出为 <code>.info</code> 原文，可直接用「批量上传」再导回，格式完全兼容。
+    </p>
+    <label class="flex items-center gap-2 text-sm mb-3">
+      <input id="expIncludeDisabled" type="checkbox" class="rounded" />
+      包含已禁用的账号
+    </label>
+    <div class="text-sm text-slate-600 mb-3">
+      当前账号 <b>${list.length}</b> 个，其中可用 <b>${act}</b> 个
+    </div>
+    <div class="flex justify-between gap-2 mt-4">
+      <button onclick="copyExport()" class="px-3 py-1.5 rounded-lg border text-sm"><i class="fa-solid fa-copy mr-1"></i>复制到剪贴板</button>
+      <div class="flex gap-2">
+        <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">取消</button>
+        <button onclick="doExport()" class="px-3 py-1.5 rounded-lg btn-primary"><i class="fa-solid fa-download mr-1"></i>下载文件</button>
+      </div>
+    </div>`);
+}
+
+async function _fetchExport() {
+  const inc = $("#expIncludeDisabled")?.checked;
+  const r = await api("/api/accounts/export", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: [], include_disabled: !!inc })
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { toast("导出失败：" + (d.detail || r.status), "err"); return null; }
+  if (!d.items || !d.items.length) { toast("没有可导出的账号", "err"); return null; }
+  return d;
+}
+
+async function doExport() {
+  const d = await _fetchExport();
+  if (!d) return;
+  // 每行一个 JSON 对象（JSONL）：既能被批量上传逐行解析，
+  // 也能用文本工具按行处理，比单个大数组更实用。
+  const text = d.items.map(x => JSON.stringify(JSON.parse(x))).join("\n");
+  downloadText(`workbuddy-accounts-${exportStamp()}.info`, text);
+  closeModal();
+  toast(`已导出 ${d.count} 个账号${d.skipped ? `（跳过 ${d.skipped} 个无效凭据）` : ""}`, "ok");
+}
+
+async function copyExport() {
+  const d = await _fetchExport();
+  if (!d) return;
+  const text = d.items.map(x => JSON.stringify(JSON.parse(x))).join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`已复制 ${d.count} 个账号到剪贴板`, "ok");
+  } catch (e) {
+    // 非 HTTPS / 无权限时降级：把内容放进文本框让用户手动复制
+    openModal(`
+      <h3 class="font-bold mb-3">手动复制（剪贴板不可用）</h3>
+      <textarea class="w-full border rounded-lg p-2 text-xs h-60 font-mono">${esc(text)}</textarea>
+      <div class="flex justify-end mt-3">
+        <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button>
+      </div>`);
+  }
+}
+
+/** 导出单个账号。 */
+async function exportAcc(id, name) {
+  const r = await api(`/api/accounts/${id}/export`);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { toast("导出失败：" + (d.detail || r.status), "err"); return; }
+  const safe = String(name || d.name || d.uid || id).replace(/[\\/:*?"<>|]/g, "_").slice(0, 40);
+  downloadText(`${safe || "account"}-${id}.info`, JSON.stringify(JSON.parse(d.item), null, 2));
+  toast(`已导出账号「${name || d.name || id}」`, "ok");
+}
+
 function openAddAccount(){
   openModal(`
     <h3 class="font-bold mb-3"><i class="fa-solid fa-plus mr-1"></i> 添加单个账号</h3>
@@ -1509,9 +1626,9 @@ function keyRow(k) {
       <td class="px-4 py-3">${k.unlimited?"∞":k.credit_limit}</td>
       <td class="px-4 py-3 ${k.credit_used>=k.credit_limit&&!k.unlimited?'text-red-500':''}">${k.credit_used}</td>
       <td class="px-4 py-3">${k.group_name
-          ? `<span class="px-2 py-0.5 rounded-full text-xs bg-indigo-100 text-indigo-700" title="仅可用该分组内模型">${esc(k.group_name)}</span>`
+          ? `<span class="badge bg-indigo-100 text-indigo-700" title="仅可用该分组内模型">${esc(k.group_name)}</span>`
           : `<span class="text-xs text-slate-300" title="不限制，可用全部启用模型">全部模型</span>`}</td>
-      <td class="px-4 py-3">${k.status==="active"?'<span class="px-2 py-0.5 rounded-full text-xs bg-emerald-100 text-emerald-700">正常</span>':'<span class="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-500">已吊销</span>'}</td>
+      <td class="px-4 py-3 col-status">${k.status==="active"?'<span class="badge bg-emerald-100 text-emerald-700">正常</span>':'<span class="badge bg-slate-100 text-slate-500">已吊销</span>'}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
         <button onclick="viewKeyUsage(${k.id},'${esc(k.name||'')}')" class="text-blue-600 hover:text-blue-800 mr-1" title="查看用量"><i class="fa-solid fa-chart-pie"></i></button>
         <button onclick="viewKeyFull(${k.id},'${esc(k.name||'')}')" class="text-violet-600 hover:text-violet-800 mr-1" title="查看完整Key"><i class="fa-solid fa-eye"></i></button>
@@ -1713,7 +1830,7 @@ function modelRow(m) {
       <td class="px-4 py-3">${m.level==='system'?'<span class="px-2 py-0.5 rounded text-[10px] bg-blue-100 text-blue-700">系统</span>':'<span class="px-2 py-0.5 rounded text-[10px] bg-purple-100 text-purple-700">用户</span>'}</td>
       <td class="px-4 py-3">${multDisplay}</td>
       <td class="px-4 py-3 text-slate-400 text-xs">${esc(m.note||'-')}</td>
-      <td class="px-4 py-3">${m.enabled?'<span class="px-2 py-0.5 rounded-full text-xs bg-emerald-100 text-emerald-700">启用</span>':'<span class="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-500">禁用</span>'}</td>
+      <td class="px-4 py-3 col-status">${m.enabled?'<span class="badge bg-emerald-100 text-emerald-700">启用</span>':'<span class="badge bg-slate-100 text-slate-500">禁用</span>'}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
         <button onclick="speedTestModel(${JSON.stringify(m.model_id)}, this)" class="text-sky-600 hover:text-sky-800 text-sm mr-2" title="测速（用账号池直接请求上游，免 Key）"><i class="fa-solid fa-gauge-high"></i></button>
         <button onclick="toggleModel(${m.id},${!m.enabled})" class="${m.enabled?'text-amber-600 hover:text-amber-800':'text-emerald-600 hover:text-emerald-800'} text-sm mr-2" title="${m.enabled?'禁用':'启用'}"><i class="fa-solid ${m.enabled?'fa-ban':'fa-check'}"></i></button>
@@ -1909,10 +2026,21 @@ function scheduleResultSummary(s){
     parts.push(`新增 ${obj.added||0}`);
     parts.push(`更新 ${obj.updated||0}`);
     parts.push(`共 ${obj.total_in_db||0}`);
+  } else if(s.task === "refresh_growth_tasks"){
+    parts.push(`任务 ${obj.total||0}`);
+    parts.push(`可自动 ${obj.actionable||0}`);
+  } else if(s.task === "run_growth_tasks"){
+    parts.push(`账号 ${obj.accounts||0}`);
+    if(obj.tasks_done) parts.push(`完成 ${obj.tasks_done}`);
+    if(obj.credit) parts.push(`<span class="text-amber-600 font-medium">+${obj.credit} 积分</span>`);
+    if(obj.energy) parts.push(`+${obj.energy} 能量`);
+    if(!obj.tasks_done) parts.push("无待做");
+    if(obj.failed_accounts && obj.failed_accounts.length) parts.push(`<span class="text-red-500">失败 ${obj.failed_accounts.length}</span>`);
   } else {
     parts.push(esc(raw.slice(0,120)));
   }
-  return `<span class="text-slate-600">${parts.join(" · ")}</span>`;
+  const fmt = obj.elapsed_s ? `<span class="text-slate-400 ml-1">${obj.elapsed_s}s</span>` : "";
+  return `<span class="text-slate-600">${parts.join(" · ")}</span>${fmt}`;
 }
 function showScheduleResult(id){
   const s = (_schedules||[]).find(x => x.id === id);
@@ -1928,16 +2056,18 @@ async function loadSchedules(){
   _schedules = d.items||[];
   $("#scheduleBody").innerHTML = (_schedules).map(s => `
     <tr class="border-t hover:bg-slate-50">
-      <td class="px-4 py-3">${esc(s.name)}</td>
-      <td class="px-4 py-3 text-slate-500">${esc(s.task_label)}</td>
-      <td class="px-4 py-3">${s.interval_minutes}</td>
+      <td class="px-4 py-3 whitespace-nowrap">${esc(s.name)}</td>
+      <td class="px-4 py-3 text-slate-500 whitespace-nowrap">${esc(s.task_label)}</td>
+      <td class="px-4 py-3 text-slate-500">${s.interval_minutes}</td>
       <td class="px-4 py-3 text-xs text-slate-400 whitespace-nowrap">${fmtTime(s.next_run_at)}</td>
       <td class="px-4 py-3 text-xs align-top">
-        ${scheduleResultSummary(s)}
-        <button onclick="showScheduleResult(${s.id})" class="ml-1 text-sky-600 hover:text-sky-800 align-middle" title="查看完整结果"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+        <div class="flex items-start gap-1">
+          <span class="flex-1 min-w-0">${scheduleResultSummary(s)}</span>
+          <button onclick="showScheduleResult(${s.id})" class="shrink-0 text-sky-600 hover:text-sky-800" title="查看完整结果"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+        </div>
         ${s.stop_after?`<div class="text-rose-400 mt-0.5">停止于 ${fmtTime(s.stop_after)}</div>`:''}
       </td>
-      <td class="px-4 py-3">${s.enabled?'<span class="px-2 py-0.5 rounded-full text-xs bg-emerald-100 text-emerald-700">启用</span>':'<span class="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-500">禁用</span>'}</td>
+      <td class="px-4 py-3 col-status">${s.enabled?'<span class="badge bg-emerald-100 text-emerald-700">启用</span>':'<span class="badge bg-slate-100 text-slate-500">禁用</span>'}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
         <button onclick="runSchedule(${s.id})" class="text-emerald-600 hover:text-emerald-800 mr-1" title="立即运行"><i class="fa-solid fa-play"></i></button>
         <button onclick="toggleSchedule(${s.id})" class="text-indigo-600 hover:text-indigo-800 mr-1" title="启停"><i class="fa-solid fa-power-off"></i></button>
