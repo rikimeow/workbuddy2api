@@ -313,6 +313,93 @@ class AccountSession:
             summary = "完成，本次无新增积分"
         return {"ok": True, "credits": credits, "steps": steps, "summary": summary}
 
+    # -----------------------------------------------------------------------
+    # 成长计划任务（/v2/activity/growth/tasks*）
+    #
+    # 与猫猫旅行同域（chatBase）。完整流程：
+    #   拉列表 → 参与(accept) → 触发行为 → 领奖(claim)
+    #
+    # 关键机制（逆向得出）：任务进度由「请求体里的 extra_vars.growthEvent」
+    # 驱动，而非独立的上报接口。事件形如：
+    #   extra_vars.growthEvent = '[{"eventCode":"chat_request_send","id":"<会话ID>"}]'
+    # 服务端只按 eventCode 记账，不校验模型是否真的被调用。
+    # -----------------------------------------------------------------------
+
+    def growth_tasks(self) -> list[dict]:
+        """拉取成长任务列表（含进度与状态）。"""
+        res = self._growth("GET", "/v2/activity/growth/tasks")
+        if not res["ok"]:
+            raise RuntimeError(f"拉取任务列表失败: {res['msg']}")
+        return res["data"].get("tasks") or []
+
+    def growth_accept(self, task_codes: list[str]) -> dict:
+        """批量参与任务。
+
+        未参与（not_accepted）的任务不会累计进度，必须先 accept。
+        返回 {task_code: status}，status 为 accepted / already_accepted。
+        """
+        res = self._growth("POST", "/v2/activity/growth/tasks/accept",
+                           {"task_codes": list(task_codes)})
+        if not res["ok"]:
+            raise RuntimeError(f"参与任务失败: {res['msg']}")
+        return {r.get("task_code"): r.get("status")
+                for r in (res["data"].get("results") or [])}
+
+    def growth_claim(self, task_code: str) -> dict:
+        """领取单任务奖励。
+
+        注意路径形态与其它 growth 接口不同：是 /activity/growth/tasks/{code}/claim
+        （无 v2 前缀，任务码在路径中，POST 空体）。
+        """
+        return self._growth("POST", f"/activity/growth/tasks/{task_code}/claim")
+
+    def growth_profile(self) -> dict:
+        """成长档案（等级 / 已完成数等）。"""
+        res = self._growth("GET", "/v2/activity/growth/profile")
+        return res["data"] if res["ok"] else {}
+
+    def growth_fire_event(self, event_codes: list[str], model: str = "hy3",
+                          event_id: str | None = None,
+                          conversation_id: str | None = None) -> dict:
+        """通过带 growthEvent 的模型请求触发任务进度。
+
+        发的是一个「完全合法」的请求（正常响应 200），避免在上游留下
+        异常日志：真实模型 + max_tokens=1，只取最小输出。
+        默认用免费 0 倍率模型（hy3），成本为零。
+
+        Args:
+            event_codes: 事件名列表，如 ["chat_request_send"]。
+            model: 使用的模型，默认免费模型。
+            event_id: 事件 id（会写入 growthEvent）。
+            conversation_id: 会话 id，用于服务端去重与归因。
+        """
+        conv = conversation_id or event_id or "00000000-0000-4000-8000-000000000001"
+        events = [{"eventCode": c, "id": conv} for c in event_codes]
+        body = {
+            "model": model,
+            "stream": True,
+            "max_tokens": 1,  # 最小输出：只为触发记账，不需要真实内容
+            "messages": [{"role": "user", "content": "hi"}],
+            "extra_vars": {"growthEvent": json.dumps(events, ensure_ascii=False)},
+        }
+        headers = self.cm.get_headers()
+        headers["Content-Type"] = "application/json"
+        try:
+            with httpx.Client(timeout=60, limits=HTTP_LIMITS) as c:
+                with c.stream("POST", f"{BACKEND}/v2/chat/completions",
+                              headers=headers, json=body) as r:
+                    status = r.status_code
+                    # 读完（或读到足够判断的量）后关闭，避免连接悬挂
+                    n = 0
+                    for _ in r.iter_lines():
+                        n += 1
+                        if n > 50:
+                            break
+        except Exception as e:
+            return {"ok": False, "status": 0, "msg": f"网络失败: {e}"}
+        return {"ok": status == 200, "status": status,
+                "msg": "" if status == 200 else f"HTTP {status}"}
+
     def get_token_expiry(self) -> int:
         """返回 token 到期时间戳（毫秒），0 表示未知。"""
         auth = self.cm._auth or {}
