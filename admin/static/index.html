@@ -111,14 +111,21 @@
       <div class="flex flex-wrap justify-between items-center mb-3 gap-2 panel-toolbar">
         <h2 class="font-semibold">账号池</h2>
         <div class="flex flex-wrap gap-2 tools">
+          <button onclick="catTravelBatch('cn')" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部 CN 账号执行：领养(+300) → 派猫 → 领奖"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 猫猫旅行(CN)</button>
+          <button onclick="catTravelBatch('ai')" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="对全部 AI 账号执行猫猫旅行"><i class="fa-solid fa-cat mr-1 text-sky-600"></i> 猫猫旅行(AI)</button>
           <button onclick="scanLocal()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-magnifying-glass mr-1"></i> 扫描本机</button>
           <button onclick="refreshAll()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-rotate mr-1"></i> 全部刷新</button>
           <button onclick="openUpload()" class="text-sm px-3 py-1.5 rounded-lg btn-primary"><i class="fa-solid fa-file-import mr-1"></i> 批量上传</button>
           <button onclick="openAddAccount()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-plus mr-1"></i> 单个添加</button>
         </div>
       </div>
-      <div class="flex gap-2 mb-3">
+      <div class="flex gap-2 mb-3 items-center">
         <input id="accSearch" oninput="renderAccPage(1)" placeholder="搜索名称 / UID" class="w-full border rounded-lg px-3 py-2 text-sm" />
+        <select id="accPlatform" onchange="renderAccPage(1)" class="border rounded-lg px-3 py-2 text-sm whitespace-nowrap">
+          <option value="">全部平台</option>
+          <option value="cn">CN 国内版</option>
+          <option value="ai">AI 国外版</option>
+        </select>
       </div>
       <div class="card overflow-x-auto max-h-[70vh]">
         <table class="w-full text-sm min-w">
@@ -418,6 +425,8 @@ function badge(st) {
 /* 列表分页（移动端友好） */
 const PS = 10;
 let _accData = [], _keyData = [], _modelData = [];
+/* 按 id 取账号（用于弹窗标题等展示，避免调用方重复传名称） */
+function accById(id) { return _accData.find(a => a.id === id); }
 let _accTerm = "", _keyTerm = "", _modelTerm = "";
 let _modelPage = 1;  // 模型配置当前页：跨操作与浏览器刷新保持
 // 模型列表排序：'default'(按 id) | 'mult_asc' | 'mult_desc'
@@ -432,16 +441,25 @@ function pagerHtml(total, page, totalPages, fn) {
 }
 
 /* ==================== 账号 ==================== */
+/* 平台徽标：CN 国内版 / AI 国外版 */
+function platBadge(p) {
+  const isAI = p === "ai";
+  const cls = isAI ? "bg-sky-100 text-sky-700" : "bg-slate-100 text-slate-600";
+  return `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold ${cls}">${isAI ? "AI" : "CN"}</span>`;
+}
+
 function accRow(a) {
+  const plat = a.platform || "cn";
   return `
     <tr class="border-t hover:bg-slate-50">
-      <td class="px-4 py-3">${esc(a.name || "未命名")}</td>
+      <td class="px-4 py-3">${esc(a.name || "未命名")} ${platBadge(plat)}</td>
       <td class="px-4 py-3 text-slate-500 font-mono text-xs">${esc(a.uid || "-")}</td>
       <td class="px-4 py-3">${badge(a.status)}</td>
       <td class="px-4 py-3">${a.balance_total}</td>
       <td class="px-4 py-3 font-medium ${a.balance_remain>0?'text-emerald-600':'text-red-500'}">${a.balance_remain}</td>
       <td class="px-4 py-3 text-slate-400 text-xs whitespace-nowrap">${fmtTime(a.last_sync_at)}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
+        <button onclick="catTravel(${a.id})" class="text-pink-600 hover:text-pink-800 mr-1" title="猫猫旅行（领养/派猫/领奖）"><i class="fa-solid fa-cat"></i></button>
         <button onclick="viewCreditDetails(${a.id},'${esc(a.name||'')}')" class="text-amber-600 hover:text-amber-800 mr-1" title="查看积分明细"><i class="fa-solid fa-list-ul"></i></button>
         <button onclick="viewRequestUsage(${a.id},'${esc(a.name||'')}')" class="text-blue-600 hover:text-blue-800 mr-1" title="请求用量"><i class="fa-solid fa-chart-line"></i></button>
         <button onclick="injectAcc(${a.id})" class="text-violet-600 hover:text-violet-800 mr-1" title="注入到本机客户端"><i class="fa-solid fa-right-to-bracket"></i></button>
@@ -455,9 +473,11 @@ async function loadAccounts() {
   const r = await api("/api/accounts"); if (!r.ok) return;
   const d = await r.json();
   const s = d.summary;
+  const bp = s.by_platform || { cn: 0, ai: 0 };
   $("#overview").innerHTML = `
     ${card("账号总数", s.total, "fa-users", "text-indigo-600")}
     ${card("可用账号", s.available, "fa-circle-check", "text-emerald-600")}
+    ${card("CN / AI", `${bp.cn} / ${bp.ai}`, "fa-layer-group", "text-sky-600")}
     ${card("总积分", s.balance_total, "fa-coins", "text-amber-600")}
     ${card("总剩余", s.balance_remain, "fa-wallet", "text-rose-600")}`;
   _accData = d.items || [];
@@ -465,12 +485,15 @@ async function loadAccounts() {
 }
 function renderAccPage(p) {
   const term = (_accTerm = ($("#accSearch") ? $("#accSearch").value : "").trim().toLowerCase());
-  const data = term ? _accData.filter(a => (a.name||"").toLowerCase().includes(term) || (a.uid||"").toLowerCase().includes(term)) : _accData;
+  const plat = $("#accPlatform") ? $("#accPlatform").value : "";
+  let data = _accData;
+  if (plat) data = data.filter(a => (a.platform || "cn") === plat);
+  if (term) data = data.filter(a => (a.name||"").toLowerCase().includes(term) || (a.uid||"").toLowerCase().includes(term));
   const total = data.length, totalPages = Math.max(1, Math.ceil(total / PS));
   p = Math.min(Math.max(1, p), totalPages);
   const slice = data.slice((p - 1) * PS, p * PS);
   $("#accBody").innerHTML = slice.map(accRow).join("") ||
-    `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">${term ? "无匹配的账号" : "还没有账号，点「批量上传」"}</td></tr>`;
+    `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">${term || plat ? "无匹配的账号" : "还没有账号，点「批量上传」"}</td></tr>`;
   $("#accPager").innerHTML = pagerHtml(total, p, totalPages, "renderAccPage");
 }
 async function refreshAcc(id){ const r=await api("/api/accounts/"+id+"/refresh",{method:"POST"}); toast(r.ok?"余额已刷新":"刷新失败", r.ok?"ok":"err"); if(r.ok) loadAccounts(); }
@@ -482,6 +505,88 @@ async function injectAcc(id){
   const d = await r.json().catch(()=>({}));
   if(r.ok){ toast(`已注入到本机客户端（备份: ${d.backup?d.backup.split(/[\\/]/).pop():"无"}）`); }
   else { toast("注入失败: "+(d.detail||""), "err"); }
+}
+
+/* 猫猫旅行：同意协议 → 首次领养(+300) → 派猫 → 领奖。逐步展示结果。 */
+function catStepRow(s) {
+  const icon = s.skipped ? '<i class="fa-solid fa-minus-circle text-slate-400"></i>'
+             : s.ok      ? '<i class="fa-solid fa-circle-check text-emerald-500"></i>'
+                         : '<i class="fa-solid fa-circle-xmark text-red-500"></i>';
+  const name = { agreement:"同意协议", adopt:"首次领养", status:"查询状态",
+                 depart:"派出旅行", claim:"领取奖励", info:"查询猫档案" }[s.step] || s.step;
+  const rw = s.reward > 0 ? `<span class="ml-2 font-semibold text-amber-600">+${s.reward} 积分</span>` : "";
+  return `<div class="flex items-start gap-2 py-1.5 border-b last:border-0">
+    <span class="mt-0.5">${icon}</span>
+    <div class="flex-1 text-sm">
+      <span class="font-medium text-slate-700">${name}</span>
+      <span class="text-slate-500 ml-1">${esc(s.message||"")}</span>${rw}
+    </div></div>`;
+}
+function catResultHtml(d) {
+  const steps = (d.steps || []).map(catStepRow).join("");
+  const head = d.credits > 0
+    ? `<div class="mb-2 text-emerald-600 font-semibold"><i class="fa-solid fa-gift mr-1"></i>${esc(d.summary||"")}</div>`
+    : `<div class="mb-2 ${d.ok?'text-slate-500':'text-red-500'} font-semibold">${esc(d.summary||"")}</div>`;
+  const bal = d.balance_remain !== undefined
+    ? `<div class="mt-3 text-xs text-slate-400">当前剩余积分：${d.balance_remain}</div>` : "";
+  return head + `<div class="rounded-lg border bg-slate-50 px-3 py-1">${steps}</div>` + bal;
+}
+async function catTravel(id) {
+  const name = (accById(id) || {}).name || id;
+  openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 猫猫旅行 — ${esc(name)}</h3>
+    <p class="text-xs text-slate-400 mb-3">正在执行：同意协议 → 首次领养 → 派出 → 领奖...</p><div id="catBody"></div>
+    <div class="flex justify-end mt-4"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
+  try {
+    const r = await api("/api/accounts/" + id + "/cat-travel", { method: "POST" });
+    const { ok, data: d } = await safeJson(r);
+    if (!r.ok) { $("#catBody").innerHTML = `<p class="text-red-500 text-sm">执行失败: ${esc(d.detail||"未知错误")}</p>`; return; }
+    $("#catBody").innerHTML = catResultHtml(d);
+    /* 关键：领取成功必须有明确提示，不能只体现在积分明细里 */
+    if (d.credits > 0) toast(`领取成功，获得 ${d.credits} 积分`, "ok");
+    else if (d.ok)      toast("执行完成，本次无新增积分", "ok");
+    else                toast("执行失败：" + (d.summary || ""), "err");
+    loadAccounts();
+  } catch (e) {
+    $("#catBody").innerHTML = `<p class="text-red-500 text-sm">执行异常: ${esc(String(e))}</p>`;
+  }
+}
+
+/* 猫猫旅行：批量执行（默认仅 CN；AI 需显式选择） */
+async function catTravelBatch(platformFilter) {
+  const list = _accData.filter(a => a.status === "active" && (!platformFilter || (a.platform||"cn") === platformFilter));
+  if (!list.length) { toast("没有符合条件的账号", "err"); return; }
+  const scope = platformFilter ? (platformFilter === "ai" ? "AI" : "CN") : "全部";
+  if (!confirm(`确认对 ${list.length} 个${scope}账号执行猫猫旅行？\n流程：同意协议 → 首次领养(+300) → 派出 → 领奖`)) return;
+  openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 批量猫猫旅行（${scope}）</h3>
+    <p class="text-xs text-slate-400 mb-3">共 ${list.length} 个账号，执行中请勿关闭...</p>
+    <div id="catBatchBody" class="text-sm text-slate-500">执行中...</div>
+    <div class="flex justify-end mt-4"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
+  try {
+    const r = await api("/api/accounts/cat-travel/batch", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ platform: platformFilter || null }),
+    });
+    const { ok, data: d } = await safeJson(r);
+    if (!r.ok) { $("#catBatchBody").innerHTML = `<span class="text-red-500">执行失败: ${esc(d.detail||"未知错误")}</span>`; return; }
+    const rows = (d.results || []).map(x =>
+      `<div class="flex items-center gap-2 py-1.5 border-b last:border-0">
+         ${x.credits > 0 ? '<i class="fa-solid fa-circle-check text-emerald-500"></i>'
+                         : x.ok ? '<i class="fa-solid fa-minus-circle text-slate-400"></i>'
+                                : '<i class="fa-solid fa-circle-xmark text-red-500"></i>'}
+         <span class="flex-1">${esc(x.account||x.id)}</span>
+         <span class="text-slate-500 text-xs">${esc(x.summary||"")}</span>
+         ${x.credits > 0 ? `<span class="font-semibold text-amber-600">+${x.credits}</span>` : ""}
+       </div>`).join("");
+    $("#catBatchBody").innerHTML =
+      `<div class="mb-2 font-semibold ${d.credits>0?'text-emerald-600':'text-slate-500'}">
+         共 ${d.total} 个账号，成功 ${d.succeeded} 个，合计获得 ${d.credits} 积分</div>
+       <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-80 overflow-auto">${rows}</div>`;
+    toast(d.credits > 0 ? `批量完成，共获得 ${d.credits} 积分` : "批量完成，无新增积分",
+          "ok");
+    loadAccounts();
+  } catch (e) {
+    $("#catBatchBody").innerHTML = `<span class="text-red-500">执行异常: ${esc(String(e))}</span>`;
+  }
 }
 
 /* 积分明细 */

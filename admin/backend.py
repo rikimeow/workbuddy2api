@@ -45,6 +45,14 @@ class AccountSession:
     def get_headers(self, extra: dict | None = None) -> dict:
         return self.cm.get_headers(extra=extra)
 
+    def platform(self) -> str:
+        """该账号归属平台（cn | ai）。"""
+        return self.cm.platform()
+
+    def chat_base(self) -> str:
+        """该账号的 chat / growth 域 base URL。"""
+        return self.cm.chat_base()
+
     def fetch_models(self) -> list:
         return self.cm.fetch_models()
 
@@ -127,6 +135,191 @@ class AccountSession:
         if streak is None:
             streak = data.get("streak_days")
         return {"ok": True, "credit": credit or 0, "streak_days": streak or 0}
+
+    # -----------------------------------------------------------------------
+    # 猫猫旅行（/activity/growth/buddy/*）
+    #
+    # 流程：同意协议 → 首次领养（+300 积分）→ 派出 → 到站领奖。
+    # 域为 chatBase（CN = copilot.tencent.com，不带 /v2 前缀），与 billing 域不同。
+    # -----------------------------------------------------------------------
+
+    #: 领养门槛未达标的业务错误关键词（HTTP 400 时出现），属预期而非失败。
+    BUDDY_TASK_INCOMPLETE_MARKER = "first_buddy task not completed yet"
+
+    def _growth(self, method: str, path: str, body: dict | None = None) -> dict:
+        """发 growth 域请求；返回 {ok, status, code, msg, data}，不抛异常。
+
+        与 billing 域的 `_request_backend_soft` 不同：growth 域的「门槛未达」
+        等业务失败走 HTTP 400，需要调用方读取 msg 判定，故这里把结果结构化返回。
+        """
+        headers = self.cm.get_headers()
+        url = f"{self.cm.chat_base()}{path}"
+        try:
+            with httpx.Client(timeout=15, limits=HTTP_LIMITS) as c:
+                if method.upper() == "GET":
+                    r = c.get(url, headers=headers)
+                else:
+                    r = c.post(url, headers=headers, json=body if body is not None else {})
+        except Exception as e:
+            return {"ok": False, "status": 0, "code": None, "msg": f"网络失败: {e}", "data": {}}
+        try:
+            payload = r.json()
+        except Exception:
+            return {
+                "ok": False, "status": r.status_code, "code": None,
+                "msg": f"非 JSON 响应 HTTP {r.status_code}: {r.text[:200]}", "data": {},
+            }
+        code = payload.get("code")
+        ok = r.status_code == 200 and code == 0
+        return {
+            "ok": ok,
+            "status": r.status_code,
+            "code": code,
+            "msg": payload.get("msg") or "",
+            "data": payload.get("data") or {},
+        }
+
+    def buddy_info(self) -> dict | None:
+        """查询当前猫档案；None 表示无猫（data.buddy 为 null），即尚未领养。"""
+        res = self._growth("GET", "/activity/growth/buddy/info")
+        if not res["ok"]:
+            raise RuntimeError(f"查询猫档案失败: {res['msg']}")
+        buddy = res["data"].get("buddy")
+        return buddy if isinstance(buddy, dict) and buddy else None
+
+    def buddy_agreement(self) -> dict:
+        """同意活动协议（幂等，重复调用无副作用）。"""
+        return self._growth("POST", "/activity/growth/buddy/agreement", {"agree": True})
+
+    def buddy_first(self) -> dict:
+        """首次领养。成功即发放 300 积分。"""
+        return self._growth("POST", "/activity/growth/buddy/first", {})
+
+    def travel_status(self) -> dict:
+        """查询猫猫旅行状态：state(idle/traveling/arrived) / record_id / reward_credit。"""
+        res = self._growth("GET", "/activity/growth/buddy/travel/status")
+        if not res["ok"]:
+            raise RuntimeError(f"查询旅行状态失败: {res['msg']}")
+        return res["data"] or {}
+
+    def travel_depart(self, location_id: int = 4) -> dict:
+        """派出猫旅行。4 个地点收益/时长区间完全相同，固定用 4（古镇客栈）。"""
+        return self._growth("POST", "/activity/growth/buddy/travel/depart", {"location_id": location_id})
+
+    def travel_claim(self, record_id: int) -> dict:
+        """领取到站奖励；成功时 data.reward_credit 为实发积分。"""
+        return self._growth("POST", "/activity/growth/buddy/travel/claim", {"record_id": record_id})
+
+    def _is_threshold_not_met(self, res: dict) -> bool:
+        """判定「领养门槛未达标」：HTTP 400 + first_buddy 关键词。"""
+        return (
+            res.get("status") == 400
+            and self.BUDDY_TASK_INCOMPLETE_MARKER in str(res.get("msg", "")).lower()
+        )
+
+    def run_cat_travel(self, location_id: int = 4) -> dict:
+        """执行一趟猫猫旅行，返回结构化分步结果（供前端逐步提示）。
+
+        步骤语义：
+          - adopt  : 无猫时才做（同意协议 → 首次领养），成功 +300 积分
+          - depart : 空闲时派出
+          - claim  : 到站时领奖，reward 为实发积分
+
+        门槛未达标（first_buddy task not completed yet）不是失败，而是「本次
+        无法领养」，标记为 skipped 并说明原因，避免误报为错误。
+        """
+        steps: list[dict] = []
+        credits = 0
+
+        def add(step: str, ok: bool, message: str, reward: int = 0, skipped: bool = False):
+            nonlocal credits
+            credits += reward
+            steps.append({
+                "step": step, "ok": ok, "skipped": skipped,
+                "reward": reward, "message": message,
+            })
+
+        # ── 1) 查猫档案 ────────────────────────────────────────────────
+        try:
+            buddy = self.buddy_info()
+        except Exception as e:
+            add("info", False, str(e))
+            return {"ok": False, "credits": credits, "steps": steps,
+                    "summary": "查询猫档案失败"}
+
+        # ── 2) 无猫则领养 ──────────────────────────────────────────────
+        if buddy is None:
+            agr = self.buddy_agreement()
+            if not agr["ok"]:
+                add("agreement", False, f"同意协议失败：{agr['msg'] or agr['status']}")
+                return {"ok": False, "credits": credits, "steps": steps,
+                        "summary": "同意协议失败"}
+            add("agreement", True, "已同意活动协议")
+
+            first = self.buddy_first()
+            if first["ok"]:
+                # 领养成功即发放 300 积分（上游在 data 里可能回传余额）
+                add("adopt", True, "领养成功，已发放 300 积分", reward=300)
+            elif self._is_threshold_not_met(first):
+                add("adopt", True, "暂不可领养：对话门槛未达标（需先与 WorkBuddy 对话几次）",
+                    skipped=True)
+                return {"ok": True, "credits": credits, "steps": steps,
+                        "summary": "本次无法领养（对话门槛未达标）"}
+            else:
+                add("adopt", False, f"领养失败：{first['msg'] or first['status']}")
+                return {"ok": False, "credits": credits, "steps": steps,
+                        "summary": "领养失败"}
+        else:
+            add("adopt", True, f"已有猫：{buddy.get('name') or buddy.get('id')}", skipped=True)
+
+        # ── 3) 查旅行状态 ──────────────────────────────────────────────
+        try:
+            st = self.travel_status()
+        except Exception as e:
+            add("status", False, str(e))
+            return {"ok": False, "credits": credits, "steps": steps,
+                    "summary": "查询旅行状态失败"}
+
+        state = str(st.get("state") or "").strip()
+        record_id = int(st.get("record_id") or 0)
+
+        # ── 4) 到站领奖 / 空闲派出 ─────────────────────────────────────
+        if state == "arrived":
+            if record_id <= 0:
+                add("claim", False, "已到站但缺少 record_id，无法领奖")
+                return {"ok": False, "credits": credits, "steps": steps,
+                        "summary": "领奖失败（缺少 record_id）"}
+            cl = self.travel_claim(record_id)
+            if cl["ok"]:
+                reward = int((cl["data"] or {}).get("reward_credit") or 0)
+                add("claim", True, f"领奖成功，获得 {reward} 积分", reward=reward)
+            else:
+                add("claim", False, f"领奖失败：{cl['msg'] or cl['status']}")
+                return {"ok": False, "credits": credits, "steps": steps,
+                        "summary": "领奖失败"}
+        elif state == "idle":
+            if st.get("daily_limit_reached"):
+                add("depart", True, "今日已派出过，明日 00:00 后可再次派出", skipped=True)
+            else:
+                dp = self.travel_depart(location_id)
+                if dp["ok"]:
+                    add("depart", True, "已派出猫咪旅行，到站后可领奖")
+                else:
+                    add("depart", False, f"派出失败：{dp['msg'] or dp['status']}")
+                    return {"ok": False, "credits": credits, "steps": steps,
+                            "summary": "派出失败"}
+        elif state == "traveling":
+            add("depart", True, f"猫咪正在旅行中（record={record_id}），到站后可领奖",
+                skipped=True)
+        else:
+            add("status", True, f"未知旅行状态 {state!r}，未执行动作", skipped=True)
+
+        total = sum(s["reward"] for s in steps)
+        if total > 0:
+            summary = f"完成，共获得 {total} 积分"
+        else:
+            summary = "完成，本次无新增积分"
+        return {"ok": True, "credits": credits, "steps": steps, "summary": summary}
 
     def get_token_expiry(self) -> int:
         """返回 token 到期时间戳（毫秒），0 表示未知。"""

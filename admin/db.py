@@ -93,7 +93,44 @@ def init_db():
     _ensure_column("accounts", "last_err_msg", "VARCHAR(255)", "DEFAULT ''")
     _ensure_column("accounts", "last_picked_at", "DATETIME", "NULL")
 
+    # 迁移：给 accounts 表加 platform 列（cn | ai 平台归属）。
+    # 加列后回填存量行：AI 账号的 auth_json.domain 含 workbuddy.ai，其余归 CN。
+    _ensure_column("accounts", "platform", "VARCHAR(16)", "DEFAULT ''")
+    _backfill_platform()
+
     # 迁移：创建 system_settings / schedules 表（create_all 已处理，这里仅兜底）
+
+
+def _backfill_platform():
+    """回填 accounts.platform：由 auth_json / domain 推断平台。
+
+    只在 platform 为空的行上执行（幂等）：手动纠正过的行不会被覆盖。
+    解析 auth_json 拿 domain 优于用 accounts.domain 列——后者是导入时快照，
+    个别存量行可能为空。
+    """
+    import json
+
+    from admin.platform import detect
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT id, domain, auth_json FROM `accounts` WHERE platform IS NULL OR platform = ''")
+            ).fetchall()
+            for rid, domain, auth_json in rows:
+                d = domain or ""
+                if not d and auth_json:
+                    try:
+                        d = str((json.loads(auth_json).get("auth") or {}).get("domain") or "")
+                    except Exception:
+                        d = ""
+                conn.execute(
+                    text("UPDATE `accounts` SET platform = :p WHERE id = :i"),
+                    {"p": detect(d), "i": rid},
+                )
+            conn.commit()
+    except Exception:
+        pass  # 非 MySQL / 权限不足时静默跳过（读取侧仍有 domain 回退推断）
 
 
 def _ensure_column(table: str, col: str, col_type: str, default: str = ""):

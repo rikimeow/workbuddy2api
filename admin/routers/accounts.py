@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from admin import backend
+from admin import backend, platform
 from admin.config import settings
 from admin.db import get_db
 from admin.models import Account
@@ -53,6 +53,9 @@ def _apply_meta(acc: Account, auth_json: str):
         acc.enterprise_id = meta["enterprise_id"]
     if meta.get("domain"):
         acc.domain = meta["domain"]
+    # 平台归属：auth.domain 是唯一可靠信号（www.workbuddy.ai → ai，其余 → cn）。
+    # 注意 www.workbuddy.cn 是 CN 的另一个域，不能按 "workbuddy" 子串误判为 AI。
+    acc.platform = platform.detect(meta.get("domain"))
     # 号池名称：真实昵称 → uid → 兜底（昵称为 null/空串/"null" 视为缺失）
     nick = meta.get("nickname")
     if isinstance(nick, str):
@@ -84,6 +87,9 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
             "uid": a.uid,
             "enterprise_id": a.enterprise_id,
             "domain": a.domain,
+            # platform 列为空（存量行）时由 domain 实时推断，前端永远拿到有效值
+            "platform": a.platform or platform.detect(a.domain),
+            "platform_label": platform.label(a.platform or platform.detect(a.domain)),
             "status": a.status,
             "balance_total": a.balance_total,
             "balance_remain": a.balance_remain,
@@ -99,6 +105,10 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
         "available": sum(1 for i in items if i["status"] == "active" and i["balance_remain"] > 0),
         "balance_total": sum(i["balance_total"] for i in items),
         "balance_remain": sum(i["balance_remain"] for i in items),
+        "by_platform": {
+            platform.CN: sum(1 for i in items if i["platform"] == platform.CN),
+            platform.AI: sum(1 for i in items if i["platform"] == platform.AI),
+        },
     }
     return {"items": items, "summary": summary}
 
@@ -321,6 +331,88 @@ def request_usage(
         raise HTTPException(status_code=502, detail=f"获取请求用量失败: {e}")
 
 
+@router.post("/{acc_id}/cat-travel")
+def cat_travel(acc_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """对单个账号执行一趟猫猫旅行：同意协议 → 首次领养(+300) → 派出 → 领奖。
+
+    返回结构化分步结果，前端据此逐步提示「领养成功 +300」「领奖成功 +N」，
+    无需再去积分明细核对。
+    """
+    acc = db.query(Account).filter(Account.id == acc_id).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    try:
+        with backend.AccountSession(acc.auth_json) as sess:
+            result = sess.run_cat_travel()
+            acc.auth_json = sess.updated_json()  # 回写可能刷新的 token
+            db.commit()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"猫猫旅行执行失败: {e}")
+    # 领取到积分后顺带刷新余额，让前端列表立即反映最新值
+    if result.get("credits"):
+        _refresh_balance(acc)
+        db.commit()
+    return {
+        "id": acc.id,
+        "account": acc.name,
+        "platform": acc.platform or platform.detect(acc.domain),
+        "balance_remain": acc.balance_remain,
+        **result,
+    }
+
+
+class CatTravelBatchIn(BaseModel):
+    ids: list[int] = []              # 指定账号；为空则按 platform 过滤
+    platform: Optional[str] = None   # cn | ai | None(全部)
+    only_with_cat: bool = False      # 只处理已有猫的账号（跳过领养，仅派猫/领奖）
+
+
+@router.post("/cat-travel/batch")
+def cat_travel_batch(
+    body: CatTravelBatchIn,
+    _: bool = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """批量执行猫猫旅行；逐个账号串行执行并返回每个账号的结果。"""
+    q = db.query(Account).filter(Account.status == "active")
+    if body.ids:
+        q = q.filter(Account.id.in_(body.ids))
+    rows = q.order_by(Account.id).all()
+    if body.platform:
+        want = platform.normalize(body.platform)
+        rows = [a for a in rows if (a.platform or platform.detect(a.domain)) == want]
+
+    results = []
+    total_credits = 0
+    for acc in rows:
+        try:
+            with backend.AccountSession(acc.auth_json) as sess:
+                res = sess.run_cat_travel()
+                acc.auth_json = sess.updated_json()
+                db.commit()
+        except Exception as e:
+            results.append({"id": acc.id, "account": acc.name, "ok": False,
+                            "credits": 0, "summary": f"执行异常: {e}", "steps": []})
+            continue
+        if res.get("credits"):
+            total_credits += res["credits"]
+            _refresh_balance(acc)
+            db.commit()
+        results.append({
+            "id": acc.id,
+            "account": acc.name,
+            "platform": acc.platform or platform.detect(acc.domain),
+            "balance_remain": acc.balance_remain,
+            **res,
+        })
+    return {
+        "total": len(results),
+        "credits": total_credits,
+        "succeeded": sum(1 for r in results if r.get("ok")),
+        "results": results,
+    }
+
+
 @router.patch("/{acc_id}")
 def patch_account(
     acc_id: int,
@@ -335,6 +427,11 @@ def patch_account(
         acc.name = body["name"]
     if "status" in body and body["status"] in ("active", "disabled"):
         acc.status = body["status"]
+    if "platform" in body:
+        # 手动纠正平台归属（例：同 domain 下的特殊账号）；非法值忽略
+        p = str(body["platform"] or "").strip().lower()
+        if p in platform.PLATFORMS:
+            acc.platform = p
     db.commit()
     return {"id": acc.id, "ok": True}
 

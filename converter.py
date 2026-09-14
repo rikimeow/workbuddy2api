@@ -95,8 +95,31 @@ from anthropic_adapter import (
 # 常量
 # ---------------------------------------------------------------------------
 
-BACKEND = "https://copilot.tencent.com"
-DEFAULT_DOMAIN = "www.codebuddy.cn"
+try:
+    from admin.platform import (
+        CHAT_BASES,
+        detect as detect_platform,
+        chat_base as platform_chat_base,
+        default_domain as platform_default_domain,
+    )
+except ImportError:  # converter.py 可作为独立脚本运行
+    CHAT_BASES = {"cn": "https://copilot.tencent.com", "ai": "https://www.workbuddy.ai"}
+
+    def detect_platform(domain=None, platform=None):
+        return "ai" if "workbuddy.ai" in (domain or "").lower() else "cn"
+
+    def platform_chat_base(domain=None, platform=None):
+        return CHAT_BASES[detect_platform(domain, platform)]
+
+    def platform_default_domain(domain=None, platform=None):
+        return (domain or "").strip() or (
+            "www.workbuddy.ai" if detect_platform(domain, platform) == "ai" else "www.codebuddy.cn"
+        )
+
+
+# 兼容旧引用：CN 后端地址。新代码请用 CredentialManager.chat_base()，
+# 它会按账号归属平台（cn / ai）返回正确的上游地址。
+BACKEND = CHAT_BASES["cn"]
 USER_AGENT = "codebuddy2openai/2.0"
 
 # ---------------------------------------------------------------------------
@@ -178,6 +201,22 @@ class CredentialManager:
             raise RuntimeError(f"无法读取 auth 文件：{self.path}")
         return self._cached
 
+    # -----------------------------------------------------------------------
+    # 平台分流（cn 国内版 / ai 国外版）
+    # -----------------------------------------------------------------------
+
+    def platform(self) -> str:
+        """该账号归属平台；auth.domain 是主要信号。"""
+        s = self._session()
+        auth = s.get("auth") or {}
+        return detect_platform(auth.get("domain"), s.get("platform"))
+
+    def chat_base(self) -> str:
+        """该账号的 chat / growth 域 base URL（CN 与 AI 不同，必须分流）。"""
+        s = self._session()
+        auth = s.get("auth") or {}
+        return platform_chat_base(auth.get("domain"), s.get("platform"))
+
     def _is_expired(self) -> bool:
         s = self._session()
         expires_at = (s.get("auth") or {}).get("expiresAt") or 0
@@ -191,7 +230,7 @@ class CredentialManager:
         headers = self._build_headers_from(auth, s.get("account") or {})
         headers["X-Refresh-Token"] = auth.get("refreshToken", "")
         headers["X-Auth-Refresh-Source"] = "plugin"
-        url = f"{BACKEND}/v2/plugin/auth/token/refresh"
+        url = f"{self.chat_base()}/v2/plugin/auth/token/refresh"
         try:
             with httpx.Client(timeout=15, limits=_HTTP_LIMITS) as c:
                 r = c.post(url, headers=headers, json={})
@@ -219,7 +258,7 @@ class CredentialManager:
         self._mtime = self.path.stat().st_mtime
 
     def _build_headers_from(self, auth: dict, account: dict) -> dict:
-        domain = auth.get("domain") or DEFAULT_DOMAIN
+        domain = platform_default_domain(auth.get("domain"), self._session().get("platform"))
         h = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -273,7 +312,7 @@ class CredentialManager:
     def _request_backend(self, method: str, path: str, json_body: dict | None = None) -> dict:
         """向后端发一个同步请求，返回 {code, msg, requestId, data} 或抛异常。"""
         headers = self.get_headers()
-        url = f"{BACKEND}{path}"
+        url = f"{self.chat_base()}{path}"
         try:
             with httpx.Client(timeout=15, limits=_HTTP_LIMITS) as c:
                 if method.upper() == "GET":
@@ -297,7 +336,7 @@ class CredentialManager:
         属于正常业务结果，需要由调用方根据 code 区分处理，而非当作错误抛掉。
         """
         headers = self.get_headers()
-        url = f"{BACKEND}{path}"
+        url = f"{self.chat_base()}{path}"
         try:
             with httpx.Client(timeout=15, limits=_HTTP_LIMITS) as c:
                 if method.upper() == "GET":
@@ -602,7 +641,7 @@ async def chat_completions(request: Request,
 
     headers = cred.get_headers()
     headers.update(_client_ip_headers(request))
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.chat_base()}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
@@ -936,7 +975,7 @@ async def create_response(request: Request,
 
     headers = cred.get_headers()
     headers.update(_client_ip_headers(request))
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.chat_base()}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
@@ -1057,7 +1096,7 @@ async def create_message(request: Request,
 
     headers = cred.get_headers()
     headers.update(_client_ip_headers(request))
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.chat_base()}/v2/chat/completions"
     t0 = time.time()
 
     return StreamingResponse(
@@ -1122,7 +1161,16 @@ def preflight() -> bool:
     sys.stderr.write("==== 预检 ====\n")
     sys.stderr.write(f"平台      : {sys.platform}\n")
     sys.stderr.write(f"Python    : {sys.version.split()[0]}\n")
-    sys.stderr.write(f"后端      : {BACKEND} (直连，原生 function calling)\n")
+    # 平台与后端地址由登录文件的 domain 决定；文件缺失/损坏时按 CN 兜底显示，
+    # 不让预检本身因读取失败而中断（后续 af is None 分支会给出明确警告）。
+    p_base, p_name = CHAT_BASES["cn"], "cn"
+    if af is not None:
+        try:
+            p_name = CredentialManager(af).platform()
+            p_base = CHAT_BASES[p_name]
+        except Exception:
+            pass
+    sys.stderr.write(f"后端      : {p_base} ({p_name}, 直连，原生 function calling)\n")
     sys.stderr.write(f"登录文件  : {af or '(未找到)'}\n")
     if auth_dirs():
         sys.stderr.write(f"已查目录  : {', '.join(str(d) for d in auth_dirs())}\n")
