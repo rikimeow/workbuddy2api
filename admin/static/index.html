@@ -29,6 +29,65 @@
     .overflow-x-auto::-webkit-scrollbar{ height:8px; }
     .overflow-x-auto::-webkit-scrollbar-thumb{ background:#d6d6dd; border-radius:8px; }
     .overflow-x-auto::-webkit-scrollbar-track{ background:transparent; }
+    /* 全局滚动条美化（纵向+横向）；Firefox 走标准属性 */
+    *{ scrollbar-width:thin; scrollbar-color:#d6d6dd transparent; }
+    ::-webkit-scrollbar{ width:10px; height:10px; }
+    ::-webkit-scrollbar-track{ background:transparent; }
+    ::-webkit-scrollbar-thumb{
+      background:#d6d6dd; border-radius:10px;
+      border:2px solid transparent; background-clip:content-box;
+    }
+    ::-webkit-scrollbar-thumb:hover{ background:#b9b9c4; background-clip:content-box; }
+    ::-webkit-scrollbar-corner{ background:transparent; }
+    /* 深色容器（代码块）内滚动条换浅色，否则看不见 */
+    pre::-webkit-scrollbar-thumb{ background:#4b5563; background-clip:content-box; }
+    pre::-webkit-scrollbar-thumb:hover{ background:#6b7280; background-clip:content-box; }
+
+    /* ==================== 自研下拉组件（替换原生 select）==================== */
+    .ui-select{ position:relative; user-select:none; }
+    .ui-select-btn{
+      display:flex; align-items:center; justify-content:space-between; gap:.5rem;
+      cursor:pointer; background:#fff; transition:.15s; text-align:left;
+    }
+    .ui-select-btn:hover{ border-color:#d6d6dd; }
+    .ui-select.open .ui-select-btn{ border-color:var(--wb-primary); box-shadow:0 0 0 3px rgba(40,184,148,.15); }
+    .ui-select-btn .ui-select-arrow{ transition:transform .18s ease; color:#94a3b8; font-size:.7rem; flex-shrink:0; }
+    .ui-select.open .ui-select-btn .ui-select-arrow{ transform:rotate(180deg); }
+    .ui-select-panel{
+      position:absolute; z-index:55; top:calc(100% + 4px); left:0; right:0;
+      background:#fff; border:1px solid var(--wb-border); border-radius:.75rem;
+      box-shadow:0 10px 30px rgba(17,24,39,.12); padding:.25rem;
+      max-height:16rem; overflow:auto; display:none;
+    }
+    .ui-select.open .ui-select-panel{ display:block; animation:fade .14s ease; }
+    .ui-select-opt{
+      padding:.45rem .6rem; border-radius:.5rem; cursor:pointer; font-size:.875rem;
+      display:flex; align-items:center; justify-content:space-between; gap:.5rem;
+    }
+    .ui-select-opt:hover{ background:var(--wb-surface); }
+    .ui-select-opt.sel{ background:rgba(40,184,148,.10); color:var(--wb-primary-d); font-weight:600; }
+    .ui-select-opt .fa-check{ font-size:.7rem; }
+
+    /* ==================== 自研确认框（替换原生 confirm）==================== */
+    #confirmMask{
+      position:fixed; inset:0; z-index:70; display:none;
+      align-items:center; justify-content:center; padding:1rem;
+      background:rgba(15,23,42,.45); backdrop-filter:blur(2px);
+    }
+    #confirmMask.show{ display:flex; }
+    .confirm-box{
+      background:#fff; border-radius:1rem; width:min(26rem,94vw);
+      box-shadow:0 24px 60px rgba(17,24,39,.24); overflow:hidden;
+      animation:pop .18s cubic-bezier(.2,.9,.3,1.2);
+    }
+    @keyframes pop{ from{opacity:0;transform:scale(.94) translateY(8px);} to{opacity:1;transform:none;} }
+    .confirm-ico{
+      width:42px; height:42px; border-radius:50%; flex-shrink:0;
+      display:flex; align-items:center; justify-content:center; font-size:1rem;
+    }
+    .confirm-ico.danger{ background:#fee2e2; color:#dc2626; }
+    .confirm-ico.warn{ background:#fef3c7; color:#d97706; }
+    .confirm-ico.info{ background:rgba(40,184,148,.12); color:var(--wb-primary-d); }
     table.min-w{ min-width:680px; }
     table.min-w-sm{ min-width:560px; }
     /* tab 胶囊 */
@@ -53,6 +112,16 @@
       .panel-toolbar .tools{ width:100%; flex-wrap:wrap; }
       .panel-toolbar .tools button{ flex:1 1 auto; }
     }
+    /* 图表 tooltip（自绘：原生 <title> 延迟长、样式不可控） */
+    #chartTip{
+      position:fixed; z-index:80; pointer-events:none; display:none;
+      background:rgba(17,24,39,.92); color:#fff; font-size:11px; line-height:1.5;
+      padding:.4rem .6rem; border-radius:.5rem; white-space:nowrap;
+      box-shadow:0 6px 20px rgba(0,0,0,.22); transform:translate(-50%,-115%);
+      transition:opacity .1s;
+    }
+    .chart-hit{ cursor:pointer; }
+    .chart-hit:hover{ opacity:.85; }
     input,select,textarea{ outline:none; }
     input:focus,select:focus,textarea:focus{ border-color:var(--wb-primary); box-shadow:0 0 0 3px rgba(40,184,148,.15); }
   </style>
@@ -71,7 +140,7 @@
     </div>
     <input id="username" class="w-full border rounded-lg px-3 py-2.5 mb-3 text-sm" placeholder="用户名" value="admin" />
     <input id="password" type="password" class="w-full border rounded-lg px-3 py-2.5 mb-4 text-sm" placeholder="密码" />
-    <button onclick="doLogin()" class="w-full btn-primary rounded-lg py-2.5 text-sm font-medium">
+    <button id="loginBtn" onclick="doLogin()" class="w-full btn-primary rounded-lg py-2.5 text-sm font-medium">
       <i class="fa-solid fa-right-to-bracket mr-1"></i> 登录
     </button>
     <p id="loginErr" class="text-red-500 text-xs mt-3 text-center hidden"></p>
@@ -100,6 +169,8 @@
       <button class="tab-btn active px-4 py-2 text-sm font-medium rounded-full whitespace-nowrap" data-tab="accounts"><i class="fa-solid fa-user-group mr-1"></i> 账号</button>
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="keys"><i class="fa-solid fa-key mr-1"></i> API Keys</button>
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="models"><i class="fa-solid fa-shapes mr-1"></i> 模型配置</button>
+      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="groups"><i class="fa-solid fa-layer-group mr-1"></i> 分组管理</button>
+      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="usage"><i class="fa-solid fa-chart-pie mr-1"></i> 使用记录</button>
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="schedules"><i class="fa-solid fa-clock-rotate-left mr-1"></i> 定时任务</button>
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="logs"><i class="fa-solid fa-list mr-1"></i> 日志</button>
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="sync"><i class="fa-solid fa-cloud-arrow-up mr-1"></i> 同步设置</button>
@@ -192,7 +263,7 @@
           <thead class="bg-slate-50 text-slate-500 text-left sticky top-0">
             <tr>
               <th class="px-4 py-3">名称</th><th class="px-4 py-3">Key</th><th class="px-4 py-3">限额</th>
-              <th class="px-4 py-3">已用</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th>
+              <th class="px-4 py-3">已用</th><th class="px-4 py-3">分组</th><th class="px-4 py-3">状态</th><th class="px-4 py-3 text-right">操作</th>
             </tr>
           </thead>
           <tbody id="keyBody"></tbody>
@@ -229,6 +300,78 @@
         </table>
       </div>
       <div id="modelPager" class="flex justify-between items-center mt-3 text-sm text-slate-500"></div>
+    </section>
+
+    <!-- 分组管理面板 -->
+    <section id="panel-groups" class="hidden">
+      <div class="flex flex-wrap justify-between items-center mb-3 gap-2 panel-toolbar">
+        <h2 class="font-semibold">模型分组</h2>
+        <div class="flex flex-wrap gap-2 tools">
+          <button onclick="openGroupEditor()" class="text-sm px-3 py-1.5 rounded-lg btn-primary"><i class="fa-solid fa-plus mr-1"></i> 新建分组</button>
+        </div>
+      </div>
+      <p class="text-xs text-slate-400 mb-3">
+        分组用于限定 API Key 可用的模型范围。创建 Key 时选择分组即可；<b>不选分组</b>表示可用全部启用模型。
+        绑定分组后该 Key 只能调用组内模型，调用组外模型返回 403（model_not_in_group）。
+      </p>
+      <div class="card overflow-x-auto max-h-[70vh]">
+        <table class="w-full text-sm min-w">
+          <thead class="bg-slate-50 text-slate-500 text-left sticky top-0">
+            <tr>
+              <th class="px-4 py-3">分组名称</th><th class="px-4 py-3">模型数</th>
+              <th class="px-4 py-3">绑定 Key</th><th class="px-4 py-3">备注</th>
+              <th class="px-4 py-3 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody id="groupBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 使用记录面板 -->
+    <section id="panel-usage" class="hidden">
+      <div class="flex flex-wrap justify-between items-center mb-3 gap-2 panel-toolbar">
+        <h2 class="font-semibold">使用记录</h2>
+        <div class="flex flex-wrap gap-2 tools items-center">
+          <div class="w-32" id="usageDaysSel"></div>
+          <div class="w-28" id="usageGrainSel"></div>
+          <button onclick="loadUsageStats()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-rotate mr-1"></i> 刷新</button>
+        </div>
+      </div>
+      <p class="text-xs text-slate-400 mb-3">统计平台全部 Key 的用量：请求数、Token、积分与平均耗时。数据来自本地 usage_logs，随请求实时累计。</p>
+      <div id="usageOverview" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4"></div>
+      <div class="grid md:grid-cols-2 gap-4 mb-4">
+        <div class="card p-4">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold">模型分布</h3>
+            <span class="text-xs text-slate-400">按积分</span>
+          </div>
+          <div id="usageModelChart"></div>
+        </div>
+        <div class="card p-4">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold">Key 使用分布</h3>
+            <span class="text-xs text-slate-400">按积分</span>
+          </div>
+          <div id="usageKeyChart"></div>
+        </div>
+      </div>
+      <div class="grid md:grid-cols-2 gap-4 mb-4">
+        <div class="card p-4">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold">端点分布</h3>
+            <span class="text-xs text-slate-400">按积分</span>
+          </div>
+          <div id="usageEndpointChart"></div>
+        </div>
+        <div class="card p-4">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold">Token 使用趋势</h3>
+            <span class="text-xs text-slate-400">输入 / 输出</span>
+          </div>
+          <div id="usageTrendChart"></div>
+        </div>
+      </div>
     </section>
 
     <!-- 定时任务面板 -->
@@ -331,7 +474,147 @@
 
 <div id="toasts" class="toast flex flex-col gap-2"></div>
 
+  <!-- 全局确认框：替换原生 confirm，样式与主题一致 -->
+  <div id="confirmMask">
+    <div class="confirm-box" role="dialog" aria-modal="true">
+      <div class="p-5">
+        <div class="flex gap-3 items-start">
+          <div id="confirmIco" class="confirm-ico info"><i class="fa-solid fa-circle-question"></i></div>
+          <div class="flex-1 min-w-0">
+            <h3 id="confirmTitle" class="font-bold text-base mb-1">确认操作</h3>
+            <div id="confirmMsg" class="text-sm text-slate-500 leading-relaxed whitespace-pre-line"></div>
+          </div>
+        </div>
+        <div class="flex justify-end gap-2 mt-5">
+          <button id="confirmCancel" class="px-3.5 py-1.5 rounded-lg border text-sm hover:bg-slate-50">取消</button>
+          <button id="confirmOk" class="px-3.5 py-1.5 rounded-lg btn-primary text-sm">确认</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
 <script>
+let _confirmResolve = null;
+
+function uiConfirm(opts) {
+  opts = opts || {};
+  const mask = $("#confirmMask");
+  if (!mask) return Promise.resolve(window.confirm(opts.message || "确认？")); // 兜底
+
+  const danger = opts.danger !== false; // 默认按危险操作处理（多为删除/覆盖）
+  const kind = opts.kind || (danger ? "danger" : "info");
+  const icons = { danger: "fa-triangle-exclamation", warn: "fa-circle-exclamation", info: "fa-circle-question" };
+  const tones = { danger: "danger", warn: "warn", info: "info" };
+
+  $("#confirmIco").className = "confirm-ico " + (tones[kind] || "danger");
+  $("#confirmIco").innerHTML = `<i class="fa-solid ${icons[kind] || icons.danger}"></i>`;
+  $("#confirmTitle").textContent = opts.title || "确认操作";
+  $("#confirmMsg").textContent = opts.message || "";   // textContent：不解析 HTML，防注入
+  const okBtn = $("#confirmOk");
+  okBtn.textContent = opts.okText || "确认";
+  okBtn.className = "px-3.5 py-1.5 rounded-lg text-sm " +
+    (kind === "danger" ? "bg-red-600 hover:bg-red-700 text-white" : "btn-primary");
+
+  mask.classList.add("show");
+  setTimeout(() => okBtn.focus(), 30);
+
+  return new Promise(resolve => { _confirmResolve = resolve; });
+}
+
+function _confirmClose(val) {
+  const mask = $("#confirmMask");
+  if (mask) mask.classList.remove("show");
+  if (_confirmResolve) { const r = _confirmResolve; _confirmResolve = null; r(val); }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const ok = $("#confirmOk"), cancel = $("#confirmCancel"), mask = $("#confirmMask");
+  if (ok) ok.onclick = () => _confirmClose(true);
+  if (cancel) cancel.onclick = () => _confirmClose(false);
+  // 点击遮罩空白处 = 取消（点 .confirm-box 内部不关闭）
+  if (mask) mask.addEventListener("click", e => {
+    if (e.target === mask) _confirmClose(false);
+  });
+  document.addEventListener("keydown", e => {
+    if (!mask || !mask.classList.contains("show")) return;
+    if (e.key === "Escape") { e.stopPropagation(); _confirmClose(false); }
+    if (e.key === "Enter") { e.stopPropagation(); _confirmClose(true); }
+  }, true); // capture：抢在全局 Esc 关 modal 之前处理
+});
+
+/* ==================== 自研下拉组件（替换原生 select）====================
+ * 原生 select 的弹出层由操作系统绘制，无法套用主题样式，因此自研。
+ * 用法：
+ *   <div class="ui-select" id="mySel"></div>
+ *   uiSelect('#mySel', { value, options:[{value,label}], onChange(v), placeholder })
+ * 也提供 uiSelectHTML(id, opts) 直接生成 HTML 字符串（用于弹窗内嵌）。
+ */
+const _uiSelectMap = new Map();  // id -> {options, value, onChange}
+
+function uiSelectHTML(id, opts) {
+  opts = opts || {};
+  const options = opts.options || [];
+  const val = opts.value != null ? String(opts.value) : (options[0] ? String(options[0].value) : "");
+  _uiSelectMap.set(id, { options, value: val, onChange: opts.onChange || null });
+
+  const cur = options.find(o => String(o.value) === val);
+  const label = cur ? cur.label : (opts.placeholder || "请选择");
+  const cls = opts.class || "border rounded-lg px-3 py-2 text-sm";
+
+  return `<div class="ui-select" id="${id}">
+    <div class="ui-select-btn ${cls}" onclick="uiSelectToggle('${id}', event)">
+      <span class="ui-select-label truncate">${esc(label)}</span>
+      <i class="fa-solid fa-chevron-down ui-select-arrow"></i>
+    </div>
+    <div class="ui-select-panel">
+      ${options.map(o => `
+        <div class="ui-select-opt ${String(o.value) === val ? "sel" : ""}"
+             data-value="${esc(String(o.value))}" onclick="uiSelectPick('${id}','${esc(String(o.value))}', event)">
+          <span class="truncate">${esc(o.label)}</span>
+          ${String(o.value) === val ? '<i class="fa-solid fa-check"></i>' : ""}
+        </div>`).join("") || '<div class="ui-select-opt text-slate-400">无可选项</div>'}
+    </div>
+  </div>`;
+}
+
+function uiSelectToggle(id, ev) {
+  if (ev) ev.stopPropagation();
+  const el = $("#" + id);
+  if (!el) return;
+  const wasOpen = el.classList.contains("open");
+  // 同时只开一个，避免面板互相重叠
+  document.querySelectorAll(".ui-select.open").forEach(x => { if (x.id !== id) x.classList.remove("open"); });
+  el.classList.toggle("open", !wasOpen);
+}
+
+function uiSelectPick(id, value, ev) {
+  if (ev) ev.stopPropagation();
+  const st = _uiSelectMap.get(id);
+  const el = $("#" + id);
+  if (!st || !el) return;
+  st.value = value;
+  const o = st.options.find(x => String(x.value) === value);
+  const lab = el.querySelector(".ui-select-label");
+  if (lab && o) lab.textContent = o.label;
+  el.querySelectorAll(".ui-select-opt").forEach(opt => {
+    const on = opt.dataset.value === value;
+    opt.classList.toggle("sel", on);
+    // 重建勾选图标
+    const old = opt.querySelector(".fa-check");
+    if (on && !old) opt.insertAdjacentHTML("beforeend", '<i class="fa-solid fa-check"></i>');
+    if (!on && old) old.remove();
+  });
+  el.classList.remove("open");
+  if (st.onChange) st.onChange(value, o);
+}
+
+function uiSelectValue(id) {
+  const st = _uiSelectMap.get(id);
+  return st ? st.value : "";
+}
+function uiSelectSet(id, value) {
+  uiSelectPick(id, String(value));
+}
 const $ = (s) => document.querySelector(s);
 const TOKEN_KEY = "wb_admin_token";
 let TOKEN = localStorage.getItem(TOKEN_KEY) || "";
@@ -380,15 +663,48 @@ function copyText(sel){ const i = $(sel); if(!i) return; i.select(); navigator.c
 document.addEventListener("DOMContentLoaded", () => {
   $("#modal")?.addEventListener("click", (e) => { if (e.target === $("#modal")) closeModal(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
+
+  // 登录页回车提交（用户名 / 密码框内按 Enter）
+  ["username", "password"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); doLogin(); }
+    });
+  });
 });
 
 async function doLogin() {
   const fd = new URLSearchParams({ username: $("#username").value, password: $("#password").value });
-  const r = await fetch("/api/login", { method: "POST", body: fd });
-  if (!r.ok) { $("#loginErr").textContent = "登录失败"; $("#loginErr").classList.remove("hidden"); return; }
-  const d = await r.json();
-  TOKEN = d.token; localStorage.setItem(TOKEN_KEY, TOKEN);
-  enterApp();
+  const btn = $("#loginBtn");
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> 登录中...'; }
+  const showErr = (m) => {
+    const el = $("#loginErr");
+    if (el) { el.textContent = m; el.classList.remove("hidden"); }
+  };
+  try {
+    const r = await fetch("/api/login", { method: "POST", body: fd });
+    if (!r.ok) {
+      // 尽量给出真实原因，而不是笼统的"登录失败"
+      let msg = "登录失败";
+      try {
+        const j = await r.json();
+        if (j && j.detail) {
+          msg = typeof j.detail === "string" ? j.detail
+              : (Array.isArray(j.detail) ? (j.detail[0] && j.detail[0].msg) || "参数错误" : JSON.stringify(j.detail));
+        }
+      } catch (e) { /* 非 JSON 响应，沿用默认文案 */ }
+      if (r.status === 401) msg = "用户名或密码错误";
+      showErr(msg);
+      return;
+    }
+    const d = await r.json();
+    TOKEN = d.token; localStorage.setItem(TOKEN_KEY, TOKEN);
+    enterApp();
+  } catch (e) {
+    showErr("网络异常：" + (e && e.message ? e.message : e));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "登录"; }
+  }
 }
 function logout() { localStorage.removeItem(TOKEN_KEY); location.reload(); }
 function enterApp() {
@@ -401,9 +717,12 @@ function enterApp() {
 document.querySelectorAll(".tab-btn").forEach(b => b.onclick = () => {
   document.querySelectorAll(".tab-btn").forEach(x => x.classList.remove("active", "text-wb"));
   b.classList.add("active");
-  ["accounts","keys","models","schedules","logs","sync","settings"].forEach(t => {
+  ["accounts","keys","models","groups","usage","schedules","logs","sync","settings"].forEach(t => {
     $(`#panel-${t}`).classList.toggle("hidden", b.dataset.tab !== t);
   });
+  // 切到这两个面板时按需拉数据（图表/分组列表不必在首屏就请求）
+  if (b.dataset.tab === "groups") loadGroups();
+  if (b.dataset.tab === "usage") loadUsageStats();
 });
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -479,9 +798,10 @@ function renderAccPage(p) {
 }
 async function refreshAcc(id){ const r=await api("/api/accounts/"+id+"/refresh",{method:"POST"}); toast(r.ok?"余额已刷新":"刷新失败", r.ok?"ok":"err"); if(r.ok) loadAccounts(); }
 async function toggleAcc(id,st){ await api("/api/accounts/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:st})}); loadAccounts(); }
-async function delAcc(id){ if(!confirm("确认删除该账号？"))return; const r=await api("/api/accounts/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"删除失败",r.ok?"ok":"err"); if(r.ok) loadAccounts(); }
+async function delAcc(id){ if(!await uiConfirm({message:"确认删除该账号？", title:"删除账号"}))return; const r=await api("/api/accounts/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"删除失败",r.ok?"ok":"err"); if(r.ok) loadAccounts(); }
 async function injectAcc(id){
-  if(!confirm("确认把该账号注入到本机 WorkBuddy 客户端？\n会先自动备份当前活动登录态（*.bak-时间戳）。")) return;
+  if(!await uiConfirm({kind:"warn", danger:false, title:"注入本机客户端",
+      message:"确认把该账号注入到本机 WorkBuddy 客户端？\n会先自动备份当前活动登录态（*.bak-时间戳）。", okText:"确认注入"})) return;
   const r = await api("/api/accounts/"+id+"/inject",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({confirm:true})});
   const d = await r.json().catch(()=>({}));
   if(r.ok){ toast(`已注入到本机客户端（备份: ${d.backup?d.backup.split(/[\\/]/).pop():"无"}）`); }
@@ -536,7 +856,8 @@ async function catTravel(id) {
 async function catTravelBatch() {
   const list = _accData.filter(a => a.status === "active");
   if (!list.length) { toast("没有可执行的账号", "err"); return; }
-  if (!confirm(`确认对 ${list.length} 个账号执行猫猫旅行？\n流程：同意协议 → 首次领养(+300) → 派出 → 领奖`)) return;
+  if (!await uiConfirm({kind:"info", danger:false, title:"批量猫猫旅行",
+      message:`确认对 ${list.length} 个账号执行猫猫旅行？\n流程：同意协议 → 首次领养(+300) → 派出 → 领奖`, okText:"开始执行"})) return;
   openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-cat mr-1 text-pink-600"></i> 批量猫猫旅行</h3>
     <p class="text-xs text-slate-400 mb-3">共 ${list.length} 个账号，执行中请勿关闭...</p>
     <div id="catBatchBody" class="text-sm text-slate-500">执行中...</div>
@@ -897,11 +1218,14 @@ function keyRow(k) {
       <td class="px-4 py-3 font-mono text-xs text-slate-500">${esc(k.masked)}</td>
       <td class="px-4 py-3">${k.unlimited?"∞":k.credit_limit}</td>
       <td class="px-4 py-3 ${k.credit_used>=k.credit_limit&&!k.unlimited?'text-red-500':''}">${k.credit_used}</td>
+      <td class="px-4 py-3">${k.group_name
+          ? `<span class="px-2 py-0.5 rounded-full text-xs bg-indigo-100 text-indigo-700" title="仅可用该分组内模型">${esc(k.group_name)}</span>`
+          : `<span class="text-xs text-slate-300" title="不限制，可用全部启用模型">全部模型</span>`}</td>
       <td class="px-4 py-3">${k.status==="active"?'<span class="px-2 py-0.5 rounded-full text-xs bg-emerald-100 text-emerald-700">正常</span>':'<span class="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-500">已吊销</span>'}</td>
       <td class="px-4 py-3 text-right whitespace-nowrap">
         <button onclick="viewKeyUsage(${k.id},'${esc(k.name||'')}')" class="text-blue-600 hover:text-blue-800 mr-1" title="查看用量"><i class="fa-solid fa-chart-pie"></i></button>
         <button onclick="viewKeyFull(${k.id},'${esc(k.name||'')}')" class="text-violet-600 hover:text-violet-800 mr-1" title="查看完整Key"><i class="fa-solid fa-eye"></i></button>
-        <button onclick="editKey(${k.id},${k.credit_limit},'${k.status}')" class="text-indigo-600 hover:text-indigo-800 mr-1" title="调整"><i class="fa-solid fa-sliders"></i></button>
+        <button onclick="editKey(${k.id})" class="text-indigo-600 hover:text-indigo-800 mr-1" title="调整"><i class="fa-solid fa-sliders"></i></button>
         <button onclick="deleteKey(${k.id})" class="text-red-500 hover:text-red-700" title="删除"><i class="fa-solid fa-trash"></i></button>
       </td>
     </tr>`;
@@ -961,12 +1285,30 @@ function renderKeyPage(p) {
     `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">${term ? "无匹配的 Key" : "还没有 Key，点「创建 Key」"}</td></tr>`;
   $("#keyPager").innerHTML = pagerHtml(total, p, totalPages, "renderKeyPage");
 }
-function openAddKey(){
+async function openAddKey(){
+  // 拉一次分组列表填下拉；失败不阻塞创建（下拉退化为「不限制」）
+  let groups = [];
+  try {
+    const r = await api("/api/groups");
+    const { ok, data } = await safeJson(r);
+    if (ok) groups = data.items || [];
+  } catch (e) { /* 忽略：无分组时仍可创建不限制的 Key */ }
+
+
   openModal(`
     <h3 class="font-bold mb-3"><i class="fa-solid fa-key mr-1"></i> 创建 API Key</h3>
     <input id="kName" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="名称（可选）" />
     <label class="flex items-center gap-2 text-sm mb-2"><input id="kUnlimited" type="checkbox" /> 不限额（∞）</label>
     <input id="kLimit" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="积分限额（credits）" />
+    <div class="mb-2">
+      <label class="text-xs text-slate-500">模型分组（可选）</label>
+      <div class="mt-1">${uiSelectHTML("kGroup", {
+        value: "0",
+        options: [{ value: "0", label: "不限制（全部可用模型）" }].concat(
+          groups.map(g => ({ value: String(g.id), label: `${g.name}（${g.effective_count} 个模型）` }))),
+      })}</div>
+      <p class="text-[11px] text-slate-400 mt-1">选择后该 Key 只能调用组内模型，调用组外模型返回 403。</p>
+    </div>
     <input id="kNote" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="备注（可选）" />
     <div class="flex justify-end gap-2 mt-2">
       <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">取消</button>
@@ -975,7 +1317,7 @@ function openAddKey(){
 }
 async function submitAddKey(){
   const unlimited = $("#kUnlimited").checked;
-  const body = { name:$("#kName").value||"", unlimited, credit_limit: Number($("#kLimit").value||0), note:$("#kNote").value||"" };
+  const body = { name:$("#kName").value||"", unlimited, credit_limit: Number($("#kLimit").value||0), note:$("#kNote").value||"", group_id: Number(uiSelectValue("kGroup")||0) };
   const r = await api("/api/keys",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const d = await r.json().catch(()=>({}));
   if(r.ok){
@@ -1017,19 +1359,57 @@ async function viewKeyUsage(id, name){
       <div class="text-xs text-slate-400">状态: ${d.status==='active'?'<span class="text-emerald-600">正常</span>':'<span class="text-red-500">已吊销</span>'} · 创建: ${fmtTime(d.created_at)}</div>`;
   } catch(e){ $("#keyUsageBody").innerHTML=`<p class="text-red-500 text-sm">异常: ${esc(e.message)}</p>`; }
 }
-async function editKey(id,limit,status){
-  openModal(`<h3 class="font-bold mb-3">调整 Key #${id}</h3>
-    <input id="ekLimit" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" value="${limit}" placeholder="积分限额" />
-    <label class="flex items-center gap-2 text-sm mb-2"><input id="ekReset" type="checkbox" /> 重置已用额度</label>
+/* 编辑 Key：名称 / 分组 / 限额 / 重置已用 */
+async function editKey(id){
+  const k = _keyData.find(x => x.id === id);
+  if (!k) { toast("Key 不存在", "err"); return; }
+
+  // 分组下拉数据；拉取失败也不阻塞编辑（退化为仅「不限制」）
+  let groups = [];
+  try {
+    const r = await api("/api/groups");
+    const { ok, data } = await safeJson(r);
+    if (ok) groups = data.items || [];
+  } catch (e) { /* 忽略 */ }
+
+  const groupOpts = [{ value: "0", label: "不限制（全部可用模型）" }]
+    .concat(groups.map(g => ({ value: String(g.id), label: `${g.name}（${g.effective_count} 个模型）` })));
+
+  openModal(`<h3 class="font-bold mb-3"><i class="fa-solid fa-sliders mr-1"></i> 编辑 API Key</h3>
+    <label class="block text-xs text-slate-500 mb-1">名称</label>
+    <input id="ekName" class="w-full border rounded-lg px-3 py-2 mb-3 text-sm" placeholder="名称" value="${esc(k.name || '')}" />
+
+    <label class="block text-xs text-slate-500 mb-1">模型分组</label>
+    <div class="mb-3">${uiSelectHTML("ekGroup", {
+      value: String(k.group_id || 0), options: groupOpts,
+    })}</div>
+    <p class="text-[11px] text-slate-400 -mt-2 mb-3">不限制 = 可用全部启用模型；选了分组则只能调用组内模型。</p>
+
+    <label class="block text-xs text-slate-500 mb-1">积分限额（credits）</label>
+    <input id="ekLimit" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-3 text-sm" value="${k.unlimited ? 0 : k.credit_limit}" placeholder="积分限额" />
+    <label class="flex items-center gap-2 text-sm mb-1"><input id="ekUnlimited" type="checkbox" ${k.unlimited ? "checked" : ""} /> 不限额（∞）</label>
+    <label class="flex items-center gap-2 text-sm mb-2"><input id="ekReset" type="checkbox" /> 重置已用额度（当前 ${k.credit_used}）</label>
+
     <div class="flex justify-end gap-2 mt-2"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">取消</button>
     <button onclick="submitEditKey(${id})" class="px-3 py-1.5 rounded-lg btn-primary">保存</button></div>`);
 }
+
 async function submitEditKey(id){
-  const body = { credit_limit: Number($("#ekLimit").value||0), reset_used: $("#ekReset").checked };
+  const name = ($("#ekName").value || "").trim();
+  if (!name) { toast("名称不能为空", "err"); return; }
+  const body = {
+    name,
+    group_id: Number(uiSelectValue("ekGroup") || 0),
+    credit_limit: Number($("#ekLimit").value || 0),
+    unlimited: $("#ekUnlimited").checked,
+    reset_used: $("#ekReset").checked,
+  };
   const r = await api("/api/keys/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  closeModal(); toast(r.ok?"已保存":"保存失败", r.ok?"ok":"err"); if(r.ok) loadKeys();
+  const { ok, data: d } = await safeJson(r);
+  if (!ok) { toast("保存失败: " + (d.detail || "未知错误"), "err"); return; }
+  closeModal(); toast("已保存"); loadKeys(); loadGroups();
 }
-async function deleteKey(id){ if(!confirm("确认删除该 Key？此操作不可恢复。"))return; const r=await api("/api/keys/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"删除失败", r.ok?"ok":"err"); if(r.ok) loadKeys(); }
+async function deleteKey(id){ if(!await uiConfirm({message:"确认删除该 Key？此操作不可恢复。", title:"删除 API Key"}))return; const r=await api("/api/keys/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"删除失败", r.ok?"ok":"err"); if(r.ok) loadKeys(); }
 
 /* ==================== 模型配置 ==================== */
 function modelRow(m) {
@@ -1122,7 +1502,7 @@ async function toggleModel(id, enabled){
   toast(r.ok?(enabled?"已启用":"已禁用"):"操作失败", r.ok?"ok":"err");
   if(r.ok) loadModels();
 }
-async function deleteModelConfig(id){ if(!confirm("确认移除该模型配置？移除后该模型将被过滤。"))return; const r=await api("/api/models/"+id,{method:"DELETE"}); toast(r.ok?"已移除":"失败",r.ok?"ok":"err"); if(r.ok) loadModels(); }
+async function deleteModelConfig(id){ if(!await uiConfirm({message:"确认移除该模型配置？移除后该模型将被过滤。", title:"移除模型配置"}))return; const r=await api("/api/models/"+id,{method:"DELETE"}); toast(r.ok?"已移除":"失败",r.ok?"ok":"err"); if(r.ok) loadModels(); }
 async function enableAllModels(enabled){
   const r = await api("/api/models/batch-toggle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled,level:"system"})});
   const d = await r.json().catch(()=>({}));
@@ -1177,13 +1557,15 @@ function _bindSyncDirty(){
   if(s && !s.dataset.syncDirtyBound){ s.addEventListener("input", _syncMarkDirty); s.dataset.syncDirtyBound="1"; }
 }
 async function regenSecret(){
-  if(!confirm("确认重新生成同步密钥？生成后需同步到线上实例才能继续接收。")) return;
+  if(!await uiConfirm({kind:"warn", danger:false, title:"重新生成同步密钥",
+      message:"确认重新生成同步密钥？生成后需同步到线上实例才能继续接收。", okText:"重新生成"})) return;
   const secret = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,"0")).join("");
   if($("#syncSecret")) $("#syncSecret").value = secret;
   toast("已生成新密钥，记得点「保存配置」");
 }
 async function pushToOnline(){
-  if(!confirm("确认把本地账号与模型配置推送到配置的线上地址？")) return;
+  if(!await uiConfirm({kind:"warn", danger:false, title:"推送到线上",
+      message:"确认把本地账号与模型配置推送到配置的线上地址？", okText:"推送"})) return;
   toast("正在推送...","ok");
   try{
     // 把当前输入框里未保存的最新值先带过去，避免漏点「保存配置」导致 DB 没数据
@@ -1276,18 +1658,19 @@ async function loadSchedules(){
 }
 async function runSchedule(id){ toast("运行中...","ok"); const r=await api("/api/schedules/"+id+"/run",{method:"POST"}); if(r.ok){ toast("运行完成"); } else { const d=await r.json().catch(()=>({})); toast("运行失败: "+(d.detail||""),"err"); } loadSchedules(); }
 async function toggleSchedule(id){ await api("/api/schedules/"+id+"/toggle",{method:"POST"}); loadSchedules(); }
-async function delSchedule(id){ if(!confirm("确认删除该任务？"))return; const r=await api("/api/schedules/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"失败",r.ok?"ok":"err"); if(r.ok) loadSchedules(); }
+async function delSchedule(id){ if(!await uiConfirm({message:"确认删除该任务？", title:"删除定时任务"}))return; const r=await api("/api/schedules/"+id,{method:"DELETE"}); toast(r.ok?"已删除":"失败",r.ok?"ok":"err"); if(r.ok) loadSchedules(); }
 function scheduleForm(title, data){
   data = data || {};
   const tasks = [["refresh_balances","刷新平台总积分"],["sync_models","同步模型列表"],["daily_checkin","每日签到领取积分"]];
-  const opts = tasks.map(t=>`<option value="${t[0]}" ${data.task===t[0]?'selected':''}>${t[1]}</option>`).join("");
+  const taskOpts = tasks.map(t => ({ value: String(t[0]), label: t[1] }));
   const saVal = (data.stop_after||"").slice(0,16); // 适配 <input type="datetime-local">
   const isCheckin = data.task==="daily_checkin";
   openModal(`
     <h3 class="font-bold mb-3">${title}</h3>
     <input id="scName" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="任务名（可选）" value="${esc(data.name||'')}" />
     <label class="block text-sm mb-1">任务类型</label>
-    <select id="scTask" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" onchange="onTaskChange()">${opts}</select>
+    <div class="mb-2">${uiSelectHTML("scTask", { value: String(data.task || (tasks[0] && tasks[0][0]) || ""),
+        options: taskOpts, onChange: () => onTaskChange() })}</div>
     <label class="block text-sm mb-1">间隔（分钟）</label>
     <input id="scIv" type="number" min="1" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" value="${data.interval_minutes||60}" />
     <div id="scStopWrap" class="${isCheckin?'':'hidden'}">
@@ -1302,7 +1685,7 @@ function scheduleForm(title, data){
     </div>`);
 }
 function onTaskChange(){
-  const v = document.getElementById("scTask").value;
+  const v = uiSelectValue("scTask");
   const wrap = document.getElementById("scStopWrap");
   if(wrap) wrap.classList.toggle("hidden", v!=="daily_checkin");
 }
@@ -1310,7 +1693,7 @@ function openAddSchedule(){ scheduleForm("新建定时任务", {enabled:1, inter
 function editSchedule(id){ const s=_schedules.find(x=>x.id===id); if(!s) return; scheduleForm("编辑定时任务", {id:id, name:s.name, task:s.task, interval_minutes:s.interval_minutes, enabled:s.enabled, stop_after:s.stop_after}); }
 async function submitSchedule(id){
   const stopRaw = ($("#scStop") ? $("#scStop").value : "").trim();
-  const body = { name:$("#scName").value, task:$("#scTask").value, interval_minutes:Number($("#scIv").value||60), enabled:$("#scEnabled").checked?1:0, stop_after: stopRaw || null };
+  const body = { name:$("#scName").value, task:uiSelectValue("scTask"), interval_minutes:Number($("#scIv").value||60), enabled:$("#scEnabled").checked?1:0, stop_after: stopRaw || null };
   let r;
   if(id){ r = await api("/api/schedules/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
   else { r = await api("/api/schedules",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
@@ -1409,9 +1792,400 @@ async function exportLogs(){
   } catch(e){ toast("导出异常: " + e.message, "err"); }
 }
 
-// 启动
-if (TOKEN) { api("/api/accounts").then(r => r.ok ? enterApp() : logout()).catch(logout); }
-else { /* 显示登录 */ }
+/* ==================== 分组管理 ==================== */
+let _groupData = [];
+
+async function loadGroups() {
+  try {
+    const r = await api("/api/groups");
+    const { ok, data: d } = await safeJson(r);
+    if (!ok) { toast("加载分组失败: " + (d.detail || ""), "err"); return; }
+    _groupData = d.items || [];
+    renderGroups();
+  } catch (e) { toast("加载分组异常: " + e.message, "err"); }
+}
+
+function renderGroups() {
+  const body = $("#groupBody");
+  if (!body) return;
+  if (!_groupData.length) {
+    body.innerHTML = `<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400">还没有分组，点「新建分组」创建</td></tr>`;
+    return;
+  }
+  body.innerHTML = _groupData.map(g => {
+    // 有效模型数 < 模型数 说明组内有模型被禁用了，提示一下
+    const stale = g.effective_count < g.model_count;
+    return `
+    <tr class="border-t hover:bg-slate-50">
+      <td class="px-4 py-3 font-medium">${esc(g.name)}</td>
+      <td class="px-4 py-3">
+        ${g.model_count} 个
+        ${stale ? `<span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700" title="部分模型已被禁用，实际可用 ${g.effective_count} 个">${g.effective_count} 可用</span>` : ""}
+      </td>
+      <td class="px-4 py-3">${g.key_count > 0 ? `<span class="text-wb font-medium">${g.key_count}</span>` : `<span class="text-slate-300">0</span>`}</td>
+      <td class="px-4 py-3 text-slate-500 text-xs">${esc(g.note || "-")}</td>
+      <td class="px-4 py-3 text-right whitespace-nowrap">
+        <button onclick="openGroupEditor(${g.id})" class="text-blue-600 hover:text-blue-700 mr-3" title="编辑"><i class="fa-solid fa-pen"></i></button>
+        <button onclick="deleteGroup(${g.id}, '${esc(g.name)}')" class="text-red-500 hover:text-red-600" title="删除"><i class="fa-solid fa-trash"></i></button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+/* 新建 / 编辑分组：多选模型列表 */
+let _geModels = [];   // 全部模型配置（可选池）
+let _geSelected = new Set();
+let _geEditId = 0;
+
+async function openGroupEditor(gid) {
+  _geEditId = gid || 0;
+  // 拉全部模型配置作为候选（只列启用的，禁用模型选进来没意义）
+  try {
+    const r = await api("/api/models/configs");
+    const { ok, data: d } = await safeJson(r);
+    if (!ok) { toast("加载模型列表失败", "err"); return; }
+    _geModels = (d.items || []).filter(m => m.enabled);
+  } catch (e) { toast("加载模型列表异常: " + e.message, "err"); return; }
+
+  let g = null;
+  if (_geEditId) {
+    g = _groupData.find(x => x.id === _geEditId);
+    if (!g) { toast("分组不存在", "err"); return; }
+  }
+  _geSelected = new Set(g ? (g.models || []) : []);
+
+  openModal(`
+    <h3 class="font-bold mb-1"><i class="fa-solid fa-layer-group mr-1"></i> ${_geEditId ? "编辑分组" : "新建分组"}</h3>
+    <p class="text-xs text-slate-400 mb-3">选择该分组允许使用的模型，并起一个名字。</p>
+    <div class="grid gap-3">
+      <div>
+        <label class="text-xs text-slate-500">分组名称 <span class="text-red-500">*</span></label>
+        <input id="geName" class="w-full border rounded-lg px-3 py-2 text-sm mt-1" placeholder="例如：便宜模型组"
+               value="${g ? esc(g.name) : ""}" />
+      </div>
+      <div>
+        <label class="text-xs text-slate-500">备注</label>
+        <input id="geNote" class="w-full border rounded-lg px-3 py-2 text-sm mt-1" placeholder="可选"
+               value="${g ? esc(g.note || "") : ""}" />
+      </div>
+      <div>
+        <div class="flex items-center justify-between mb-1">
+          <label class="text-xs text-slate-500">模型列表 <span class="text-red-500">*</span>（已选 <span id="geCount">0</span> 个）</label>
+          <div class="flex gap-2 text-xs">
+            <button onclick="geSelectAll(true)" class="text-wb hover:underline">全选</button>
+            <button onclick="geSelectAll(false)" class="text-slate-400 hover:underline">清空</button>
+          </div>
+        </div>
+        <input id="geFilter" oninput="renderGeModels()" placeholder="搜索模型 ID" class="w-full border rounded-lg px-3 py-1.5 text-sm mb-2" />
+        <div id="geModelList" class="border rounded-lg max-h-64 overflow-auto p-2 grid gap-1"></div>
+      </div>
+    </div>
+    <div class="flex justify-end gap-2 mt-4">
+      <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">取消</button>
+      <button onclick="saveGroup()" class="px-3 py-1.5 rounded-lg btn-primary text-sm">保存</button>
+    </div>`);
+  renderGeModels();
+}
+
+function renderGeModels() {
+  const box = $("#geModelList");
+  if (!box) return;
+  const term = (($("#geFilter") || {}).value || "").trim().toLowerCase();
+  const list = _geModels.filter(m => !term || (m.model_id || "").toLowerCase().includes(term));
+  if (!list.length) { box.innerHTML = `<div class="text-xs text-slate-400 p-2">无匹配模型</div>`; }
+  else {
+    box.innerHTML = list.map(m => `
+      <label class="flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-50 cursor-pointer text-sm">
+        <input type="checkbox" ${_geSelected.has(m.model_id) ? "checked" : ""}
+               onchange="geToggle('${esc(m.model_id)}', this.checked)" />
+        <span class="font-mono text-xs">${esc(m.model_id)}</span>
+        ${m.is_free ? `<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">免费</span>`
+                    : `<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">x${m.credit_multiplier}</span>`}
+      </label>`).join("");
+  }
+  const c = $("#geCount"); if (c) c.textContent = _geSelected.size;
+}
+
+function geToggle(mid, on) {
+  if (on) _geSelected.add(mid); else _geSelected.delete(mid);
+  const c = $("#geCount"); if (c) c.textContent = _geSelected.size;
+}
+function geSelectAll(on) {
+  // 全选只作用于当前筛选结果，避免误勾到看不见的模型
+  const term = (($("#geFilter") || {}).value || "").trim().toLowerCase();
+  const list = _geModels.filter(m => !term || (m.model_id || "").toLowerCase().includes(term));
+  for (const m of list) { if (on) _geSelected.add(m.model_id); else _geSelected.delete(m.model_id); }
+  renderGeModels();
+}
+
+async function saveGroup() {
+  const name = ($("#geName").value || "").trim();
+  if (!name) { toast("请填写分组名称", "err"); return; }
+  if (!_geSelected.size) { toast("请至少选择一个模型", "err"); return; }
+  const payload = { name, note: ($("#geNote").value || "").trim(), models: [..._geSelected] };
+  try {
+    const r = await api(_geEditId ? `/api/groups/${_geEditId}` : "/api/groups", {
+      method: _geEditId ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const { ok, data: d } = await safeJson(r);
+    if (!ok) { toast("保存失败: " + (d.detail || "未知错误"), "err"); return; }
+    closeModal();
+    toast(_geEditId ? "分组已更新" : `分组「${name}」已创建`);
+    loadGroups();
+  } catch (e) { toast("保存异常: " + e.message, "err"); }
+}
+
+async function deleteGroup(gid, name) {
+  if (!await uiConfirm({title:"删除分组",
+      message:`确认删除分组「${name}」？\n绑定了该分组的 Key 会自动变为「不限制模型」`})) return;
+  try {
+    const r = await api(`/api/groups/${gid}`, { method: "DELETE" });
+    const { ok, data: d } = await safeJson(r);
+    if (!ok) { toast("删除失败: " + (d.detail || ""), "err"); return; }
+    toast(d.unbound_keys > 0 ? `已删除分组，${d.unbound_keys} 个 Key 已自动解除限制` : "分组已删除");
+    loadGroups(); loadKeys();
+  } catch (e) { toast("删除异常: " + e.message, "err"); }
+}
+
+/* ==================== 使用记录统计 ==================== */
+const _PIE_COLORS = ["#3b82f6","#22c55e","#f59e0b","#ef4444","#8b5cf6","#06b6d4","#ec4899","#84cc16"];
+
+function fmtNum(n) {
+  n = Number(n) || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(Math.round(n));
+}
+function fmtCredit(n) { return (Number(n) || 0).toFixed(2); }
+
+/* 纯 SVG 环形图 + 图例表格（不引第三方图表库，保持单文件零依赖）
+ * tooltip：原生 <title> 有 ~1s 延迟且样式不可控，故自绘跟随鼠标的浮层。
+ */
+function donutChart(rows, valueKey, title) {
+  const items = (rows || []).filter(r => (r[valueKey] || 0) > 0);
+  if (!items.length) return `<div class="text-xs text-slate-400 py-8 text-center">暂无数据</div>`;
+
+  const total = items.reduce((s, r) => s + (r[valueKey] || 0), 0);
+  const R = 60, SW = 26, C = 2 * Math.PI * R;
+  let offset = 0;
+  const arcs = items.map((r, i) => {
+    const frac = (r[valueKey] || 0) / total;
+    const len = frac * C;
+    const pct = (frac * 100).toFixed(1);
+    const tip = `<b>${esc(r.label)}</b><br>积分 ${fmtCredit(r.credits)}（${pct}%）<br>请求 ${fmtNum(r.requests)} · Token ${fmtNum(r.tokens)}`;
+    const seg = `<circle class="chart-hit" cx="80" cy="80" r="${R}" fill="none"
+        stroke="${_PIE_COLORS[i % _PIE_COLORS.length]}" stroke-width="${SW}"
+        stroke-dasharray="${len} ${C - len}" stroke-dashoffset="${-offset}"
+        transform="rotate(-90 80 80)"
+        onmousemove="showTip(event, '${tip.replace(/'/g, "&#39;")}')" onmouseleave="hideTip()"></circle>`;
+    offset += len;
+    return seg;
+  }).join("");
+
+  const legend = items.map((r, i) => {
+    const frac = total ? ((r[valueKey] || 0) / total * 100).toFixed(1) : "0.0";
+    return `
+    <tr class="border-t hover:bg-slate-50">
+      <td class="py-1.5 pr-2">
+        <span class="inline-block w-2.5 h-2.5 rounded-sm mr-1.5" style="background:${_PIE_COLORS[i % _PIE_COLORS.length]}"></span>
+        <span class="text-xs">${esc(r.label)}</span>
+      </td>
+      <td class="py-1.5 px-2 text-right text-xs text-slate-500">${fmtNum(r.requests)}</td>
+      <td class="py-1.5 px-2 text-right text-xs text-slate-500">${fmtNum(r.tokens)}</td>
+      <td class="py-1.5 px-2 text-right text-xs text-slate-400">${frac}%</td>
+      <td class="py-1.5 pl-2 text-right text-xs font-medium text-amber-600">${fmtCredit(r.credits)}</td>
+    </tr>`;
+  }).join("");
+
+  return `
+    <div class="flex items-center gap-3">
+      <svg viewBox="0 0 160 160" class="w-32 h-32 shrink-0">${arcs}</svg>
+      <div class="flex-1 min-w-0 max-h-56 overflow-auto">
+        <table class="w-full">
+          <thead><tr class="text-[10px] text-slate-400">
+            <th class="text-left font-normal pb-1">名称</th>
+            <th class="text-right font-normal pb-1">请求</th>
+            <th class="text-right font-normal pb-1">Token</th>
+            <th class="text-right font-normal pb-1">占比</th>
+            <th class="text-right font-normal pb-1">积分</th>
+          </tr></thead>
+          <tbody>${legend}</tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+/* Token 趋势：输入/输出 双折线 + 面积；每个数据点可 hover 看当点明细 */
+function trendChart(rows) {
+  if (!rows || !rows.length) return `<div class="text-xs text-slate-400 py-8 text-center">暂无数据</div>`;
+  const W = 560, H = 200, PAD = 34;
+  const n = rows.length;
+  const maxV = Math.max(1, ...rows.map(r => Math.max(r.prompt_tokens, r.completion_tokens)));
+  const x = i => PAD + (n === 1 ? (W - PAD * 2) / 2 : (i * (W - PAD * 2)) / (n - 1));
+  const y = v => H - PAD - (v / maxV) * (H - PAD * 2);
+
+  const line = (key, color) => {
+    const pts = rows.map((r, i) => `${x(i)},${y(r[key])}`).join(" ");
+    const area = `${PAD},${H - PAD} ${pts} ${x(n - 1)},${H - PAD}`;
+    return `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" pointer-events="none"></polyline>
+            <polygon points="${area}" fill="${color}" opacity="0.10" pointer-events="none"></polygon>`;
+  };
+
+  const grid = [0, 0.25, 0.5, 0.75, 1].map(f => {
+    const v = maxV * f, yy = y(v);
+    return `<line x1="${PAD}" y1="${yy}" x2="${W - PAD}" y2="${yy}" stroke="#e2e8f0" stroke-width="1" pointer-events="none"></line>
+            <text x="${PAD - 6}" y="${yy + 3}" text-anchor="end" font-size="9" fill="#94a3b8" pointer-events="none">${fmtNum(v)}</text>`;
+  }).join("");
+
+  const step = Math.max(1, Math.ceil(n / 6));
+  const xlabels = rows.map((r, i) => (i % step === 0 || i === n - 1)
+    ? `<text x="${x(i)}" y="${H - PAD + 14}" text-anchor="middle" font-size="9" fill="#94a3b8" pointer-events="none">${esc(String(r.bucket).slice(5))}</text>`
+    : "").join("");
+
+  // 每个点画一个透明的较大命中圆，便于悬停
+  const hits = rows.map((r, i) => {
+    const tip = `<b>${esc(r.bucket)}</b><br>输入 ${fmtNum(r.prompt_tokens)} · 输出 ${fmtNum(r.completion_tokens)}<br>请求 ${fmtNum(r.requests)} · 积分 ${fmtCredit(r.credits)}`;
+    const cx = x(i);
+    const dots = `
+      <circle cx="${cx}" cy="${y(r.prompt_tokens)}" r="2.5" fill="#3b82f6" pointer-events="none"></circle>
+      <circle cx="${cx}" cy="${y(r.completion_tokens)}" r="2.5" fill="#22c55e" pointer-events="none"></circle>`;
+    return `<g class="chart-hit" onmousemove="showTip(event, '${tip.replace(/'/g, "&#39;")}')" onmouseleave="hideTip()">
+      ${dots}
+      <circle cx="${cx}" cy="${H / 2}" r="${Math.max(8, (W - PAD * 2) / Math.max(1, n) / 2)}" fill="transparent"></circle>
+    </g>`;
+  }).join("");
+
+  return `
+    <div>
+      <div class="flex gap-3 text-xs mb-1">
+        <span class="flex items-center gap-1"><span class="inline-block w-3 h-0.5" style="background:#3b82f6"></span> 输入</span>
+        <span class="flex items-center gap-1"><span class="inline-block w-3 h-0.5" style="background:#22c55e"></span> 输出</span>
+      </div>
+      <svg viewBox="0 0 ${W} ${H}" class="w-full">
+        ${grid}
+        ${line("prompt_tokens", "#3b82f6")}
+        ${line("completion_tokens", "#22c55e")}
+        ${hits}
+        ${xlabels}
+      </svg>
+    </div>`;
+}
+
+/* 使用记录工具栏的两个下拉：首次进入时渲染一次 */
+let _usageSelReady = false;
+function initUsageSelects() {
+  if (_usageSelReady) return;
+  _usageSelReady = true;
+  const daysBox = $("#usageDaysSel");
+  if (daysBox) daysBox.outerHTML = uiSelectHTML("usageDaysSel", {
+    value: "14",
+    options: [
+      { value: "1", label: "近 1 天" },
+      { value: "7", label: "近 7 天" },
+      { value: "14", label: "近 14 天" },
+      { value: "30", label: "近 30 天" },
+      { value: "90", label: "近 90 天" },
+    ],
+    onChange: () => loadUsageStats(),
+  });
+  const gBox = $("#usageGrainSel");
+  if (gBox) gBox.outerHTML = uiSelectHTML("usageGrainSel", {
+    value: "day",
+    options: [
+      { value: "day", label: "按天" },
+      { value: "hour", label: "按小时" },
+    ],
+    onChange: () => loadUsageStats(),
+  });
+}
+
+async function loadUsageStats() {
+  initUsageSelects();
+  const days = uiSelectValue("usageDaysSel") || 14;
+  const grain = uiSelectValue("usageGrainSel") || "day";
+  const ov = $("#usageOverview");
+  if (ov) ov.innerHTML = `<div class="col-span-4 text-sm text-slate-400">加载中...</div>`;
+  try {
+    const r = await api(`/api/stats/usage?days=${days}&granularity=${grain}`);
+    const { ok, data: d } = await safeJson(r);
+    if (!ok) { if (ov) ov.innerHTML = `<div class="col-span-4 text-sm text-red-500">加载失败: ${esc(d.detail || "")}</div>`; return; }
+
+    const o = d.overview || {};
+    if (ov) ov.innerHTML = `
+      ${card("总请求数", fmtNum(o.requests), "fa-paper-plane", "text-indigo-600")}
+      ${card("总 Token", fmtNum(o.total_tokens), "fa-cube", "text-amber-600")}
+      ${card("总消费", fmtCredit(o.credits), "fa-coins", "text-emerald-600")}
+      ${card("平均耗时", (o.avg_latency_ms ? (o.avg_latency_ms / 1000).toFixed(2) : "0.00") + "s", "fa-stopwatch", "text-violet-600")}`;
+
+    $("#usageModelChart").innerHTML = donutChart(d.by_model, "credits");
+    $("#usageKeyChart").innerHTML = donutChart(d.by_key, "credits");
+    $("#usageEndpointChart").innerHTML = donutChart(d.by_endpoint, "credits");
+    $("#usageTrendChart").innerHTML = trendChart(d.trend);
+  } catch (e) {
+    if (ov) ov.innerHTML = `<div class="col-span-4 text-sm text-red-500">加载异常: ${esc(e.message)}</div>`;
+  }
+}
+
+/* ==================== 自研确认框（替换原生 confirm）====================
+ * 原生 confirm 有三大问题：样式无法控制、阻塞主线程、移动端样式丑陋。
+ * 这里用 Promise 化实现：await uiConfirm({...}) 返回 true/false。
+ * 用法：if (!await uiConfirm({ title, message, danger:true })) return;
+ */
+
+
+// 点击空白处收起所有下拉
+document.addEventListener("click", () => {
+  document.querySelectorAll(".ui-select.open").forEach(x => x.classList.remove("open"));
+});
+
+
+/* ==================== 图表 tooltip ==================== */
+function _ensureTip() {
+  let t = $("#chartTip");
+  if (!t) {
+    t = document.createElement("div");
+    t.id = "chartTip";
+    document.body.appendChild(t);
+  }
+  return t;
+}
+function showTip(ev, html) {
+  const t = _ensureTip();
+  t.innerHTML = html;
+  t.style.display = "block";
+  t.style.left = ev.clientX + "px";
+  t.style.top = ev.clientY + "px";
+}
+function hideTip() {
+  const t = $("#chartTip");
+  if (t) t.style.display = "none";
+}
+// 鼠标跟随（绑在容器上做事件委托，避免每个图形单独绑）
+document.addEventListener("mousemove", e => {
+  const t = $("#chartTip");
+  if (!t || t.style.display !== "block") return;
+  t.style.left = e.clientX + "px";
+  t.style.top = e.clientY + "px";
+});
+
+// 启动：只有 401/403 才认定 token 失效；其它错误保留登录态，
+// 否则任何一个接口偶发 500 都会把用户踢回登录页（且清掉 token）。
+if (TOKEN) {
+  api("/api/accounts").then(r => {
+    if (r.ok) { enterApp(); return; }
+    if (r.status === 401 || r.status === 403) { logout(); return; }
+    // 其它状态：先进应用，由各面板自己提示错误
+    enterApp();
+    toast("部分数据加载失败（HTTP " + r.status + "），可稍后重试", "err");
+  }).catch(e => {
+    // 网络异常也不清 token，允许用户手动重试
+    enterApp();
+    toast("网络异常：" + (e && e.message ? e.message : e), "err");
+  });
+} else { /* 显示登录 */ }
 </script>
 </body>
 </html>

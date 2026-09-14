@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from admin.db import get_db
-from admin.models import ApiKey
+from admin.models import ApiKey, ModelGroup
 from admin.security import hash_key, require_admin
 
 router = APIRouter(prefix="/api/keys", tags=["keys"])
@@ -18,6 +18,7 @@ class KeyIn(BaseModel):
     credit_limit: float = 0
     unlimited: bool = False
     note: str = ""
+    group_id: int = 0  # 0 = 不绑定分组（可用全部启用模型）
 
 
 def _gen_key() -> str:
@@ -44,6 +45,7 @@ def _decode_key(encoded: str) -> str:
 @router.get("")
 def list_keys(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
     rows = db.query(ApiKey).order_by(ApiKey.id.desc()).all()
+    group_names = {g.id: g.name for g in db.query(ModelGroup).all()}
     items = [
         {
             "id": k.id,
@@ -55,6 +57,8 @@ def list_keys(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
             "unlimited": bool(k.unlimited),
             "status": k.status,
             "note": k.note,
+            "group_id": int(k.group_id or 0),
+            "group_name": group_names.get(int(k.group_id or 0), ""),
             "created_at": k.created_at.isoformat() if k.created_at else None,
         }
         for k in rows
@@ -62,9 +66,18 @@ def list_keys(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
     return {"items": items}
 
 
+def _validate_group(db: Session, group_id: int) -> int:
+    """校验分组存在；0 表示不绑定（允许）。返回规范化后的 group_id。"""
+    gid = int(group_id or 0)
+    if gid and not db.query(ModelGroup).filter(ModelGroup.id == gid).first():
+        raise HTTPException(status_code=400, detail=f"分组 #{gid} 不存在")
+    return gid
+
+
 @router.post("")
 def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
     raw = _gen_key()
+    gid = _validate_group(db, body.group_id)
     k = ApiKey(
         name=body.name or "未命名",
         key_hash=hash_key(raw),
@@ -73,6 +86,7 @@ def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depe
         credit_limit=body.credit_limit,
         unlimited=1 if body.unlimited else 0,
         note=body.note,
+        group_id=gid,
     )
     db.add(k)
     db.commit()
@@ -85,6 +99,7 @@ def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depe
         "key_prefix": k.key_prefix,
         "credit_limit": k.credit_limit,
         "unlimited": bool(k.unlimited),
+        "group_id": int(k.group_id or 0),
     }
 
 
@@ -141,6 +156,8 @@ def patch_key(key_id: int, body: dict, _: bool = Depends(require_admin), db: Ses
         k.status = body["status"]
     if "note" in body:
         k.note = body["note"]
+    if "group_id" in body:
+        k.group_id = _validate_group(db, body["group_id"])
     if body.get("reset_used"):
         k.credit_used = 0
     db.commit()

@@ -48,8 +48,33 @@ class ApiKey(Base):
     unlimited = Column(Integer, default=0)  # 0/1
     status = Column(String(16), default="active")  # active | revoked
     note = Column(String(255), default="")
+    # 绑定的模型分组 id；0 = 未绑定（可用全部启用模型）。分组被删时按 0 处理（自动降级）
+    group_id = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ModelGroup(Base):
+    """模型分组：一组模型的命名集合，供 API Key 绑定以限制可用模型范围。"""
+
+    __tablename__ = "model_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(120), nullable=False, default="")
+    note = Column(String(255), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ModelGroupItem(Base):
+    """分组内的模型成员（一个分组多条）。"""
+
+    __tablename__ = "model_group_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    group_id = Column(Integer, nullable=False, index=True)
+    model_id = Column(String(120), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class UsageLog(Base):

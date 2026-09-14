@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from admin.config import settings
 from admin.db import ensure_database, init_db, SessionLocal
 from admin.models import SystemSetting
-from admin.routers import accounts, keys, logs, models, proxy, schedules, sync
+from admin.routers import accounts, groups, keys, logs, models, proxy, schedules, stats, sync
 from admin.ratelimit import clear_failures, get_client_ip, is_locked, record_failure
 from admin.security import (
     create_admin_token,
@@ -64,6 +64,8 @@ app.include_router(proxy.router)
 app.include_router(sync.router)
 app.include_router(schedules.router)
 app.include_router(logs.router)
+app.include_router(groups.router)
+app.include_router(stats.router)
 
 
 @app.on_event("startup")
@@ -75,10 +77,24 @@ def _startup():
 
 
 def _get_stored_hash() -> str:
-    """读取已存储的密码哈希；无记录或旧明文则迁移为哈希后持久化。"""
+    """读取密码哈希；显式配置 ADMIN_PASSWORD 时以 env 为准并同步数据库。"""
+    db = None
     try:
         db = SessionLocal()
         row = db.query(SystemSetting).filter(SystemSetting.key == "admin_password").first()
+
+        # env 是部署配置的明确来源，优先级高于数据库中可能遗留的旧密码。
+        if settings.ADMIN_PASSWORD_FROM_ENV:
+            if row and row.value and verify_password(settings.ADMIN_PASSWORD, row.value):
+                return row.value
+            val = hash_password(settings.ADMIN_PASSWORD)
+            if row:
+                row.value = val
+            else:
+                db.add(SystemSetting(key="admin_password", value=val))
+            db.commit()
+            return val
+
         if row and row.value:
             val = row.value
             if not val.startswith("pbkdf2$"):  # 旧明文 → 迁移为哈希
@@ -87,9 +103,11 @@ def _get_stored_hash() -> str:
                 db.commit()
             return val
     finally:
-        db.close()
+        if db is not None:
+            db.close()
     # 无记录：用配置默认密码并持久化哈希
     h = hash_password(settings.ADMIN_PASSWORD)
+    db = None
     try:
         db = SessionLocal()
         db.add(SystemSetting(key="admin_password", value=h))
@@ -97,7 +115,8 @@ def _get_stored_hash() -> str:
     except Exception:
         pass
     finally:
-        db.close()
+        if db is not None:
+            db.close()
     return h
 
 

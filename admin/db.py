@@ -93,6 +93,9 @@ def init_db():
     _ensure_column("accounts", "last_err_msg", "VARCHAR(255)", "DEFAULT ''")
     _ensure_column("accounts", "last_picked_at", "DATETIME", "NULL")
 
+    # 迁移：api_keys 加 group_id 列（绑定模型分组；0=不限制）
+    _ensure_column("api_keys", "group_id", "INT", "DEFAULT 0")
+
     # 迁移：创建 system_settings / schedules 表（create_all 已处理，这里仅兜底）
 
 

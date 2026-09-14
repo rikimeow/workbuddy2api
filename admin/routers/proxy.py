@@ -422,13 +422,44 @@ def _select_account(db: Session, exclude_ids: set | None = None,
     return acc
 
 
-def _pick_best_model(db: Session, requested_model: str) -> str | None:
+def _key_group_models(db: Session, key: "ApiKey | None") -> set[str] | None:
+    """返回该 Key 允许的模型集合；None 表示不限制（可用全部启用模型）。
+
+    绑定分组后只允许组内模型。分组被删除 → group_id 由删除接口置 0，
+    这里读到 0 即视为不限制（自动降级，不锁死 Key）。
+    组内模型全部被禁用时返回空集合，此时拒绝一切模型调用 —— 这是「配了分组但
+    组内模型都不可用」的明确信号，不应静默放开。
+    """
+    if key is None:
+        return None
+    gid = int(getattr(key, "group_id", 0) or 0)
+    if not gid:
+        return None
+    from admin.routers.groups import effective_group_models
+    return effective_group_models(db, gid)
+
+
+def _model_out_of_group_error(model: str) -> JSONResponse:
+    """模型不在 Key 绑定分组内时的统一拒绝响应。"""
+    return JSONResponse(
+        status_code=403,
+        content={"error": {
+            "message": f"模型 '{model}' 不在该 API Key 绑定的分组内",
+            "type": "model_not_in_group",
+            "code": "model_not_in_group",
+        }},
+    )
+
+
+def _pick_best_model(db: Session, requested_model: str,
+                     allowed: set[str] | None = None) -> str | None:
     """根据请求模型和可用配置，选出最优实际使用的模型 ID。
 
     策略：
       - 用户指定了具体模型 → 校验白名单后直接用（或返回 None 表示被拒）
       - 用户传 "auto" 或空 → 优先选免费模型（credit_multiplier=0），没有免费的才选付费的
       - 未配置任何模型规则时放行全部（向后兼容），返回原始 model
+      - allowed 非 None 时（Key 绑定了分组），只在 allowed 集合内选择
     """
     from admin.routers.models import _is_model_allowed, _get_free_models, _get_enabled_models
     from admin.models import ModelConfig
@@ -438,6 +469,10 @@ def _pick_best_model(db: Session, requested_model: str) -> str | None:
 
     # 具体模型：有配置时校验白名单，无配置直接放行
     if requested_model and requested_model != "auto":
+        if allowed is not None:
+            # 绑定了分组：只认组内模型，优先于全局白名单判定，
+            # 组内没有就是没权限（比白名单更严格，语义更明确）
+            return requested_model if requested_model in allowed else None
         if not has_any_config:
             return requested_model  # 无配置，放行
         if _is_model_allowed(db, requested_model):
@@ -445,6 +480,15 @@ def _pick_best_model(db: Session, requested_model: str) -> str | None:
         return None  # 被白名单拒绝
 
     # auto 模式：有配置时免费优先，无配置也从后端取模型列表自选（绝不透传 auto）
+    if allowed is not None:
+        # 分组内：免费优先，否则任意组内模型
+        free_in_group = _get_free_models(db) & allowed
+        if free_in_group:
+            return sorted(free_in_group)[0]
+        if allowed:
+            return sorted(allowed)[0]
+        return None  # 分组内无可用模型（都被禁用）
+
     if not has_any_config:
         # 无本地配置时：尝试从后端拉一次模型列表来选免费模型
         try:
@@ -480,12 +524,19 @@ def _pick_best_model(db: Session, requested_model: str) -> str | None:
     return None  # 有配置但全禁用
 
 
-def _candidate_models(db: Session, tried: set) -> list:
-    """按 免费→付费 顺序返回可用模型候选（排除已尝试的），用于 429/5xx 自动切换。"""
+def _candidate_models(db: Session, tried: set, allowed: set[str] | None = None) -> list:
+    """按 免费→付费 顺序返回可用模型候选（排除已尝试的），用于 429/5xx 自动切换。
+
+    allowed 非 None 时（Key 绑定了分组）只在组内挑选，避免自动切换时
+    悄悄把请求切到分组外的模型上。
+    """
     from admin.routers.models import _get_enabled_models, _get_free_models
 
     free = _get_free_models(db) - tried
     paid = (_get_enabled_models(db) - free) - tried
+    if allowed is not None:
+        free &= allowed
+        paid &= allowed
     return list(free) + list(paid)
 
 
@@ -577,7 +628,7 @@ _ANTHROPIC_MODEL_TIERS = (
 )
 
 
-def _map_anthropic_model(db: Session, model: str) -> str:
+def _map_anthropic_model(db: Session, model: str, key: "ApiKey | None" = None) -> str:
     """把 Anthropic 的模型名翻译成本后台白名单里的模型名。
 
     按顺序判定：
@@ -585,16 +636,25 @@ def _map_anthropic_model(db: Session, model: str) -> str:
       2. 已在白名单里（如 glm-5.2） → 原样，允许直接点名上游模型
       3. 含 opus / sonnet / haiku   → 取 .env 配置的对应档次模型
       4. 其余（claude-* 等）        → auto
+
+    传了 key（且绑定了分组）时，判定 2 的「在白名单里」改为「在该分组里」：
+    否则客户端点一个分组外的模型名会被原样放行，绕过分组限制。
     """
+    allowed = _key_group_models(db, key)
     m = (model or "").strip()
     if not m or m == "auto":
         return "auto"
-    if _pick_best_model(db, m):
+    if allowed is not None:
+        if m in allowed:
+            return m
+    elif _pick_best_model(db, m):
         return m
     low = m.lower()
     for tier, target in _ANTHROPIC_MODEL_TIERS:
         if tier in low and target:
-            return target
+            # 档次映射目标也必须落在分组内，否则退化为 auto 由组内自选
+            if allowed is None or target in allowed:
+                return target
     return "auto"
 
 
@@ -631,9 +691,12 @@ async def chat_completions(
 
     model = payload.get("model", "auto")
 
-    # 模型白名单检查 + 免费优先选择
-    resolved_model = _pick_best_model(db, model)
+    # 模型白名单检查 + 免费优先选择（绑定了分组的 Key 只在组内选择）
+    allowed = _key_group_models(db, key)
+    resolved_model = _pick_best_model(db, model, allowed)
     if resolved_model is None:
+        if allowed is not None and model not in ("auto", ""):
+            return _model_out_of_group_error(model)
         return JSONResponse(
             status_code=400,
             content={"error": {"message": f"模型 '{model}' 不存在或已被禁用", "type": "model_not_found"}},
@@ -641,7 +704,7 @@ async def chat_completions(
 
     # 候选模型顺序：auto 模式按 免费→付费 排列，支持上游 429/5xx 自动切换下一个
     if model in ("auto", ""):
-        order = [resolved_model] + _candidate_models(db, {resolved_model})
+        order = [resolved_model] + _candidate_models(db, {resolved_model}, allowed)
         order = order[:8]  # 最多尝试 8 个，避免全局限流时反复重试
     else:
         order = [resolved_model]  # 具体模型：不静默切换，失败即报错
@@ -817,14 +880,17 @@ async def responses_proxy(
     chat_body["stream_options"] = opts
 
     requested = payload.get("model", "auto")
-    resolved = _pick_best_model(db, requested)
+    allowed = _key_group_models(db, key)
+    resolved = _pick_best_model(db, requested, allowed)
     if resolved is None:
+        if allowed is not None and requested not in ("auto", ""):
+            return _model_out_of_group_error(requested)
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"模型 '{requested}' 不存在或已被禁用", "type": "model_not_found"}})
 
     order = [resolved]
     if requested in ("auto", ""):
-        order = [resolved] + _candidate_models(db, {resolved})
+        order = [resolved] + _candidate_models(db, {resolved}, allowed)
         order = order[:8]
 
     client_wants_stream = bool(payload.get("stream", True))
@@ -1074,15 +1140,18 @@ async def anthropic_messages(
         except Exception as e:
             _logger.warning("harness 脱敏失败，按原样发送：%s", e)
 
-    requested = _map_anthropic_model(db, payload.get("model", "auto"))
-    resolved = _pick_best_model(db, requested)
+    requested = _map_anthropic_model(db, payload.get("model", "auto"), key)
+    allowed = _key_group_models(db, key)
+    resolved = _pick_best_model(db, requested, allowed)
     if resolved is None:
+        if allowed is not None and requested not in ("auto", ""):
+            return _model_out_of_group_error(requested)
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"模型 '{requested}' 不存在或已被禁用", "type": "model_not_found"}})
 
     order = [resolved]
     if requested in ("auto", ""):
-        order = ([resolved] + _candidate_models(db, {resolved}))[:8]
+        order = ([resolved] + _candidate_models(db, {resolved}, allowed))[:8]
 
     # 上游一律按流式拉取：Anthropic 的方向就是「消费 Chat SSE 再转事件流」。
     # 客户端若要非流式，我们在内部聚合完再一次性返回。
@@ -1329,6 +1398,8 @@ async def models(
     if not acc:
         return JSONResponse(status_code=503,
                             content={"error": {"message": "无可用账号", "type": "no_account"}})
+    # 绑定了分组的 Key 只应看到组内模型，否则客户端会照着完整列表点模型然后被 403
+    allowed = _key_group_models(db, key)
     try:
         with backend.AccountSession(acc.auth_json) as sess:
             models_raw = sess.fetch_models()
@@ -1342,7 +1413,10 @@ async def models(
             "name": m.get("name") or m.get("id"),
             "credit_multiplier": backend.CredentialManager._parse_credit_multiplier(m.get("credits"))
             if hasattr(backend.CredentialManager, "_parse_credit_multiplier") else None,
-        } for m in models_raw if m.get("id") and _is_model_allowed(db, m.get("id")) and m.get("id","").lower() != "auto"]
+        } for m in models_raw
+            if m.get("id")
+            and m.get("id", "").lower() != "auto"
+            and (m.get("id") in allowed if allowed is not None else _is_model_allowed(db, m.get("id")))]
         return {"object": "list", "data": data, "source": "backend"}
     except Exception as e:
         return JSONResponse(status_code=502, content={"error": {"message": f"获取模型失败：{e}", "type": "upstream"}})
