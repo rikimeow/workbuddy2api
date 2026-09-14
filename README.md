@@ -22,10 +22,11 @@
 - [三、多账号代理共享平台（admin）](#三多账号代理共享平台admin)
 - [四、环境安装与项目运行](#四环境安装与项目运行)
 - [五、每日签到定时任务（daily_checkin）](#五每日签到定时任务daily_checkin)
-- [六、客户端接入](#六客户端接入)
-- [七、日志与排障](#七日志与排障)
-- [八、项目结构](#八项目结构)
-- [九、免责声明与协议](#九免责声明与协议)
+- [六、成长计划任务（growth）](#六成长计划任务growth)
+- [七、客户端接入](#七客户端接入)
+- [八、日志与排障](#八日志与排障)
+- [九、项目结构](#九项目结构)
+- [十、免责声明与协议](#十免责声明与协议)
 
 ---
 
@@ -210,6 +211,9 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 | 账号 | `POST /api/accounts/{id}/refresh` · `PATCH/DELETE /api/accounts/{id}` | 刷新余额 / 改状态 / 删除 |
 | Key | `GET/POST /api/keys` · `PATCH/DELETE /api/keys/{id}` | Key 列表（脱敏）/ 创建 / 改限额 / 停用 / 吊销 |
 | 任务 | `GET/POST /api/schedules` · `PATCH/DELETE /api/schedules/{id}` · `POST /api/schedules/{id}/run` | 定时任务 CRUD / 立即运行 |
+| 成长任务 | `GET /api/growth/tasks` · `GET /api/growth/accounts/{id}/tasks` | 全量任务列表（不绑账号）/ 单账号任务详情 |
+| 成长任务 | `POST /api/growth/accept` · `POST /api/growth/run` · `POST /api/growth/claim` | 参与 / 自动完成 / 领奖 |
+| 成长任务 | `GET /api/growth/plans` | 任务分级策略表（哪些能自动完成及依据） |
 | 用量 | `GET /api/usage` · `GET /api/logs/usage` | 用量汇总 / 明细 |
 | 代理网关 | `POST /v1/chat/completions` · `GET /v1/models` | 带 Key 校验 + 配额 + 记账 |
 | 代理网关 | `POST /v1/responses` | OpenAI Responses（适配 Codex CLI，默认做投影压缩） |
@@ -221,7 +225,7 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 > OpenAI 系客户端填 `http://<host>:8790/v1`，Anthropic 系（Claude Code）填 `http://<host>:8790`——
 > 两种 SDK 都会自己拼后面的路径。
 
-### 3.4 环境变量（admin）
+### 3.5 环境变量（admin）
 
 `ADMIN_DATABASE_URL` · `ADMIN_REDIS_URL` · `ADMIN_BACKEND` · `ADMIN_USERNAME` · `ADMIN_PASSWORD` · `ADMIN_JWT_SECRET`（≥32 字节）· `ADMIN_JWT_EXPIRE_HOURS` · `ADMIN_COST_PER_TOKEN` · `ADMIN_ACCOUNT_SELECT`（`remain` / `lru`）· `ADMIN_PORT` · `ADMIN_CLIENT_AUTH_DIR`
 
@@ -237,7 +241,7 @@ Anthropic 端点（`/v1/messages`）相关：
 - `CODEBUDDY_AUTH_DIR` —— converter 读取桌面端凭据的目录。**注意与 `ADMIN_CLIENT_AUTH_DIR` 是两个不同的变量**：后者给后台「扫描本机 / 注入本机」用。以 Windows 服务（LocalSystem）方式运行时两者都必须写**绝对路径**，否则 `%LOCALAPPDATA%` 会解析到空目录
 - `CONVERTER_DESENSITIZE` · `CONVERTER_LOG`
 
-### 3.5 已知限制
+### 3.6 已知限制
 
 - 账号凭据（`.info` 原文）以明文存于 MySQL，生产环境请加密存储或限制库访问
 - 后端未回传 `credits` 时，按 `completion_tokens × COST_PER_TOKEN` 估算扣费（经验值）
@@ -395,7 +399,164 @@ PYTHONPATH=. python scripts/test_daily_checkin.py
 
 ---
 
-## 六、客户端接入
+## 六、成长计划任务（growth）
+
+把 WorkBuddy「成长中心」的任务做成可自动完成的模块：拉列表 → 参与 → 自动完成 → 领奖，全流程纯 HTTP，不需要桌面端在线、不需要 CLI、不占用本地登录态。
+
+### 6.1 协议机制（逆向结论）
+
+**进度不是靠独立上报接口驱动的。** 这是整件事最关键的一点，也是最容易走错的方向。
+
+任务进度由**模型请求体里的 `extra_vars.growthEvent`** 驱动。也就是发一个正常的对话请求，在 body 里附带事件声明：
+
+```http
+POST /v2/chat/completions
+Content-Type: application/json
+
+{
+  "model": "hy3",
+  "stream": true,
+  "max_tokens": 1,
+  "messages": [{"role": "user", "content": "hi"}],
+  "extra_vars": {
+    "growthEvent": "[{\"eventCode\":\"chat_request_send\",\"id\":\"<会话ID>\"}]"
+  }
+}
+```
+
+要点：
+
+- `growthEvent` 是 **JSON 字符串**（不是数组对象），服务端只按 `eventCode` 记账
+- 事件声明在**请求体**里，不在 header 里——早期只在 header / 独立上报接口找，方向是错的
+- 服务端**不校验模型是否真的被调用**，只认事件名
+- 独立上报接口 `POST /v2/report` 虽然返回 200，但**不驱动任务进度**
+
+### 6.2 完整状态机
+
+```text
+not_accepted ──accept──► accepted ──触发──► in_progress ──► completed ──claim──► claimed
+```
+
+**两个必须遵守的点：**
+
+1. **必须先 `accept`**，否则进度完全不累计。这曾导致大量错误的负面结论——不是方法不成立，是任务没参与。
+2. **`completed` ≠ `claimed`**。完成只是达标，奖励要**另外调一次 claim** 才真正到账。
+
+### 6.3 三个接口的形态
+
+| 步骤 | 请求 |
+|------|------|
+| 拉列表 | `GET /v2/activity/growth/tasks` |
+| 参与 | `POST /v2/activity/growth/tasks/accept`，body `{"task_codes":["chat_5", ...]}` |
+| 触发 | `POST /v2/chat/completions`，body 带 `extra_vars.growthEvent` |
+| 领奖 | `POST /activity/growth/tasks/{task_code}/claim`，空 body |
+
+注意领奖路径与其它 growth 接口**形态不同**：**没有 `/v2` 前缀**，任务码在路径里。参与接口只接受上面这一种 body 形态（复数 + 数组），另外试过的 12 种写法一律 `400 invalid request`。
+
+### 6.4 为什么不用「直接发完成包 / 直接发事件」
+
+这是**已验证不可行**的方案，本模块**没有采用**：
+
+- **直接发完成包、直接上报事件 → 任务不通过。** 已实测：`POST /v2/report` 返回 200 但不驱动进度；伪造完成态也无法让任务真正达标。
+- 空 `messages` 等畸形请求虽然有时也能触发计数，但会产生 **HTTP 400 报错**。上游有报错日志审查，这类痕迹容易被发现并封堵。
+
+本模块走的是**免费模型路线**，请求形态与正常对话**完全一致**：
+
+- 用免费 0 倍率模型（`hy3`）+ `max_tokens=1`，**成本为 0**
+- 返回 **HTTP 200**，上游日志里看不出任何异常
+- 只有在个别任务确实需要特定模型时才换（见 6.5 的「模型体验」）
+
+### 6.5 任务分级与实测结论
+
+分级规则见 `admin/growth_plans.py`，分 **简单 / 简单(多次) / 复杂 / 跳过** 四级。下表是**逐条实测**的结果，不是推测：
+
+| 任务 | 分级 | 完成方式 | 实测 |
+|------|------|----------|------|
+| `chat_5` 对话 5 次 | 简单(多次) | `chat_request_send` × N | ✅ |
+| `automation_1` 设置自动化 | 简单 | `automated_task_create_suc` | ✅ |
+| `skill_1` 尝鲜技能 | 简单 | `skill_info` | ✅ |
+| `Model_chat_GLM5.2` 模型体验 | 简单 | **真实调用 `glm-5.2`** | ✅ |
+| `expert_5` 召唤 5 次专家 | 复杂 | — | ❌ 见 6.6 |
+| `Expert_team_use_3` 专家团 | 复杂 | — | ❌ 见 6.6 |
+| `Hp_Appearance` 和平精英主题 | 复杂 | — | ❌ 见 6.6 |
+| `RichMeow_Chat` 桌面端对话 | 复杂 | — | ❌ 见 6.6 |
+| `black_cat` 夜猫子折扣 | 跳过 | — | 奖励为 0 |
+
+**「模型体验」类任务**（`Model_chat_GLM5.2`）的完成条件是 **请求体里的 `model` 必须真的是 `glm-5.2`**，发事件包一律无效。用 `max_tokens=1` 最小输出调用一次即可，倍率 0.79、单次成本极低。
+
+### 6.6 为什么部分任务不做（必须客户端）
+
+这些任务**不是"没找到方法"，而是机制上就不接受服务端触发**，已在策略表里写明具体原因：
+
+| 任务 | 真实机制 | 证据 |
+|------|----------|------|
+| `expert_5` / `Expert_team_use_3` | **召唤 = 客户端本地专家包的下载 + 激活** | 桌面端实现为 `new ExpertSummonService(..., {package: packageProvider, downloadUrl: downloadUrlService}).summon(params)`，市场通道是 IPC（`builtin-market:install` / `downloadUrl`），非服务端事件 |
+| `Hp_Appearance` | 需桌面端「菜单-外观」切换主题 | 纯客户端本地设置状态 |
+| `RichMeow_Chat` | 按**客户端类型**判定 | 发 `chat_request_send` 等 5 个事件均不计数 |
+
+对专家类任务做过的验证（均无效果）：
+
+- **后端没有专家接口**：`/v2/experts`、`/v2/expert/list`、`/v2/market/expert/list`、`/v2/experts/summon` 等 12 个候选路径全部 404；`/v2/agents/summon` 返回 `12202 agent not exist`（该接口是 IDE agent，与「专家」不是同一体系）
+- **埋点不驱动进度**：`expert_summoned`、`expert_summon_click`、`expert_team_summon`、`select_expert` 等 9 个逐个实测，进度均无变化
+- **请求体带专家标识无效**：`agentId` / `agent_id` / `expertId` / `botId` / `templateId`（含 11/22/23）共 9 种字段组合实测，进度均无变化
+- 暴力枚举 **1131 个候选事件**均未命中
+
+> 结论：这些任务要的是「在桌面端真的点一下」，属于产品设计上拉日活的手段。该部分**不做自动化**，在面板上标为「复杂」，仍保留尝试入口，便于日后上游改版时复验。
+
+### 6.7 串行执行（重要）
+
+早期实现是「先把所有待办任务批量 `accept`，再逐个触发」，实测会出现 **「已 accept 但首次触发不计数」**——上游的参与状态是**异步落库**的，紧接着发事件会被判定为「未参与」而丢弃。
+
+因此改为**每个任务独立走完整闭环，全程串行**：
+
+```text
+accept → 等待落库(_ACCEPT_SETTLE=3s) → 重新读取状态
+       → 触发(每次间隔 _EVENT_GAP=1.2s) → 等待(_VERIFY_WAIT=1.5s) → 复查进度
+```
+
+账号之间另有 `_ACCOUNT_GAP=2s` 间隔。**请勿对同一账号并行执行**，否则会出现任务不成功。
+
+### 6.8 使用方式
+
+**后台界面**（推荐）：账号池页 → 点某行 🌱 图标打开任务弹窗，可看每个任务的难度 / 状态 / 进度 / 积分，支持单个完成、单个领奖、一键完成全部可自动化任务（完成后自动领奖）。工具栏「批量做任务」对全部 active 账号串行执行。
+
+**接口调用**：
+
+```bash
+# 全量任务列表（不绑账号，任意可用登录态即可拉）
+curl -H "X-Admin-Token: <jwt>" http://127.0.0.1:8790/api/growth/tasks
+
+# 某账号的任务详情（<id> 为后台账号 ID）
+curl -H "X-Admin-Token: <jwt>" http://127.0.0.1:8790/api/growth/accounts/<id>/tasks
+
+# 完成可自动化任务（并自动领奖）
+curl -X POST -H "X-Admin-Token: <jwt>" -H "Content-Type: application/json" \
+     -d '{"account_ids":[<id>]}' http://127.0.0.1:8790/api/growth/run
+curl -X POST -H "X-Admin-Token: <jwt>" -H "Content-Type: application/json" \
+     -d '{"account_ids":[<id>]}' http://127.0.0.1:8790/api/growth/claim
+```
+
+**定时刷新**：默认自带「每日更新成长任务列表」（`refresh_growth_tasks`，1440 分钟）。任务定义对所有账号一致，所以只用**一个**可用登录态拉取，不遍历账号；失败时保留旧缓存，不影响面板使用。
+
+### 6.9 实测结果
+
+```text
+账号 A   not_accepted×4 → 4/4 completed → +400 积分 / +20 能量
+账号 B   +400 积分
+账号 C   +300 积分
+账号 D   +300 积分
+账号 E   +300 积分（含 GLM 模型体验）
+账号 F   +100 积分
+账号 G   +100 积分
+```
+
+单轮 9 个账号合计 **+900 积分**，所有账号「待做」清零。
+
+> 注：账号标识已完全脱敏，不暴露任何手机号、UID 或昵称。
+
+---
+
+## 七、客户端接入
 
 ### Codex CLI（走 `/v1/responses`）
 
@@ -472,7 +633,7 @@ curl -N http://127.0.0.1:8790/v1/chat/completions \
 
 ---
 
-## 七、日志与排障
+## 八、日志与排障
 
 ### 推荐启动
 
@@ -494,7 +655,7 @@ python converter.py --desensitize --log converter.log
 
 ---
 
-## 八、项目结构
+## 九、项目结构
 
 ```text
 workbuddy2api/
@@ -517,10 +678,11 @@ workbuddy2api/
 │   ├── db.py                 # SQLAlchemy 引擎 / 会话 / 建库建表 / 列迁移
 │   ├── models.py             # Account / ApiKey / UsageLog / Schedule ORM
 │   ├── security.py           # JWT、Key 哈希、配额拦截
-│   ├── backend.py            # 复用 converter.CredentialManager 操作单账号（含签到）
-│   ├── scheduler.py          # 轻量定时任务：refresh_balances / sync_models / daily_checkin
+│   ├── backend.py            # 复用 converter.CredentialManager 操作单账号（含签到 / 成长任务）
+│   ├── growth_plans.py       # 成长任务分级与完成策略表（实测结论沉淀处）
+│   ├── scheduler.py          # 轻量定时任务：refresh_balances / sync_models / daily_checkin / refresh_growth_tasks
 │   ├── turing_token.py       # Python 侧 X-Device-Token 提供器（subprocess 调 helper）
-│   ├── routers/              # accounts / keys / proxy / schedules / logs / sync / models
+│   ├── routers/              # accounts / groups / growth / keys / proxy / schedules / logs / stats / sync / models
 │   └── static/index.html     # 纯 HTML + TailwindCSS + FontAwesome 管理大屏
 └── README.md
 
@@ -531,7 +693,7 @@ D:\workbuddy\resources\app.asar.unpacked\native\turing-sdk\   # 设备风控原�
 
 ---
 
-## 九、免责声明与协议
+## 十、免责声明与协议
 
 本项目仅用于个人学习与研究。与腾讯、WorkBuddy、CodeBuddy、OpenAI、Anthropic 无官方关联。请仅在你合法拥有订阅的前提下使用，并自行承担风险。
 
