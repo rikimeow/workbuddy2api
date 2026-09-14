@@ -25,9 +25,12 @@ router = APIRouter(prefix="/api/growth", tags=["growth"])
 #: 任务定义缓存 {"tasks": [...], "synced_at": iso}
 _task_cache: dict = {}
 
-#: 执行节流（秒）：每个事件包之间、每个账号之间
-_EVENT_GAP = 1.2
-_ACCOUNT_GAP = 2.0
+#: 执行节流（秒）
+_EVENT_GAP = 1.2          # 同一任务内两次触发之间
+_ACCOUNT_GAP = 2.0        # 两个账号之间
+_ACCEPT_SETTLE = 3.0      # accept 之后等参与状态落库，再触发
+_VERIFY_WAIT = 1.5        # 触发后等计数落库，再复查
+_MAX_TIMES = 10           # 单任务最多触发次数上限
 
 #: 触发事件时优先使用的免费模型（0 倍率），用完再退回低倍率
 _PREFERRED_MODELS = ["hy3", "hunyuan-chat"]
@@ -142,6 +145,17 @@ def growth_accept(payload: AcceptIn, db: Session = Depends(get_db)):
     return {"results": results}
 
 
+def _find_task(session, task_code: str) -> dict | None:
+    """重新读取单个任务的最新状态（accept 后刷新用）。"""
+    try:
+        for t in session.growth_tasks():
+            if t.get("task_code") == task_code:
+                return t
+    except Exception:
+        pass
+    return None
+
+
 def _updated(session, acc: Account) -> str:
     """AccountSession 关闭前读回最新凭据（token 可能被刷新）。"""
     try:
@@ -178,17 +192,13 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
                     and t.get("accept_status") != "claimed"
                 ]
 
-                # 2) 参与（未参与的不计进度）
-                need_accept = [c for c in wanted
-                               if (by_code.get(c) or {}).get("accept_status") == "not_accepted"]
-                if need_accept:
-                    try:
-                        s.growth_accept(need_accept)
-                    except Exception as e:
-                        acc_log["accept_error"] = str(e)
-                    time.sleep(_EVENT_GAP)
-
-                # 3) 逐个任务触发
+                # 2) 逐个任务串行处理。
+                #
+                # 关键：accept 与 trigger 必须成对、串行、且中间留出间隔。
+                # 早期版本把所有任务的 accept 批量做完再统一触发，实测会出现
+                # 「已 accept 但首次触发不计数」——上游的参与状态是异步落库的，
+                # 紧接着发事件会被判定为「未参与」而丢弃。所以这里每个任务都
+                # 走「accept → 确认 → 触发」的完整闭环。
                 for code in wanted:
                     info = by_code.get(code) or {}
                     plan = growth_plans.plan_for(code)
@@ -204,24 +214,36 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
                         acc_log["tasks"].append(item)
                         continue
 
+                    # 2a) 参与（未参与的任务不计进度）
+                    if info.get("accept_status") == "not_accepted":
+                        try:
+                            s.growth_accept([code])
+                            time.sleep(_ACCEPT_SETTLE)  # 等参与状态落库
+                            info = _find_task(s, code) or info
+                        except Exception as e:
+                            item["accept_error"] = str(e)
+
                     prog = info.get("progress") or {}
                     target = prog.get("target")
                     current = prog.get("current") or 0
                     # 需要触发的次数：按任务 target 与当前进度的差额
                     times = (target - current) if isinstance(target, int) and target > current else 1
-                    times = max(1, min(times, 10))  # 加上限，避免异常任务打爆
+                    times = max(1, min(times, _MAX_TIMES))  # 加上限，避免异常任务打爆
 
+                    # 2b) 触发。若任务要求使用特定模型（如「体验 GLM-5.2」），
+                    # 用指定模型真实调用；否则用免费模型发事件包。
+                    fire_model = plan.model or model
                     fired = 0
                     for _ in range(times):
-                        r = s.growth_fire_event(plan.event_codes, model=model)
+                        r = s.growth_fire_event(plan.event_codes, model=fire_model)
                         if r.get("ok"):
                             fired += 1
                         else:
                             item["last_error"] = r.get("msg")
                         time.sleep(_EVENT_GAP)
 
-                    # 复查进度
-                    time.sleep(1.0)
+                    # 2c) 复查进度
+                    time.sleep(_VERIFY_WAIT)
                     try:
                         now = {t.get("task_code"): t for t in s.growth_tasks()}
                         np_ = (now.get(code) or {}).get("progress") or {}
@@ -230,6 +252,8 @@ def growth_run(payload: RunIn, db: Session = Depends(get_db)):
                     except Exception:
                         pass
                     item.update({"ok": fired > 0, "fired": fired, "times": times})
+                    if plan.model:
+                        item["model"] = plan.model
                     acc_log["tasks"].append(item)
 
                 acc.auth_json = _updated(s, acc)

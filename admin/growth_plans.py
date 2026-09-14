@@ -45,6 +45,8 @@ class TaskPlan:
     reason: str = ""
     # 需要触发的次数；None 表示按任务 target 动态决定
     times: int | None = None
+    # 指定模型：非空时用该模型真实调用（用于「体验某模型」类任务）
+    model: str = ""
 
     @property
     def actionable(self) -> bool:
@@ -60,10 +62,6 @@ TASK_PLANS: dict[str, TaskPlan] = {
         "chat_5", MULTI, ["chat_request_send"],
         "对话类：发送带 growthEvent 的对话请求，按 target 次数重复",
     ),
-    "RichMeow_Chat": TaskPlan(
-        "RichMeow_Chat", AUTO, ["chat_request_send"],
-        "桌面端对话：与对话类同链路（实测桌面端对话即计数）",
-    ),
     "automation_1": TaskPlan(
         "automation_1", AUTO, ["automated_task_create_suc"],
         "自动化任务：创建成功事件（已实测命中）",
@@ -73,10 +71,18 @@ TASK_PLANS: dict[str, TaskPlan] = {
         "尝鲜技能：skill_info 事件（已实测命中）",
     ),
 
-    # ---------------- 已实测发事件包无效 ----------------
+    # ---------------- 已实测可自动（需指定模型）----------------
     "Model_chat_GLM5.2": TaskPlan(
-        "Model_chat_GLM5.2", MANUAL, [],
-        "模型体验：枚举 1131 个候选事件未命中，可能需真实调用该模型",
+        "Model_chat_GLM5.2", AUTO, ["chat_request_send"],
+        "模型体验：请求体 model 必须真的是 glm-5.2（发事件包无效，已实测）",
+        model="glm-5.2",
+    ),
+
+    # ---------------- 已实测发事件包无效 ----------------
+    "RichMeow_Chat": TaskPlan(
+        "RichMeow_Chat", MANUAL, [],
+        "桌面端对话：实测 chat_request_send 等 5 个事件均不计数，"
+        "上游按客户端类型判定，需真实桌面端对话",
     ),
     "expert_5": TaskPlan(
         "expert_5", MANUAL, [],

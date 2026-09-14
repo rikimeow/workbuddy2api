@@ -1019,7 +1019,8 @@ function renderGrowthTasks(d){
       </table>
     </div>
     <div class="flex justify-between items-center mt-3">
-      <p class="text-xs text-slate-400">「完成」只对已实测可自动化的任务开放；标为「复杂」的任务需在客户端手动完成。</p>
+      <p class="text-xs text-slate-400">「完成」只对已实测可自动化的任务开放；标为「复杂」的任务需在客户端手动完成。<br>
+        执行按「参与 → 等待落库 → 触发 → 复查」串行进行，请勿中途并行操作同一账号。</p>
       <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button>
     </div>`;
 }
@@ -1063,8 +1064,13 @@ async function growthDoRun(id, taskCode){
       if (a2.total_credit > 0) claimMsg = `，并自动领取 ${a2.total_credit} 积分`;
     } catch(e){}
 
+    const usedModels = [...new Set((a.tasks || []).map(t => t.model).filter(Boolean))];
+    const modelNote = usedModels.length
+      ? `模型：${esc(d.model || "-")}（免费）· 指定模型：${esc(usedModels.join(", "))}`
+      : `使用模型 ${esc(d.model || "-")}（免费 0 倍率，成本为 0）`;
+
     openModal(`<h3 class="font-bold mb-1"><i class="fa-solid fa-seedling mr-1 text-emerald-600"></i> 执行结果</h3>
-      <p class="text-xs text-slate-400 mb-3">使用模型 ${esc(d.model || "-")}（免费 0 倍率，成本为 0）</p>
+      <p class="text-xs text-slate-400 mb-3">${modelNote}</p>
       <div class="rounded-lg border bg-slate-50 px-3 py-1 max-h-72 overflow-auto">${lines}</div>
       <div class="flex justify-end gap-2 mt-4">
         <button onclick="growthTasks(${id},'')" class="px-3 py-1.5 rounded-lg border text-sm">查看任务</button>
