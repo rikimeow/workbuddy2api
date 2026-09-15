@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +17,31 @@ from converter import BACKEND, CredentialManager  # 复用既有后端鉴权 / �
 
 # 连接池：减少 TLS 握手，与 Go 项目 MaxIdleConnsPerHost=20 对齐。
 HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+
+#: 各域名与 UA（成长任务在不同域上报，头形状必须与对应客户端一致）
+WEB_BASE = "https://www.workbuddy.cn"      # web 域：资料库等浏览器行为
+BILL_BASE = "https://www.codebuddy.cn"     # billing 域：常规业务上报
+WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+DESKTOP_UA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+
+#: 资料库介绍页（Library_read 的 pageURL，必须是真实可访问的文档页）
+LIBRARY_DOC_URL = f"{WEB_BASE}/space/d/o0KWYeynteVv06UnAZqIFm"
+
+
+def stable_device_id(uid: str, salt: str) -> str:
+    """由 uid 稳定派生设备标识（machineId / sessionId 用）。
+
+    为什么必须稳定：同一账号在服务端眼里应当始终是**同一台设备**。
+    每次随机 = 频繁换设备 = 明显异常；所有账号共用一个常量则更糟
+    （多账号同一设备，是最容易被批量识别的特征）。
+
+    取 master 项目 deriveID 同款算法（md5(salt:uid) 截 36 位），
+    不参与任何业务逻辑，仅用于事件指纹。
+    """
+    import hashlib
+    return hashlib.md5(f"{salt}:{uid}".encode()).hexdigest()[:36]
+
 
 
 def parse_auth_meta(auth_json: str) -> dict:
@@ -440,7 +466,10 @@ class AccountSession:
             event_id: 事件 id（会写入 growthEvent）。
             conversation_id: 会话 id，用于服务端去重与归因。
         """
-        conv = conversation_id or event_id or "00000000-0000-4000-8000-000000000001"
+        # 会话 id 必须每个账号、每次调用都不同。
+        # 之前这里是一个硬编码的假 UUID，导致所有账号共用同一个会话 id ——
+        # 这种「多账号同会话」是很容易被批量识别的特征，也影响服务端归因。
+        conv = conversation_id or event_id or str(uuid.uuid4())
         events = [{"eventCode": c, "id": conv} for c in event_codes]
         body = {
             "model": model,
@@ -467,10 +496,138 @@ class AccountSession:
         return {"ok": status == 200, "status": status,
                 "msg": "" if status == 200 else f"HTTP {status}"}
 
+    # ------------------------------------------------------------------
+    # 事件上报（POST /v2/report）
+    # ------------------------------------------------------------------
+    # 有一部分成长任务不吃 chat/completions 的 growthEvent，而是要求客户端
+    # 上报**真实业务事件**。这类事件必须带上与对应客户端一致的指纹头，
+    # 否则要么不计数，要么被当成异常客户端。
+    #
+    # 三个域各有一套形状，不能混用：
+    #   billing (codebuddy.cn)     常规业务事件（灵感案例等）
+    #   chat    (copilot.tencent.com) 桌面端事件
+    #   web     (workbuddy.cn)     浏览器行为（资料库等）
+    # ------------------------------------------------------------------
+
+    def _sess_auth(self) -> dict:
+        return (self.cm._session() or {}).get("auth") or {}
+
+    def _sess_acct(self) -> dict:
+        return (self.cm._session() or {}).get("account") or {}
+
+    def _uid(self) -> str:
+        return str(self._sess_acct().get("uid") or "")
+
+    def _nick(self) -> str:
+        return str(self._sess_acct().get("nickname") or "")
+
+    def _domain(self) -> str:
+        return self._sess_auth().get("domain") or "copilot.tencent.com"
+
+    def _billing_headers(self) -> dict:
+        """billing 域头：CLI 形状。"""
+        return {
+            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+            "Origin": BILL_BASE,
+            "Referer": BILL_BASE + "/",
+            "X-User-Id": self._uid(),
+            "X-Domain": self._domain(),
+        }
+
+    def _web_headers(self, page_url: str) -> dict:
+        """web 域头：浏览器形状。
+
+        X-Domain 必须显式覆盖成 web 域：auth 里的 domain 可能是
+        copilot.tencent.com，发往 www.workbuddy.cn 会造成跨域不一致。
+        """
+        return {
+            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-client-platform": "web",
+            "Origin": WEB_BASE,
+            "Referer": page_url,
+            "User-Agent": WEB_UA,
+            "X-User-Id": self._uid(),
+            "X-Domain": WEB_BASE,
+        }
+
+    def report_billing_event(self, events: list[dict]) -> dict:
+        """向 billing 域上报业务事件。"""
+        uid = self._uid()
+        arr = []
+        for e in events:
+            m = dict(e)
+            m.setdefault("userId", uid)
+            arr.append(m)
+        return self._post_report(BILL_BASE + "/v2/report",
+                                 self._billing_headers(), arr)
+
+    def report_web_event(self, event_code: str, page_url: str,
+                         element_id: str, element_name: str) -> dict:
+        """向 web 域上报一次浏览器元素点击（资料库任务用）。"""
+        now = int(time.time() * 1000)
+        uid = self._uid()
+        ev = {
+            "eventCode": event_code, "timestamp": now, "reportDelay": 0,
+            "pageURL": page_url, "elementId": element_id,
+            "elementName": element_name,
+            "os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": WEB_UA,
+            "machineId": stable_device_id(uid, "webmachine"),
+            "userId": uid, "userNickname": self._nick(),
+        }
+        return self._post_report(WEB_BASE + "/v2/report",
+                                 self._web_headers(page_url), [ev])
+
+    def _post_report(self, url: str, headers: dict, events: list[dict]) -> dict:
+        """上报事件；返回 {ok, status, code, msg}，不抛异常。"""
+        try:
+            with httpx.Client(timeout=20, limits=HTTP_LIMITS) as c:
+                r = c.post(url, headers=headers, json=events)
+        except Exception as e:
+            return {"ok": False, "status": 0, "code": None,
+                    "msg": f"网络失败: {e}"}
+        try:
+            payload = r.json()
+        except Exception:
+            payload = {}
+        code = payload.get("code") if isinstance(payload, dict) else None
+        ok = r.status_code == 200 and code == 0
+        return {"ok": ok, "status": r.status_code, "code": code,
+                "msg": "" if ok else f"HTTP {r.status_code} code={code}"}
+
+    def fire_playbook_prompt(self) -> dict:
+        """灵感案例任务：上报一次「使用官方案例提示词」。
+
+        事件必须带齐 skills/expertId 等业务字段——上游按内容判断是不是
+        真实使用案例，只发一个空壳事件不计数。
+        """
+        now = int(time.time() * 1000)
+        uid = self._uid()
+        cid = str(uuid.uuid4())
+        ev = {
+            "eventCode": "playbook_prompt_send", "timestamp": now,
+            "reportDelay": 0, "id": f"pb-{now}", "name": "playbook",
+            "type": "other", "promptLength": 12, "isOfficial": 1,
+            "skills": "", "skillNames": "", "expertId": "", "expertName": "",
+            "categoryId": "", "categoryName": "", "query": "",
+            "source": "discover", "conversationId": cid,
+            "requestId": f"{cid}-{now}", "ext1": "discover", "userId": uid,
+        }
+        return self.report_billing_event([ev])
+
+    def fire_library_read(self) -> dict:
+        """资料库任务：上报一次资料库介绍页的点击。"""
+        return self.report_web_event(
+            "web_element_click", LIBRARY_DOC_URL,
+            "library_doc_intro_click", "WorkBuddy资料库介绍")
+
     def get_token_expiry(self) -> int:
         """返回 token 到期时间戳（毫秒），0 表示未知。"""
-        auth = self.cm._auth or {}
-        return auth.get("expiresAt") or 0
+        return self._sess_auth().get("expiresAt") or 0
 
     def updated_json(self) -> str:
         with open(self._path, "r", encoding="utf-8") as f:

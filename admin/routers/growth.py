@@ -359,7 +359,16 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                     fire_model = plan.model or model
                     fired = 0
                     for _ in range(times):
-                        r = s.growth_fire_event(plan.event_codes, model=fire_model)
+                        # 两种触发方式：
+                        #   firer 非空 -> 调用 AccountSession 上的对应方法
+                        #                （上报真实业务事件，如 fire_library_read）
+                        #   firer 为空 -> 走 chat/completions 的 growthEvent
+                        if plan.firer:
+                            fn = getattr(s, plan.firer, None)
+                            r = (fn() if fn else
+                                 {"ok": False, "msg": f"缺少触发方法 {plan.firer}"})
+                        else:
+                            r = s.growth_fire_event(plan.event_codes, model=fire_model)
                         if r.get("ok"):
                             fired += 1
                         else:

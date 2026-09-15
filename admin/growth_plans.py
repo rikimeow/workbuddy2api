@@ -2,22 +2,32 @@
 
 这里沉淀的是实测结论，不是猜测：
 
-  已实测可自动完成的（eventCode 经账号实测命中）：
+  已实测可自动完成的（走 chat/completions 的 growthEvent）：
     chat_5               <- chat_request_send
     automation_1         <- automated_task_create_suc
     skill_1              <- skill_info
-    RichMeow_Chat        <- chat_request_send（桌面端对话，实测同链路）
+    Model_chat_GLM5.2    <- 请求体 model 必须真的是 glm-5.2
+
+  已实测可自动完成的（走 POST /v2/report 上报真实业务事件）：
+    Library_read         <- web 域 web_element_click（+100 已实测到账）
+    playbook_prompt      <- billing 域 playbook_prompt_send（+100 已实测到账）
+    —— 这两个不吃 growthEvent，必须带完整业务字段与对应域的指纹头，
+       走 chat 事件包无论发多少次都不计数。
 
   已实测「发事件包无效」的（枚举 1131 个候选事件均未命中）：
-    Model_chat_GLM5.2 / expert_5 / Hp_Appearance
-    —— 归为 MANUAL，面板上标灰但仍允许「尝试」，便于日后发现新方法。
+    expert_5 / Hp_Appearance / template_5 / Buddy_App / Expert_lighthouse
+    Expert_team_use_3 / create_canvas / RichMeow_Chat
+    —— 归为 MANUAL。部分任务参考资料显示需上报真实业务事件，但事件体里
+       要填真实对象 id（专家 id / 模板 id / 画布 id），自造 id 属于伪造
+       业务对象，后端核对即露，故暂不纳入自动执行。
 
   奖励为 0 或依赖支付/登录/三方的：直接跳过。
+    Expert_Philanthropy 需真实捐款；black_cat 奖励为 0。
 
 分级说明：
-  AUTO   一次事件包即可完成（简单，优先执行）
-  MULTI  需要重复 N 次事件包（如 chat_5 需 5 次）
-  MANUAL 暂未找到自动化方式（需人工在客户端/网页操作）
+  AUTO   一次事件即可完成（简单，优先执行）
+  MULTI  需要重复 N 次（如 chat_5 需 5 次）
+  MANUAL 暂未找到安全的自动化方式（需人工在客户端/网页操作）
   SKIP   明确不处理（奖励为 0、需支付、需三方授权等）
 """
 from dataclasses import dataclass, field
@@ -47,11 +57,20 @@ class TaskPlan:
     times: int | None = None
     # 指定模型：非空时用该模型真实调用（用于「体验某模型」类任务）
     model: str = ""
+    # 触发方式：空 = 走 chat/completions 的 growthEvent；
+    # 非空 = 调用 AccountSession 上的同名方法（如 fire_library_read）。
+    # 有些任务不吃 growthEvent，要求客户端上报真实业务事件，必须分开走。
+    firer: str = ""
 
     @property
     def actionable(self) -> bool:
-        """是否可由本系统自动完成。"""
-        return self.level in (AUTO, MULTI) and bool(self.event_codes)
+        """是否可由本系统自动完成。
+
+        两种触发方式都算「可自动」：
+          * 有 event_codes（走 chat/completions 的 growthEvent）
+          * 有 firer（走 POST /v2/report 上报真实业务事件）
+        """
+        return self.level in (AUTO, MULTI) and bool(self.event_codes or self.firer)
 
 
 #: 任务策略表。键为 task_code。
@@ -105,13 +124,17 @@ TASK_PLANS: dict[str, TaskPlan] = {
         "template_5", MANUAL, ["agent_task_created_with_template"],
         "使用模板：尝试模板事件，未验证",
     ),
+    # 已实测可自动完成（走 POST /v2/report 上报真实业务事件，
+    # 不是 growthEvent —— 这两个任务不吃事件包）
     "playbook_prompt": TaskPlan(
-        "playbook_prompt", MANUAL, [],
-        "灵感案例：未找到有效事件",
+        "playbook_prompt", AUTO, [],
+        "灵感案例：billing 域上报 playbook_prompt_send（已实测点亮 +100）",
+        firer="fire_playbook_prompt",
     ),
     "Library_read": TaskPlan(
-        "Library_read", MANUAL, [],
-        "资料库：未找到有效事件",
+        "Library_read", AUTO, [],
+        "资料库：web 域上报资料库介绍页点击（已实测点亮 +100）",
+        firer="fire_library_read",
     ),
     "Expert_Philanthropy": TaskPlan(
         "Expert_Philanthropy", MANUAL, [],
@@ -168,7 +191,10 @@ def classify(task: dict) -> dict:
         **task,
         "level": level,
         "level_label": LEVEL_LABEL.get(level, "未知"),
-        "actionable": level in (AUTO, MULTI) and bool(plan.event_codes),
+        # 直接用 TaskPlan.actionable，不要再重复写一遍判断条件——
+        # 之前这里单独判了 event_codes，导致「用 firer 上报」的任务
+        # 明明能自动完成，面板上却显示不可自动
+        "actionable": level in (AUTO, MULTI) and bool(plan.event_codes or plan.firer),
         "strategy": plan.reason,
         # 待触发次数：优先用任务自带 target，否则用策略表，最后兜底 1
         "need_times": (target - current) if isinstance(target, int) and target > current
