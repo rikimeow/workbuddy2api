@@ -1301,16 +1301,86 @@ async def create_message(request: Request,
     _log(f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}")
     _log(f"[{rid}] ── ANTHROPIC → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}")
 
+    # Anthropic 协议中 stream 缺省为 **false**（非流式）。
+    # 此前本端点无条件返回 StreamingResponse，导致：
+    #   ① stream:false 的客户端拿到 SSE 却按 JSON 解析 → 直接报错；
+    #   ② stream 缺省的客户端（Anthropic SDK 非流式调用）同样拿到 SSE。
+    # 现按协议语义分流：显式 stream:true 才走流式。
+    # （日志确认此前无 /v1/messages 真实流量，改默认值无回归风险。）
+    client_wants_stream = bool(payload.get("stream"))
+
     headers = cred.get_headers()
     headers.update(_client_ip_headers(request))
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
 
-    return StreamingResponse(
-        _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    if client_wants_stream:
+        return StreamingResponse(
+            _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # 非流式：聚合后端 SSE → 组装单个 Anthropic Message 对象
+    try:
+        async with httpx.AsyncClient(timeout=300, limits=_HTTP_LIMITS) as c:
+            async with c.stream("POST", url, headers=headers, json=chat_body) as r:
+                if r.status_code != 200:
+                    raw = await r.aread()
+                    _log(f"[{rid}] ✗ ANTHROPIC HTTP {r.status_code} | {model_name} | "
+                         f"{_truncate(raw.decode('utf-8','replace'), 200)}")
+                    raise HTTPException(status_code=r.status_code,
+                                        detail=_safe_err_raw(raw, r.status_code))
+                agg = await _collect_stream(r)
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        _log(f"[{rid}] ✗ ANTHROPIC 网络错误 | {model_name} | {e}")
+        raise HTTPException(status_code=502, detail={
+            "error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+
+    result = _nonstream_anthropic(agg, model_name)
+    _log(f"[{rid}] ◀ ANTHROPIC(non-stream) {model_name} | {time.time()-t0:.1f}s | "
+         f"stop={result.get('stop_reason')} | tokens={(agg.get('usage') or {}).get('total_tokens', '?')}")
+    return JSONResponse(content=result)
+
+
+def _nonstream_anthropic(agg: dict, model_name: str) -> dict:
+    """把聚合后的 chat.completion 转成 Anthropic Message 对象。"""
+    choice = (agg.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content: list[dict] = []
+    if msg.get("reasoning_content"):
+        content.append({"type": "thinking",
+                        "thinking": msg["reasoning_content"],
+                        "signature": ""})
+    if msg.get("content"):
+        content.append({"type": "text", "text": msg["content"]})
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            args = {}
+        content.append({"type": "tool_use", "id": tc.get("id") or "",
+                        "name": fn.get("name") or "", "input": args})
+
+    stop_map = {"stop": "end_turn", "length": "max_tokens",
+                "tool_calls": "tool_use", "content_filter": "end_turn"}
+    usage = agg.get("usage") or {}
+    return {
+        "id": "msg_" + os.urandom(12).hex(),
+        "type": "message",
+        "role": "assistant",
+        "model": model_name,
+        "content": content or [{"type": "text", "text": ""}],
+        "stop_reason": stop_map.get(choice.get("finish_reason") or "stop", "end_turn"),
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
 
 
 async def _stream_anthropic(url: str, headers: dict, body: dict,

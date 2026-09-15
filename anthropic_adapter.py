@@ -35,7 +35,8 @@ def anthropic_request_to_chat(body: dict) -> dict:
       system → messages[0] role=system
       messages[].content (blocks) → content (string) / tool_calls / tool role
       tools[].input_schema → tools[].function.parameters
-      metadata / thinking → 丢弃
+      thinking → reasoning_effort（见下）
+      metadata → 丢弃
     """
     messages: list[dict] = []
 
@@ -78,6 +79,27 @@ def anthropic_request_to_chat(body: dict) -> dict:
     for key in ("temperature", "top_p", "stop", "top_k"):
         if key in body:
             chat[key] = body[key]
+
+    # thinking → reasoning_effort
+    # Anthropic 用 thinking:{type:"enabled", budget_tokens:N} 表达思考；
+    # 上游只认扁平的 reasoning_effort，且**不识别** budget_tokens（实测传
+    # thinking/budget_tokens 都被静默忽略，reasoning_content 为空）。
+    # 因此这里把「要不要思考」翻译成 reasoning_effort：
+    #   - thinking.type == "disabled" → 显式关闭
+    #   - thinking.type == "enabled"  → 有档位则用档位，否则给默认 high
+    # （实测 high 是 deepseek 系上游的默认档，且必然开启思维链）
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict):
+        ttype = str(thinking.get("type") or "").strip().lower()
+        if ttype == "disabled":
+            chat["thinking"] = {"type": "disabled"}
+        elif ttype == "enabled":
+            effort = thinking.get("effort")
+            if not (isinstance(effort, str) and effort.strip()):
+                effort = "high"
+            chat.setdefault("reasoning_effort", effort.strip())
+    elif isinstance(thinking, str) and thinking.strip().lower() == "enabled":
+        chat.setdefault("reasoning_effort", "high")
 
     return chat
 
@@ -224,6 +246,11 @@ class AnthropicStreamConverter:
         # 状态
         self._emitted_start = False
 
+        # thinking 内容块（思维链）
+        self._thinking_content = ""
+        self._thinking_block_open = False
+        self._thinking_block_idx = 0
+
         # text 内容块
         self._text_content = ""
         self._text_block_open = False
@@ -257,6 +284,13 @@ class AnthropicStreamConverter:
     def finish(self) -> str:
         """流结束，发出收尾事件。"""
         events: list[str] = []
+
+        # 关闭 thinking 块（若正文未开始就结束了，这里收口）
+        if self._thinking_block_open:
+            events.append(self._evt(
+                "content_block_stop", {"index": self._thinking_block_idx}
+            ))
+            self._thinking_block_open = False
 
         # 关闭 text 块
         if self._text_block_open:
@@ -381,9 +415,34 @@ class AnthropicStreamConverter:
             delta = choice.get("delta", {})
             finish = choice.get("finish_reason")
 
+            # thinking delta（思维链）
+            # 上游把思维链放在 delta.reasoning_content；Anthropic 协议用
+            # thinking 内容块承载。此前这里完全没处理，导致 Claude Code 等
+            # 客户端拿不到任何思考内容。
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                self._thinking_content += reasoning
+                if not self._thinking_block_open:
+                    self._thinking_block_idx = self._next_block_idx
+                    self._next_block_idx += 1
+                    events.append(self._evt("content_block_start", {
+                        "index": self._thinking_block_idx,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }))
+                    self._thinking_block_open = True
+                events.append(self._evt("content_block_delta", {
+                    "index": self._thinking_block_idx,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                }))
+
             # content delta
             content = delta.get("content")
             if content:
+                # 思维链结束后正文开始：先收口 thinking 块，保证块顺序 thinking → text
+                if self._thinking_block_open:
+                    events.append(self._evt("content_block_stop", {
+                        "index": self._thinking_block_idx}))
+                    self._thinking_block_open = False
                 self._text_content += content
                 if not self._text_block_open:
                     self._text_block_idx = self._next_block_idx
@@ -459,6 +518,11 @@ class AnthropicStreamConverter:
     def _build_content_blocks(self) -> list[dict]:
         """构造完整的 content blocks 数组（用于非流式响应）。"""
         blocks: list[dict] = []
+
+        # thinking block（先于 text，与流式块顺序一致）
+        if self._thinking_content or self._thinking_block_open:
+            blocks.append({"type": "thinking", "thinking": self._thinking_content,
+                           "signature": ""})
 
         # text block
         if self._text_content or self._text_block_open:
