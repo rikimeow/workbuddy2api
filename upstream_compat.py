@@ -368,6 +368,9 @@ EFFORT_RANK = {
     "medium": 3, "high": 4, "xhigh": 5, "max": 6,
 }
 
+# 「不要思考」的表达，见 5b 节说明（作为档位传入上游会被 11150 拒绝）。
+# 定义在 5b 节，供本节的归一逻辑与思考意图翻译共用。
+
 
 def _effort_index(v: str) -> int | None:
     return EFFORT_RANK.get(str(v or "").strip().lower())
@@ -378,6 +381,7 @@ def normalize_reasoning_effort(obj: dict, supported: list[str] | None) -> tuple[
 
     规则：
       - 请求档位在上游支持列表内 → 原样透传（不动）
+      - 请求档位是关闭意图（off/none/disabled）→ **原样透传**，绝不抬升
       - 不支持 → 改为 ≤请求档位的最高支持档
       - 支持档全部高于请求档 → 取最低支持档（偏离最小）
       - supported 为空（上游未声明）→ **一律透传**，不做任何猜测性降级
@@ -399,6 +403,9 @@ def normalize_reasoning_effort(obj: dict, supported: list[str] | None) -> tuple[
     if not isinstance(req, str):
         return None
     req = req.strip()
+    # 关闭意图直接放行：上游若不认会自行报错，但绝不在这里把「关」改成「开」。
+    if req.lower() in THINKING_OFF_SPELLINGS:
+        return None
     req_idx = _effort_index(req)
     if req_idx is None:
         # 完全未知的档位拼写：交给上游校验（会 400 code=11150），不猜测
@@ -420,6 +427,159 @@ def normalize_reasoning_effort(obj: dict, supported: list[str] | None) -> tuple[
         best = min(known, key=lambda x: x[1])[0]
     obj[key] = best
     return (req, best)
+
+
+# ---------------------------------------------------------------------------
+# 5b. 思考开关的协议兼容（只翻译，不注入）
+# ---------------------------------------------------------------------------
+
+# 「不要思考」的表达。这些**不是**档位阶梯上的一档：
+# 实测上游对 reasoning_effort="off"/"disabled" 直接 400 code=11150
+# （the reasoning effort value is not supported by the current model），
+# 而 "none"/"minimal" 反而会开启思维链。上游唯一认可的关闭方式是
+# thinking={"type":"disabled"}（或不带任何字段）。
+# 因此这里把关闭意图统一翻译成 thinking.disabled，而不是透传档位。
+THINKING_OFF_SPELLINGS = frozenset({"off", "none", "disabled", "false", "0"})
+
+
+def wants_thinking(obj: dict) -> bool | None:
+    """判断客户端是否**明确表态**了要不要思考。
+
+    返回：
+      - True  : 客户端明确要思考
+      - False : 客户端明确不要思考
+      - None  : 客户端**没表态**（没有出现任何思考相关字段）
+
+    本函数只做识别，不产生任何副作用。注意「没表态」必须与「表态开启」
+    严格区分：调用方据此决定是否翻译，而不是据此补默认值。
+
+    只认真正表达语义的形态，不把「有字段但值无意义」当成表态：
+      - reasoning_effort: "high"          → True
+      - reasoning_effort: "off"           → False
+      - thinking: {"type":"enabled"}      → True
+      - thinking: {"type":"disabled"}     → False
+      - reasoning: {"effort":"high"}      → True   （Responses 嵌套形态）
+      - reasoning: {"summary":"auto"}     → None   （只说摘要，没表态要不要思考）
+      - enable_thinking: true             → True
+    """
+    for key in ("reasoning_effort", "reasoningEffort"):
+        v = obj.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower() not in THINKING_OFF_SPELLINGS
+
+    for key in ("thinking", "enable_thinking", "enableThinking"):
+        v = obj.get(key)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s:
+                return s not in THINKING_OFF_SPELLINGS
+        if isinstance(v, dict):
+            t = str(v.get("type") or "").strip().lower()
+            if t:
+                return t not in THINKING_OFF_SPELLINGS
+            # 只有 budget_tokens 等参数、没有 type：视为要思考
+            if v.get("budget_tokens") or v.get("effort"):
+                return True
+
+    for key in ("reasoning", "include_reasoning", "reasoning_summary"):
+        v = obj.get(key)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s:
+                return s not in THINKING_OFF_SPELLINGS
+        if isinstance(v, dict):
+            effort = str(v.get("effort") or "").strip()
+            if effort:
+                return effort.lower() not in THINKING_OFF_SPELLINGS
+            # {"summary":"auto"} 之类的非思考开关，不表态
+    return None
+
+
+def _explicit_effort(obj: dict) -> str:
+    """取客户端显式给出的档位拼写（扁平或嵌套），取不到返回空串。"""
+    for key in ("reasoning_effort", "reasoningEffort"):
+        v = obj.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for key in ("thinking", "reasoning"):
+        v = obj.get(key)
+        if isinstance(v, dict):
+            e = str(v.get("effort") or "").strip()
+            if e:
+                return e
+    return ""
+
+
+def _pick_effort(explicit: str, efforts: list[str], preferred: str = "high") -> str | None:
+    """在支持档位里挑一个：显式档位优先，其次 preferred，再其次最高档。"""
+    if explicit and any(e.lower() == explicit.lower() for e in efforts):
+        return explicit.lower()
+    if any(e.lower() == preferred.lower() for e in efforts):
+        return preferred.lower()
+    ranked = sorted(((e, _effort_index(e)) for e in efforts),
+                    key=lambda x: (x[1] is None, x[1] or 0))
+    return ranked[-1][0].lower() if ranked else None
+
+
+def apply_thinking_intent(obj: dict, *, supported: list[str] | None = None) -> str | None:
+    """把客户端**已经表态**的思考意图翻译成上游认得的形态。
+
+    只翻译，不注入：客户端没表态时本函数不做任何事（保持不开启思考）。
+    这保证「没传思考字段」的请求行为与此前完全一致。
+
+    两种情形：
+      1. 明确关闭 → 删掉 reasoning_effort，写 thinking={"type":"disabled"}
+         （上游对 reasoning_effort="off" 会 400，"none" 反而开启思考）
+      2. 明确开启 → 保证有合法的扁平 reasoning_effort。客户端可能用
+         thinking:{type:enabled,effort}、enable_thinking=true、
+         reasoning:{effort} 等嵌套/异名写法，上游只认扁平字段；
+         有档位就用档位，没给档位才按支持列表挑一个（优先 high）。
+
+    返回实际写入的档位；"off" 表示确认为关闭；None 表示未改动
+    （没表态，或模型不支持思考时保持原样，绝不硬塞）。
+    """
+    state = wants_thinking(obj)
+
+    if state is None:
+        # 没表态 → 保持原样，不注入任何字段。
+        return None
+
+    if state is False:
+        # 关闭意图：清掉一切会开启思考的字段，改用上游认得的开关。
+        obj.pop("reasoning_effort", None)
+        obj.pop("reasoningEffort", None)
+        obj.pop("reasoning", None)
+        obj.pop("include_reasoning", None)
+        obj.pop("enable_thinking", None)
+        obj.pop("enableThinking", None)
+        obj["thinking"] = {"type": "disabled"}
+        return "off"
+
+    # state is True：明确开启。上游只认扁平 reasoning_effort，
+    # 若客户端用的是嵌套写法，这里把它落地；已经是合法扁平档位的则原样保留。
+    efforts = [str(e).strip() for e in (supported or []) if str(e).strip()]
+    explicit = _explicit_effort(obj)
+    if explicit and explicit.lower() in THINKING_OFF_SPELLINGS:
+        explicit = ""
+
+    if explicit and any(e.lower() == explicit.lower() for e in efforts):
+        obj["reasoning_effort"] = explicit.lower()
+        return obj["reasoning_effort"]
+
+    if not efforts:
+        # 上游没声明档位能力：无法确定该挑哪一档。若客户端已给出扁平档位，
+        # 保持原样交给上游校验；否则不动（不猜测）。
+        return None
+
+    pick = _pick_effort(explicit, efforts)
+    if not pick:
+        return None
+    obj["reasoning_effort"] = pick
+    return pick
 
 
 # ---------------------------------------------------------------------------
@@ -655,9 +815,13 @@ def prepare_upstream_body(obj: dict, *, sanitize: bool = False,
       2. role 归一（developer → system）
       3. tool_choice 归一
       4. 孤儿 tool_call 清理（安全网，必须早于发出）
-      5. reasoning_effort 归一（依据上游实时能力）
-      6. reasoning_content 回填（deepseek）
-      7. 可选指纹脱敏
+      5. 思考开关翻译（关→thinking.disabled；开→扁平档位；**未表态则不动**）
+      6. reasoning_effort 归一（依据上游实时能力）
+      7. reasoning_content 回填（deepseek）
+      8. 可选指纹脱敏
+
+    注意：本函数**不会**替客户端开启思考。没传思考字段的请求保持不开启，
+    与此前行为一致；第 5 步只翻译客户端已经表达的意图。
     """
     obj["stream"] = True
     if "stream_options" not in obj:
@@ -666,6 +830,7 @@ def prepare_upstream_body(obj: dict, *, sanitize: bool = False,
     normalize_roles(obj)
     normalize_tool_choice(obj)
     cleanup_orphan_tool_calls(obj)
+    apply_thinking_intent(obj, supported=supported_efforts)
     normalize_reasoning_effort(obj, supported_efforts)
     backfill_reasoning_content(obj)
     if sanitize:

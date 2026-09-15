@@ -440,12 +440,22 @@ _MODELS_CACHE = {"ts": 0.0, "data": None, "error": None}
 _BALANCE_CACHE = {"ts": 0.0, "data": None, "error": None}
 
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
+#
+# thinking / enable_thinking 必须列入：三方客户端（如 mirai-mifan）用
+# thinking={"type":"enabled"} + enable_thinking=true 表达「开启思考」，
+# 而它们的默认推理强度是空（「自动」），此时**只发这两个字段**。
+# 若在此被丢弃，请求到达上游时既无 reasoning_effort 也无 thinking，
+# 上游便按默认不思考 → 客户端「开了思考却没有思考内容」。
+# 这两个字段本身上游不直接识别（thinking.enabled 会被忽略），
+# 由 upstream_compat 的思考开关翻译层转成扁平 reasoning_effort；
+# thinking.disabled 则是上游唯一认可的关闭方式，必须原样放行。
 PASSTHROUGH_BODY_KEYS = {
     "model", "messages", "tools", "tool_choice", "temperature",
     "max_tokens", "max_completion_tokens", "top_p", "stream",
     "stream_options", "stop", "presence_penalty", "frequency_penalty",
     "n", "response_format", "seed", "user", "reasoning_effort",
     "verbosity", "reasoning_summary",
+    "thinking", "enable_thinking",
 }
 
 # ---------------------------------------------------------------------------
@@ -793,9 +803,10 @@ async def chat_completions(request: Request,
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
     body.setdefault("model", "auto")
 
-    # 协议兼容层：role/tool_choice 归一、孤儿 tool_call 清理、档位归一、
-    # reasoning_content 回填、（可选）指纹脱敏。详见 upstream_compat.py。
+    # 协议兼容层：role/tool_choice 归一、孤儿 tool_call 清理、思考开关翻译、
+    # 档位归一、reasoning_content 回填、（可选）指纹脱敏。详见 upstream_compat.py。
     # 档位归一只依据上游**实时**能力，取不到就原样透传（不猜测性降级）。
+    # 思考开关只翻译客户端已表达的意图，未传则不开启思考。
     supported = _supported_efforts_for(cred, body.get("model"))
     upstream_compat.prepare_upstream_body(
         body,
@@ -1155,7 +1166,7 @@ async def create_response(request: Request,
     chat_body.setdefault("model", "auto")
 
     # 协议兼容层（与 chat 端点共用同一套改写）：role/tool_choice 归一、
-    # 孤儿 tool_call 清理、档位归一、reasoning_content 回填、可选脱敏。
+    # 孤儿 tool_call 清理、思考开关翻译、档位归一、reasoning_content 回填、可选脱敏。
     supported = _supported_efforts_for(cred, chat_body.get("model"))
     upstream_compat.prepare_upstream_body(
         chat_body,

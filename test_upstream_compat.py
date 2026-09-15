@@ -531,6 +531,202 @@ def test_prepare_body_sanitize_optional():
 
 
 # ---------------------------------------------------------------------------
+# 思考开关的协议兼容（只翻译，不注入）
+# ---------------------------------------------------------------------------
+
+def test_wants_thinking_absent_returns_none():
+    """完全没提 = 没表态（None）。此时兼容层必须什么都不做。"""
+    assert uc.wants_thinking({"model": "x", "messages": []}) is None
+
+
+def test_wants_thinking_detects_explicit_on():
+    assert uc.wants_thinking({"reasoning_effort": "high"}) is True
+    assert uc.wants_thinking({"reasoning_effort": "low"}) is True, "低档仍是开启"
+    assert uc.wants_thinking({"thinking": {"type": "enabled"}}) is True
+    assert uc.wants_thinking({"thinking": "enabled"}) is True
+    assert uc.wants_thinking({"enable_thinking": True}) is True
+    assert uc.wants_thinking({"reasoning": {"effort": "high"}}) is True
+    assert uc.wants_thinking({"thinking": {"budget_tokens": 8000}}) is True
+
+
+def test_wants_thinking_detects_explicit_off():
+    assert uc.wants_thinking({"reasoning_effort": "off"}) is False
+    assert uc.wants_thinking({"reasoning_effort": "none"}) is False
+    assert uc.wants_thinking({"thinking": {"type": "disabled"}}) is False
+    assert uc.wants_thinking({"enable_thinking": False}) is False
+    assert uc.wants_thinking({"include_reasoning": False}) is False
+
+def test_wants_thinking_ignores_non_committal():
+    """{"summary":"auto"} 只说摘要，不代表要不要思考 → None，可补默认。"""
+    assert uc.wants_thinking({"reasoning": {"summary": "auto"}}) is None
+    assert uc.wants_thinking({"reasoning_effort": ""}) is None
+    assert uc.wants_thinking({"reasoning_effort": "   "}) is None
+
+
+def test_silent_client_gets_no_thinking():
+    """核心约束：客户端没传思考字段时**绝不**注入任何开启思考的字段。
+
+    上游把「无 reasoning_effort」视为不思考；兼容层只做翻译，
+    不得改变这一默认行为。
+    """
+    obj = {"model": "deepseek-v4.1-flash", "messages": []}
+    assert uc.apply_thinking_intent(obj, supported=["high"]) is None
+    assert "reasoning_effort" not in obj
+    assert "thinking" not in obj
+
+
+def test_silent_client_unchanged_through_pipeline():
+    """端到端：静默请求经 prepare 后仍是静默，一个思考字段都不多。"""
+    obj = {"model": "deepseek-v4.1-flash", "messages": [{"role": "user", "content": "hi"}]}
+    uc.prepare_upstream_body(obj, supported_efforts=["high"])
+    assert "reasoning_effort" not in obj, "未传思考就不该开启"
+    assert "thinking" not in obj
+
+
+def test_thinking_on_keeps_explicit_effort():
+    """明确给档位：原样保留，不因支持列表不同而擅自改写。"""
+    obj = {"model": "x", "messages": [], "reasoning_effort": "low"}
+    assert uc.apply_thinking_intent(obj, supported=["low", "high"]) == "low"
+    assert obj["reasoning_effort"] == "low"
+
+
+def test_thinking_on_flat_effort_untouched_when_unsupported():
+    """上游没声明能力时，客户端已给的扁平档位保持原样交给上游校验。"""
+    obj = {"model": "x", "messages": [], "reasoning_effort": "max"}
+    assert uc.apply_thinking_intent(obj, supported=None) is None
+    assert obj["reasoning_effort"] == "max"
+
+
+def test_thinking_off_translates_to_disabled():
+    """显式关闭必须被尊重，且翻译成上游认得的形态。
+
+    实测上游对 reasoning_effort="off" 直接 400 code=11150，
+    "none" 反而会开启思维链；唯一有效的关闭是 thinking.disabled。
+    """
+    obj = {"model": "x", "messages": [], "reasoning_effort": "off"}
+    assert uc.apply_thinking_intent(obj, supported=["low", "high"]) == "off"
+    assert "reasoning_effort" not in obj, "off 不能作为档位透传（会被 11150 拒）"
+    assert obj["thinking"] == {"type": "disabled"}
+
+
+def test_thinking_off_from_anthropic_shape():
+    """Anthropic 的 thinking.disabled 原样保留，不被升级成开启。"""
+    obj = {"model": "x", "messages": [], "thinking": {"type": "disabled"}}
+    assert uc.apply_thinking_intent(obj, supported=["high"]) == "off"
+    assert "reasoning_effort" not in obj
+    assert obj["thinking"] == {"type": "disabled"}
+
+
+def test_thinking_on_normalizes_nested_to_flat():
+    """thinking.enabled 是嵌套写法，上游不认，必须翻译成扁平档位。"""
+    obj = {"model": "x", "messages": [], "thinking": {"type": "enabled"}}
+    assert uc.apply_thinking_intent(obj, supported=["low", "high"]) == "high"
+    assert obj["reasoning_effort"] == "high", "嵌套写法必须落地为扁平档位"
+
+
+def test_thinking_on_respects_explicit_nested_effort():
+    obj = {"model": "x", "messages": [], "thinking": {"type": "enabled", "effort": "low"}}
+    uc.apply_thinking_intent(obj, supported=["low", "high"])
+    assert obj["reasoning_effort"] == "low", "用户明确要 low 就不该被抬到 high"
+
+
+def test_thinking_on_from_enable_thinking_flag():
+    """enable_thinking=True 也应落地为扁平档位。"""
+    obj = {"model": "x", "messages": [], "enable_thinking": True}
+    assert uc.apply_thinking_intent(obj, supported=["high"]) == "high"
+    assert obj["reasoning_effort"] == "high"
+
+
+def test_prepare_body_normalizes_anthropic_enabled():
+    """端到端：Anthropic 风格的 thinking.enabled 落成扁平档位。"""
+    obj = {"model": "deepseek-v4.1-flash", "messages": [],
+           "thinking": {"type": "enabled"}}
+    uc.prepare_upstream_body(obj, supported_efforts=["high"])
+    assert obj["reasoning_effort"] == "high"
+
+
+def test_prepare_body_keeps_explicit_off():
+    """端到端：客户端表态关闭时，最终 body 不得带任何开启思考的字段。"""
+    obj = {"model": "deepseek-v4.1-flash", "messages": [], "reasoning_effort": "off"}
+    uc.prepare_upstream_body(obj, supported_efforts=["high"])
+    assert "reasoning_effort" not in obj, "off 若透传会被上游 11150 拒绝"
+    assert obj["thinking"] == {"type": "disabled"}
+
+
+def test_prepare_body_off_with_unknown_capability_still_disables():
+    """能力未知时，关闭意图仍要翻译（否则 off 透传会被 11150 拒）。"""
+    obj = {"model": "unknown", "messages": [], "reasoning_effort": "off"}
+    uc.prepare_upstream_body(obj, supported_efforts=None)
+    assert "reasoning_effort" not in obj
+    assert obj["thinking"] == {"type": "disabled"}
+
+
+def test_prepare_body_no_capability_no_injection():
+    """能力未知且未表态时整条链保持原样（既不补也不降级）。"""
+    obj = {"model": "unknown", "messages": []}
+    uc.prepare_upstream_body(obj, supported_efforts=None)
+    assert "reasoning_effort" not in obj
+    assert "thinking" not in obj
+
+
+# ---------------------------------------------------------------------------
+# 白名单：三方客户端的思考开启字段必须能到达兼容层
+# ---------------------------------------------------------------------------
+
+def test_passthrough_keeps_thinking_aliases():
+    """回归：thinking / enable_thinking 必须在白名单内。
+
+    mirai-mifan 等三方客户端对 deepseek 系模型无条件发
+    thinking={"type":"enabled"} + enable_thinking=true，且其默认推理强度
+    为空（「自动」），此时**只发这两个字段**。若白名单漏掉它们，
+    请求到达兼容层时已无任何思考痕迹 → 上游按默认不思考
+    → 用户「开了思考却没有思考内容」。
+    """
+    import converter
+    assert "thinking" in converter.PASSTHROUGH_BODY_KEYS
+    assert "enable_thinking" in converter.PASSTHROUGH_BODY_KEYS
+
+
+def test_mirai_default_flow_enables_thinking():
+    """端到端（无网络）：复现 mirai 默认配置走网关后的请求体。
+
+    mirai 默认「推理强度=自动」时只发 thinking/enable_thinking，
+    经白名单过滤 + 兼容层翻译后，必须带上扁平 reasoning_effort。
+    """
+    import converter
+
+    payload = {
+        "model": "deepseek-v4.1-flash",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+        "thinking": {"type": "enabled"},
+        "enable_thinking": True,
+    }
+    body = {k: payload[k] for k in converter.PASSTHROUGH_BODY_KEYS if k in payload}
+    assert "thinking" in body and "enable_thinking" in body, "白名单不得丢弃思考开关"
+
+    uc.prepare_upstream_body(body, supported_efforts=["high"])
+    assert body.get("reasoning_effort") == "high", "mirai 默认配置应能开启思考"
+
+
+def test_mirai_thinking_off_flow():
+    """端到端（无网络）：mirai 关闭思考时不得被开启。"""
+    import converter
+
+    payload = {
+        "model": "deepseek-v4.1-flash",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+        "thinking": {"type": "disabled"},
+        "enable_thinking": False,
+    }
+    body = {k: payload[k] for k in converter.PASSTHROUGH_BODY_KEYS if k in payload}
+    uc.prepare_upstream_body(body, supported_efforts=["high"])
+    assert "reasoning_effort" not in body, "关闭思考时不得产生档位"
+    assert body["thinking"] == {"type": "disabled"}
+
+
+# ---------------------------------------------------------------------------
 # 运行器
 # ---------------------------------------------------------------------------
 
