@@ -71,6 +71,19 @@ def responses_request_to_chat(body: dict) -> dict:
         if key in body:
             chat[key] = body[key]
 
+    # reasoning → reasoning_effort
+    # Responses API 用嵌套对象 reasoning:{effort, summary} 表达思考强度，
+    # 而 Chat/上游只认扁平的 reasoning_effort。此前**完全没有映射**，
+    # 导致走 Responses 的客户端（Codex 等）档位被静默丢弃、上游不吐思维链。
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if isinstance(effort, str) and effort.strip():
+            chat.setdefault("reasoning_effort", effort.strip())
+    elif isinstance(reasoning, str) and reasoning.strip():
+        # 少数客户端直接给字符串
+        chat.setdefault("reasoning_effort", reasoning.strip())
+
     # max_output_tokens → max_tokens
     if "max_output_tokens" in body:
         chat["max_tokens"] = body["max_output_tokens"]
@@ -264,6 +277,13 @@ class ResponsesStreamConverter:
 
         # 累积内容
         self._content = ""
+        # 思维链：上游 delta.reasoning_content。Responses 协议用 reasoning item
+        # （response.reasoning_summary_text.delta）承载，此前完全没有处理，
+        # 导致走 Responses 的客户端（Codex 等）永远看不到思考内容。
+        self._reasoning = ""
+        self._reasoning_item_id = _rand_id("rs_")
+        self._emitted_reasoning_item = False
+        self._reasoning_output_idx: int | None = None
         self._tool_calls: dict[int, dict] = {}  # index → {id, name, args, fc_id, output_idx, emitted}
         self._finish_reason: str | None = None
         self._usage: dict | None = None
@@ -288,19 +308,33 @@ class ResponsesStreamConverter:
         """流结束后，发出收尾事件（done + completed）。"""
         events: list[str] = []
 
+        # 关闭 reasoning item（先于正文，与 output 顺序一致）
+        if self._emitted_reasoning_item:
+            events.append(self._evt("response.reasoning_summary_text.done", {
+                "item_id": self._reasoning_item_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "text": self._reasoning,
+            }))
+            events.append(self._evt("response.output_item.done", {
+                "output_index": 0,
+                "item": self._reasoning_item("completed"),
+            }))
+
         # 关闭 text content
         if self._emitted_content_part:
+            base = self._body_base_idx()
             events.append(self._evt("response.output_text.done", {
-                "output_index": 0, "content_index": 0, "text": self._content
+                "output_index": base, "content_index": 0, "text": self._content
             }))
             events.append(self._evt("response.content_part.done", {
-                "output_index": 0, "content_index": 0,
+                "output_index": base, "content_index": 0,
                 "part": {"type": "output_text", "text": self._content, "annotations": []}
             }))
 
         if self._emitted_msg_item:
             events.append(self._evt("response.output_item.done", {
-                "output_index": 0,
+                "output_index": self._body_base_idx(),
                 "item": self._msg_item("completed")
             }))
 
@@ -328,6 +362,22 @@ class ResponsesStreamConverter:
 
     # ---- 内部 ----
 
+    def _body_base_idx(self) -> int:
+        """正文（message item）的 output_index：reasoning item 占 0 时正文顺延到 1。"""
+        return 1 if self._emitted_reasoning_item else 0
+
+    def _reasoning_item(self, status: str) -> dict:
+        """Responses 协议的 reasoning item。summary 为空时给空数组。"""
+        summary = []
+        if self._reasoning:
+            summary = [{"type": "summary_text", "text": self._reasoning}]
+        return {
+            "type": "reasoning",
+            "id": self._reasoning_item_id,
+            "summary": summary,
+            "status": status,
+        }
+
     def _process_chunk(self, chunk: dict) -> str:
         events: list[str] = []
 
@@ -350,34 +400,57 @@ class ResponsesStreamConverter:
             delta = choice.get("delta", {})
             finish = choice.get("finish_reason")
 
+            # ---- reasoning delta（思维链）----
+            # 映射为 Responses 的 reasoning item；output_index 固定占 0，
+            # 正文 msg / function_call 依次后移（见 _body_base_idx）。
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                if not self._emitted_reasoning_item:
+                    self._reasoning_output_idx = 0
+                    events.append(self._evt("response.output_item.added", {
+                        "output_index": 0,
+                        "item": self._reasoning_item("in_progress"),
+                    }))
+                    self._emitted_reasoning_item = True
+                self._reasoning += reasoning
+                events.append(self._evt("response.reasoning_summary_text.delta", {
+                    "item_id": self._reasoning_item_id,
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": reasoning,
+                }))
+
             # ---- content delta ----
             content = delta.get("content")
             if content:
                 if not self._emitted_msg_item:
                     events.append(self._evt("response.output_item.added", {
-                        "output_index": 0,
+                        "output_index": self._body_base_idx(),
                         "item": self._msg_item("in_progress", empty=True)
                     }))
                     self._emitted_msg_item = True
 
                 if not self._emitted_content_part:
                     events.append(self._evt("response.content_part.added", {
-                        "output_index": 0, "content_index": 0,
+                        "output_index": self._body_base_idx(), "content_index": 0,
                         "part": {"type": "output_text", "text": "", "annotations": []}
                     }))
                     self._emitted_content_part = True
 
                 self._content += content
                 events.append(self._evt("response.output_text.delta", {
-                    "output_index": 0, "content_index": 0, "delta": content
+                    "output_index": self._body_base_idx(), "content_index": 0,
+                    "delta": content
                 }))
 
             # ---- tool_calls delta ----
             for tc in delta.get("tool_calls", []):
                 idx = tc.get("index", 0)
                 if idx not in self._tool_calls:
-                    # 计算 output_index：msg 占 0，function_call 从 1 开始（如果有 msg）
-                    base = 1 if (self._emitted_msg_item or self._content) else 0
+                    # 计算 output_index：reasoning / msg 已占用前置槽位，function_call 顺延
+                    base = self._body_base_idx()
+                    if self._emitted_msg_item or self._content:
+                        base += 1
                     oi = base + len(self._tool_calls)
                     self._tool_calls[idx] = {
                         "id": tc.get("id", ""),
@@ -445,6 +518,8 @@ class ResponsesStreamConverter:
 
     def _response_obj(self, status: str) -> dict:
         output = []
+        if self._emitted_reasoning_item or self._reasoning:
+            output.append(self._reasoning_item(status))
         if self._emitted_msg_item or self._content:
             output.append(self._msg_item(status))
         for idx in sorted(self._tool_calls):
@@ -455,11 +530,17 @@ class ResponsesStreamConverter:
         usage = None
         if self._usage:
             u = self._usage
+            # reasoning_tokens 从上游 usage 真实透出（此前硬编码 0，把思维链用量抹掉了）
+            details = u.get("completion_tokens_details") or {}
+            reasoning_tokens = details.get("reasoning_tokens")
+            if reasoning_tokens is None:
+                reasoning_tokens = u.get("completion_thinking_tokens", 0)
+            prompt_details = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
             usage = {
                 "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)),
-                "input_tokens_details": {"cached_tokens": 0},
+                "input_tokens_details": {"cached_tokens": prompt_details or u.get("cached_tokens", 0)},
                 "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)),
-                "output_tokens_details": {"reasoning_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": reasoning_tokens or 0},
                 "total_tokens": u.get("total_tokens", 0),
             }
 

@@ -36,6 +36,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
+import upstream_compat
+
 # 连接池：减少重复 TLS 握手； MaxIdleConnsPerHost=20 设计。
 _HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
 
@@ -360,6 +362,41 @@ class CredentialManager:
             raise RuntimeError("后端模型列表格式异常：缺少 data.models 且 agents 中无模型")
         return result
 
+    def fetch_models_raw(self) -> dict:
+        """取后端模型目录的**原始响应**（保留 models 全字段 + agents 名单）。
+
+        fetch_models() 只回 models 数组，丢掉了 agents 名单（cli agent 才是官方
+        CLI 实际可选的模型集合）与 reasoning/supportsImages 等能力字段。
+        能力层需要完整结构，故单独提供本方法。
+        """
+        eid = self._enterprise_path_key()
+        return self._request_backend("GET", f"/v2/enterprises/{eid}/models")
+
+    def generate_image(self, body: dict, timeout: float = 300.0) -> dict:
+        """调后端生图接口 /v2/images/generations（同步返回）。
+
+        生图耗时远高于普通 RPC（实测数秒~数十秒），故不复用 _request_backend 的 15s 超时。
+
+        后端返回形态（实测）：
+          {"code":0,"msg":"OK","requestId":"...",
+           "data":{"created":..., "data":[{"url":"...","revised_prompt":"..."}],
+                   "usage":{"output_image_counts":N,"credit":X}}}
+        """
+        headers = self.get_headers()
+        url = f"{BACKEND}/v2/images/generations"
+        try:
+            with httpx.Client(timeout=timeout, limits=_HTTP_LIMITS) as c:
+                r = c.post(url, headers=headers, json=body)
+        except Exception as e:
+            raise RuntimeError(f"生图请求网络失败：{e}")
+        try:
+            data = r.json()
+        except Exception:
+            raise RuntimeError(f"生图返回非 JSON HTTP {r.status_code}: {r.text[:200]}")
+        if r.status_code != 200 or data.get("code") != 0:
+            raise RuntimeError(f"生图失败 HTTP {r.status_code} / {data.get('msg', data)}")
+        return data
+
     def fetch_balance(self) -> dict:
         """获取当前账号积分汇总，仅返回总量与剩余（可用积分）。
 
@@ -387,11 +424,14 @@ class CredentialManager:
 # 模型列表
 # ---------------------------------------------------------------------------
 
+# 静态兜底模型列表（仅在**取不到上游实时目录**时使用）。
+# 内容对齐实测的上游 cli agent 名单（2026-09 实测），不再用手写的过时清单。
 DEFAULT_MODELS = [
-    "glm-5.2", "glm-5.1", "glm-5v-turbo",
-    "kimi-k2.7", "kimi-k2.6", "kimi-k2.5",
-    "deepseek-v4-pro", "deepseek-v4-flash",
-    "minimax-m3-pay", "hy3-preview-agent", "auto",
+    "auto", "hy4-preview", "hy3", "hy3-x",
+    "deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-flash",
+    "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo",
+    "kimi-k3-1", "kimi-k2.8-preview", "kimi-k2.7", "kimi-k2.6",
+    "minimax-m3",
 ]
 
 # 后端资源缓存（TTL，秒）
@@ -479,6 +519,46 @@ def _cached_models(cred) -> list[dict]:
     return models
 
 
+# 规范化后的模型目录缓存（含能力元数据）。与 _MODELS_CACHE 同 TTL，
+# 但存的是 upstream_compat.normalize_catalog 的结果，供 /v1/models 与
+# reasoning_effort 归一使用。
+_CATALOG_CACHE = {"ts": 0.0, "data": None}
+
+
+def _cached_catalog(cred) -> dict:
+    """带 TTL 缓存的规范化模型目录：{chat: [...], image: [...], all_ids: [...]}。
+
+    失败时抛异常，由调用方回退（绝不缓存半成品）。
+    """
+    global _CATALOG_CACHE
+    now = time.time()
+    if _CATALOG_CACHE["data"] is not None and now - _CATALOG_CACHE["ts"] < _RESOURCE_CACHE_TTL:
+        return _CATALOG_CACHE["data"]
+    raw = cred.fetch_models_raw()
+    catalog = upstream_compat.normalize_catalog(raw)
+    _CATALOG_CACHE = {"ts": now, "data": catalog}
+    return catalog
+
+
+def _supported_efforts_for(cred, model: str) -> list[str] | None:
+    """取该模型上游**实时声明**的 reasoning 档位；取不到返回 None（不做任何降级）。
+
+    注意：刻意不用静态兜底表。实测本账号 deepseek-v4.1-flash 上游声明
+    supportedEfforts=["high"]，但实际 low/medium/high/xhigh/max/minimal
+    全部 200 且有思维链——用静态表会把 max 硬降成 high，正是要修的 bug。
+    因此这里只信实时目录，未知即透传。
+    """
+    if not model:
+        return None
+    try:
+        for m in _cached_catalog(cred)["chat"]:
+            if m["id"] == model and m["supports_efforts"]:
+                return m["supports_efforts"]
+    except Exception as e:
+        _log(f"读取模型能力失败（{model}），reasoning_effort 将原样透传：{e}")
+    return None
+
+
 def _cached_balance(cred) -> dict:
     """带 TTL 缓存的真实积分额度；失败时抛异常由调用方回退。"""
     global _BALANCE_CACHE
@@ -518,29 +598,56 @@ def list_models(authorization: Optional[str] = Header(default=None),
     cred = CONFIG["cred"]
     if cred is not None:
         try:
-            models = _cached_models(cred)
-            data = [{
-                "id": m.get("id"),
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": "codebuddy",
-                "name": m.get("name") or m.get("id"),
-                "credits": m.get("credits"),
-                "credit_multiplier": cred._parse_credit_multiplier(m.get("credits")),
-                "description": m.get("descriptionZh") or m.get("descriptionEn"),
-                "supports_images": m.get("supportsImages"),
-                "supports_reasoning": m.get("supportsReasoning"),
-                "supports_tool_call": m.get("supportsToolCall"),
-                "max_input_tokens": m.get("maxInputTokens"),
-                "max_output_tokens": m.get("maxOutputTokens"),
-                "vendor": m.get("vendor"),
-            } for m in models if m.get("id")]
-            return {"object": "list", "data": data, "source": "backend"}
+            catalog = _cached_catalog(cred)
+            data = [_model_entry(m, kind="chat") for m in catalog["chat"]]
+            data += [_model_entry(m, kind="image") for m in catalog["image"]]
+            if data:
+                return {"object": "list", "data": data, "source": "backend"}
         except Exception as e:
             _log(f"获取真实模型列表失败，回退到 DEFAULT_MODELS: {e}")
     data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
             for m in DEFAULT_MODELS]
     return {"object": "list", "data": data, "source": "fallback"}
+
+
+def _model_entry(m: dict, kind: str = "chat") -> dict:
+    """把规范化模型条目转成 /v1/models 的输出条目（能力字段全量透出）。"""
+    entry = {
+        "id": m["id"],
+        "object": "model",
+        "created": 1700000000,
+        "owned_by": "codebuddy",
+        "name": m.get("name") or m.get("id"),
+        "kind": kind,
+        "credits": m.get("credits"),
+        "credit_multiplier": _parse_credit_multiplier_safe(m.get("credits")),
+        "description": m.get("description"),
+        "vendor": m.get("vendor"),
+        "tags": m.get("tags") or [],
+        "context_length": m.get("context_window"),
+        "max_output_tokens": m.get("max_output_tokens"),
+        "supports_images": m.get("supports_images"),
+        "supports_reasoning": m.get("supports_reasoning"),
+        "supports_tool_call": m.get("supports_tool_call"),
+        "only_reasoning": m.get("only_reasoning"),
+        "can_disable_thinking": m.get("can_disable_thinking"),
+    }
+    # 档位能力：上游**实时**声明才输出；没有就整个字段省略（不输出空数组）
+    efforts = m.get("supports_efforts") or []
+    if efforts:
+        entry["reasoning_supported_efforts"] = efforts
+        if m.get("default_effort"):
+            entry["reasoning_default_effort"] = m["default_effort"]
+    if m.get("icon_url"):
+        entry["icon_url"] = m["icon_url"]
+    return entry
+
+
+def _parse_credit_multiplier_safe(credits):
+    try:
+        return CredentialManager._parse_credit_multiplier(credits)
+    except Exception:
+        return None
 
 
 @app.get("/v1/balance")
@@ -552,6 +659,117 @@ def get_balance(authorization: Optional[str] = Header(default=None),
         return {"object": "balance", "source": "backend", **_cached_balance(cred)}
     except Exception as e:
         raise HTTPException(status_code=502, detail={"error": {"message": f"获取额度失败：{e}", "type": "upstream_error"}})
+
+
+# ---------------------------------------------------------------------------
+# 生图端点（OpenAI Images API 兼容）
+# ---------------------------------------------------------------------------
+
+# 默认生图模型：上游目录里 tags 含 text-to-image 的那一个。
+DEFAULT_IMAGE_MODEL = "hunyuan-image-v3.0"
+
+
+def _pick_image_model(cred, requested: str | None) -> str:
+    """选生图模型：客户端指定则用指定的，否则用目录里的第一个生图模型。"""
+    if requested:
+        return requested
+    try:
+        img = _cached_catalog(cred)["image"]
+        if img:
+            return img[0]["id"]
+    except Exception as e:
+        _log(f"读取生图模型列表失败，回退 {DEFAULT_IMAGE_MODEL}: {e}")
+    return DEFAULT_IMAGE_MODEL
+
+
+@app.post("/v1/images/generations")
+async def images_generations(request: Request,
+                             authorization: Optional[str] = Header(default=None),
+                             x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """OpenAI Images API 兼容端点：POST /v1/images/generations。
+
+    上游实测可用端点：POST /v2/images/generations（返回 data[].url）。
+    本端点把 OpenAI 的入参映射为上游入参，再把上游返回规整成 OpenAI 形态。
+    """
+    _check_auth(authorization, x_api_key)
+    cred = _cred()
+
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+
+    prompt = payload.get("prompt")
+    if not prompt:
+        raise HTTPException(status_code=400, detail={
+            "error": {"message": "prompt is required", "type": "invalid_request_error"}})
+
+    model = _pick_image_model(cred, payload.get("model"))
+    n = payload.get("n") or 1
+    rid = os.urandom(4).hex()
+    _log(f"[{rid}] ▶ IMAGES {model} | n={n} | prompt={_truncate(str(prompt), 60)!r}")
+
+    # OpenAI → 上游入参映射。上游只认 prompt/model/部分尺寸字段，
+    # 未识别字段会被忽略；这里只透传确定被支持的。
+    body: dict = {"prompt": prompt, "model": model}
+    for k in ("size", "width", "height", "negative_prompt", "seed"):
+        if payload.get(k) is not None:
+            body[k] = payload[k]
+    if n and int(n) > 1:
+        body["n"] = int(n)
+
+    t0 = time.time()
+    try:
+        result = cred.generate_image(body)
+    except Exception as e:
+        _log(f"[{rid}] ✗ IMAGES {model} | {e}")
+        raise HTTPException(status_code=502, detail={
+            "error": {"message": f"生图失败：{e}", "type": "upstream_error"}})
+
+    data = result.get("data") or {}
+    items = data.get("data") or []
+    usage = data.get("usage") or {}
+    created = data.get("created") or int(time.time())
+
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        entry = {"url": it.get("url")}
+        if it.get("revised_prompt"):
+            entry["revised_prompt"] = it["revised_prompt"]
+        # b64_json 请求：上游只给 url，这里不自行下载转码（避免大对象与额外耗时），
+        # 客户端需要 base64 时请自行取 url。URL 存在性由 response_format 提示。
+        out.append(entry)
+
+    _log(f"[{rid}] ◀ IMAGES {model} | {time.time()-t0:.1f}s | images={len(out)}"
+         f" | credit={usage.get('credit')}")
+    return {
+        "created": created,
+        "data": out,
+        "usage": usage,
+        "model": model,
+    }
+
+
+@app.get("/v1/images/models")
+def images_models(authorization: Optional[str] = Header(default=None),
+                  x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """列出可用的生图模型（上游 tags 含 text-to-image）。"""
+    _check_auth(authorization, x_api_key)
+    cred = CONFIG["cred"]
+    if cred is None:
+        return {"object": "list", "data": [{"id": DEFAULT_IMAGE_MODEL, "object": "model"}],
+                "source": "fallback"}
+    try:
+        catalog = _cached_catalog(cred)
+        data = [_model_entry(m, kind="image") for m in catalog["image"]]
+        if data:
+            return {"object": "list", "data": data, "source": "backend"}
+    except Exception as e:
+        _log(f"获取生图模型列表失败，回退默认: {e}")
+    return {"object": "list", "data": [{"id": DEFAULT_IMAGE_MODEL, "object": "model"}],
+            "source": "fallback"}
 
 
 @app.post("/v1/chat/completions")
@@ -574,19 +792,16 @@ async def chat_completions(request: Request,
     client_wants_stream = bool(payload.get("stream"))
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
     body.setdefault("model", "auto")
-    # 后端只支持流式：始终以 stream=True 调后端，非流式由转换器聚合
-    body["stream"] = True
-    if "stream_options" not in body:
-        body["stream_options"] = {"include_usage": True}
 
-    # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
-    # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
-    if CONFIG.get("desensitize"):
-        body = desensitize_body(body, roles=("system", "developer"),
-                                desensitize_harness_user=True,
-                                desensitize_tools=True,
-                                compact_harness=not CONFIG.get("no_compact"),
-                                strip_tool_metadata=True)
+    # 协议兼容层：role/tool_choice 归一、孤儿 tool_call 清理、档位归一、
+    # reasoning_content 回填、（可选）指纹脱敏。详见 upstream_compat.py。
+    # 档位归一只依据上游**实时**能力，取不到就原样透传（不猜测性降级）。
+    supported = _supported_efforts_for(cred, body.get("model"))
+    upstream_compat.prepare_upstream_body(
+        body,
+        sanitize=bool(CONFIG.get("desensitize")),
+        supported_efforts=supported,
+    )
 
     # 日志：请求摘要
     model_name = payload.get("model", "auto")
@@ -669,14 +884,22 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
 async def _collect_stream(response: httpx.Response) -> dict:
     """消费后端的 OpenAI SSE 流，聚合成单个非流式 chat.completion 对象。
 
-    合并所有 chunk 的 delta（content / tool_calls），并取 usage / finish_reason。
+    合并所有 chunk 的 delta（content / reasoning_content / tool_calls），
+    并取 usage / finish_reason。
+
+    注意：上游会把思维链放在 delta.reasoning_content 里（实测 deepseek 系带
+    reasoning_effort 时必吐）。早期版本只读 delta.content，导致非流式请求
+    的思考内容被整段丢弃——这里显式保留。
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     # tool_calls: index -> {id, name, arguments(分片拼接)}
     tool_calls: dict[int, dict] = {}
     model: str | None = None
     finish_reason: str | None = None
     usage: dict | None = None
+    # 兼容上游偶发返回 message（而非 delta）的形态
+    saw_content_delta = False
 
     async for line in response.aiter_lines():
         line = line.strip()
@@ -698,6 +921,16 @@ async def _collect_stream(response: httpx.Response) -> dict:
             delta = choice.get("delta") or {}
             if delta.get("content"):
                 content_parts.append(delta["content"])
+                saw_content_delta = True
+            # 思维链：与 content 同等对待，原样保留
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
+            # 兜底：上游非 delta 形态（只在从未收到 content delta 时）
+            msg = choice.get("message") or {}
+            if not saw_content_delta and msg.get("content"):
+                content_parts.append(msg["content"])
+            if not reasoning_parts and msg.get("reasoning_content"):
+                reasoning_parts.append(msg["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 slot = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
@@ -718,9 +951,18 @@ async def _collect_stream(response: httpx.Response) -> dict:
         ]
         finish_reason = finish_reason or "tool_calls"
 
+    # 输出阶段（length 截断）剔除参数不完整的工具调用，避免客户端解析到半个 JSON
     message = {"role": "assistant", "content": "".join(content_parts) or None}
     if tcs:
         message["tool_calls"] = tcs
+        if finish_reason == "length":
+            dropped = upstream_compat.drop_truncated_tool_calls(message)
+            if dropped:
+                tcs = message.get("tool_calls")
+                _log(f"剔除 {dropped} 个参数截断的 tool_call（finish_reason=length）")
+    reasoning = "".join(reasoning_parts)
+    if reasoning:
+        message["reasoning_content"] = reasoning
     return {
         "id": "chatcmpl-" + os.urandom(12).hex(),
         "object": "chat.completion",
@@ -911,11 +1153,15 @@ async def create_response(request: Request,
 
     chat_body, projection_stats = project_responses_chat_body(chat_body)
     chat_body.setdefault("model", "auto")
-    chat_body["stream"] = True
-    if "stream_options" not in chat_body:
-        chat_body["stream_options"] = {"include_usage": True}
 
-    chat_body = _chat_body_desensitize(chat_body)
+    # 协议兼容层（与 chat 端点共用同一套改写）：role/tool_choice 归一、
+    # 孤儿 tool_call 清理、档位归一、reasoning_content 回填、可选脱敏。
+    supported = _supported_efforts_for(cred, chat_body.get("model"))
+    upstream_compat.prepare_upstream_body(
+        chat_body,
+        sanitize=bool(CONFIG.get("desensitize")),
+        supported_efforts=supported,
+    )
 
     client_wants_stream = payload.get("stream", True)  # Codex CLI 默认 stream
     model_name = payload.get("model", "auto")
