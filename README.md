@@ -23,9 +23,11 @@
 | **猫猫旅行** | 同意协议 → 首次领养（+300）→ 派猫 → 到站领奖，批量执行 |
 | **定时调度** | 内置调度器，签到 / 刷余额 / 同步模型列表 / 拉取成长任务列表均可按间隔自动跑 |
 
-**成长任务是本项目的核心亮点**：逆向出任务进度实际由**模型请求体里的 `extra_vars.growthEvent`** 驱动，因此可以用**完全合法的免费模型请求**（0 成本、正常 200 响应）完成其中一部分任务，并顺带把奖励领到手。详见 [第六章](#六成长计划任务growth)。
+**成长任务是本项目的核心亮点**：逆向出任务进度由**两条通道**驱动——一条是模型请求体里的 `extra_vars.growthEvent`，另一条是**客户端真实业务事件上报**（`POST /v2/report`）。两条通道都用**完全合法的请求**（正常 200 响应、免费模型或零成本事件、真实业务对象 id），因此能完成其中绝大多数任务并顺带把奖励领到手。详见 [第六章](#六成长计划任务growth)。
 
-> 部分任务（召唤专家、切换主题、桌面端对话等）**机制上就不接受服务端触发**，本平台明确不做，原因与验证证据见 [6.6](#66-为什么部分任务不做必须客户端)。
+> 共有 **14 个可自动完成的任务**（单账号满额 1400 积分），覆盖对话、技能、自动化、模型体验、资料库、灵感案例、召唤专家、专家团、换肤、桌面端应用等类型。触发方式分两类：`growthEvent` 与**真实业务事件上报**，详见 [6.6](#66-两类触发通道关键区分)。新增的同类任务会被[模式规则](#68-新增任务会自动识别模式匹配)自动识别。
+>
+> 唯一不做的是 `create_canvas`（事件里要自造画布 id，属伪造业务对象）、`expert_5_paid`（付费）与 `Expert_Philanthropy`（需真实捐款）。
 
 ---
 
@@ -43,6 +45,10 @@
 - [四、环境安装与项目运行](#四环境安装与项目运行)
 - [五、每日签到定时任务（daily_checkin）](#五每日签到定时任务daily_checkin)
 - [六、成长计划任务（growth）](#六成长计划任务growth)
+  - [6.5 任务分级与实测结论](#65-任务分级与实测结论)
+  - [6.6 两类触发通道（关键区分）](#66-两类触发通道关键区分)
+  - [6.7 对象 id 一律现拉，绝不编造](#67-对象-id-一律现拉绝不编造)
+  - [6.8 新增任务会自动识别（模式匹配）](#68-新增任务会自动识别模式匹配)
 - [七、客户端接入](#七客户端接入)
 - [八、日志与排障](#八日志与排障)
 - [九、项目结构](#九项目结构)
@@ -212,7 +218,7 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 - **猫猫旅行**：同意协议 → 首次领养（+300）→ 派猫 → 到站领奖，支持批量
 - **定时调度**：内置调度器，签到 / 刷余额 / 同步模型列表 / 拉取成长任务列表均可按间隔自动跑，后台可增删改查与「立即运行」
 
-> 自动化请求全部走**正常业务接口**（正常 200 响应、免费模型、最小输出），不伪造畸形请求，详见 [6.4](#64-为什么不用直接发完成包--直接发事件)。
+> 自动化请求全部走**正常业务接口**（正常 200 响应、免费模型、最小输出），不伪造畸形请求，详见 [6.4](#64-为什么不用直接发完成包-直接发事件)。
 
 ### 3.2 稳定性设计（借鉴 `workbuddy2ap-2`）
 
@@ -504,40 +510,100 @@ not_accepted ──accept──► accepted ──触发──► in_progress �
 
 分级规则见 `admin/growth_plans.py`，分 **简单 / 简单(多次) / 复杂 / 跳过** 四级。下表是**逐条实测**的结果，不是推测：
 
+**14 个可自动完成的任务**，单账号满额 **1400 积分**：
+
 | 任务 | 分级 | 完成方式 | 实测 |
 |------|------|----------|------|
 | `chat_5` 对话 5 次 | 简单(多次) | `chat_request_send` × N | ✅ |
 | `automation_1` 设置自动化 | 简单 | `automated_task_create_suc` | ✅ |
 | `skill_1` 尝鲜技能 | 简单 | `skill_info` | ✅ |
 | `Model_chat_GLM5.2` 模型体验 | 简单 | **真实调用 `glm-5.2`** | ✅ |
-| `expert_5` 召唤 5 次专家 | 复杂 | — | ❌ 见 6.6 |
-| `Expert_team_use_3` 专家团 | 复杂 | — | ❌ 见 6.6 |
-| `Hp_Appearance` 和平精英主题 | 复杂 | — | ❌ 见 6.6 |
-| `RichMeow_Chat` 桌面端对话 | 复杂 | — | ❌ 见 6.6 |
-| `black_cat` 夜猫子折扣 | 跳过 | — | 奖励为 0 |
+| `Library_read` 体验资料库 | 简单 | web 域 `web_element_click` | ✅ |
+| `playbook_prompt` 探索灵感案例 | 简单 | billing 域 `playbook_prompt_send` | ✅ |
+| `expert_5` 召唤 5 次专家 | 简单(多次) | 真实专家 id + `expert_actual_use` | ✅ |
+| `template_5` 使用模板 | 简单(多次) | 真实场景 id + 模板事件 | ✅ |
+| `Expert_team_use_3` 专家团 | 简单(多次) | `expert_type=team` 过滤后上报 | ✅ |
+| `Expert_lighthouse` 轻量云专家 | 简单 | 关键词筛真实专家后上报 | ✅ |
+| `Hp_Appearance` 和平精英主题 | 简单 | 真实主题 resourceKey | ✅ |
+| `Buddy_App` 发现应用 | 简单 | 桌面指纹 buddyapp 五连事件 | ✅ |
+| `Buddy_App_QQ` 企鹅教师助手 | 简单 | 同一组五连事件 | ✅ |
+| `RichMeow_Chat` 桌面端对话 | 简单 | 桌面指纹 6 连对话事件链 | ✅ |
+
+**不做 / 跳过**：
+
+| 任务 | 分级 | 原因 |
+|------|------|------|
+| `create_canvas` 设计创意模式 | 复杂 | 事件里要自造 `wb-<ms>` 画布 id，属**伪造业务对象**，不做 |
+| `expert_5_paid` 付费召唤专家 | 复杂 | 付费任务，无收益 |
+| `Expert_Philanthropy` 公益专家 | 复杂 | 需真实捐款动作，无法代做 |
+| `black_cat` 夜猫子折扣 | 跳过 | 奖励为 0 |
 
 **「模型体验」类任务**（`Model_chat_GLM5.2`）的完成条件是 **请求体里的 `model` 必须真的是 `glm-5.2`**，发事件包一律无效。用 `max_tokens=1` 最小输出调用一次即可，倍率 0.79、单次成本极低。
 
-### 6.6 为什么部分任务不做（必须客户端）
+### 6.6 两类触发通道（关键区分）
 
-这些任务**不是"没找到方法"，而是机制上就不接受服务端触发**，已在策略表里写明具体原因：
+任务**不是**都靠 `growthEvent`。实测有两类完全不同的通道，混用必然失败：
 
-| 任务 | 真实机制 | 证据 |
-|------|----------|------|
-| `expert_5` / `Expert_team_use_3` | **召唤 = 客户端本地专家包的下载 + 激活** | 桌面端实现为 `new ExpertSummonService(..., {package: packageProvider, downloadUrl: downloadUrlService}).summon(params)`，市场通道是 IPC（`builtin-market:install` / `downloadUrl`），非服务端事件 |
-| `Hp_Appearance` | 需桌面端「菜单-外观」切换主题 | 纯客户端本地设置状态 |
-| `RichMeow_Chat` | 按**客户端类型**判定 | 发 `chat_request_send` 等 5 个事件均不计数 |
+**通道 A：`growthEvent`（走 chat/completions）**
 
-对专家类任务做过的验证（均无效果）：
+请求体里带 `extra_vars.growthEvent`，用免费模型 `hy3` 发一次最小请求即可。适用：`chat_5`、`automation_1`、`skill_1`。
 
-- **后端没有专家接口**：`/v2/experts`、`/v2/expert/list`、`/v2/market/expert/list`、`/v2/experts/summon` 等 12 个候选路径全部 404；`/v2/agents/summon` 返回 `12202 agent not exist`（该接口是 IDE agent，与「专家」不是同一体系）
-- **埋点不驱动进度**：`expert_summoned`、`expert_summon_click`、`expert_team_summon`、`select_expert` 等 9 个逐个实测，进度均无变化
-- **请求体带专家标识无效**：`agentId` / `agent_id` / `expertId` / `botId` / `templateId`（含 11/22/23）共 9 种字段组合实测，进度均无变化
-- 暴力枚举 **1131 个候选事件**均未命中
+**通道 B：真实业务事件（走 `POST /v2/report`）**
 
-> 结论：这些任务要的是「在桌面端真的点一下」，属于产品设计上拉日活的手段。该部分**不做自动化**，在面板上标为「复杂」，仍保留尝试入口，便于日后上游改版时复验。
+上游要的是**带完整业务字段的客户端事件**，且不同域的事件头形状不同，混用不计数：
 
-### 6.7 串行执行（重要）
+| 域 | 用途 | 关键请求头 |
+|----|------|-----------|
+| `billing`（codebuddy.cn） | 常规业务事件 | CLI UA + `Origin`/`Referer` + `X-Domain`=账号域 |
+| `chat`（copilot.tencent.com） | 市场/场景接口、桌面事件 | 桌面事件需注入**桌面指纹** |
+| `web`（workbuddy.cn） | 浏览器行为 | 浏览器 UA + `Origin`/`Referer` + `x-client-platform: web` |
+
+**桌面指纹**（`Buddy_App` / `RichMeow_Chat` 必需）：`ideName=WorkBuddy`、`extName=workbuddy-desktop`、`ideVersion=5.5.6`，其中 `machineId` / `sessionId` **由 uid 稳定派生**——同一账号每次都是同一台「设备」。频繁换设备反而是异常信号。缺这些头会被判为非桌面端来源，事件不计数。
+
+> 关于任务说明里的「需升级到电脑端 5.5.3 或以上版本」「需下载并使用桌面端」：那是**客户端侧**的提示文案，**服务端只认上报的事件本身**。实测直接上报事件链即可完成，无需真的安装桌面端——这和换肤任务同理（能上报就能完成）。
+
+### 6.7 对象 id 一律现拉，绝不编造
+
+有一类任务要求事件里带**真实存在的对象 id**。这些 id 全部从官方接口现时拉取：
+
+| 任务 | 来源接口 |
+|------|----------|
+| `expert_5` / `Expert_team_use_3` / `Expert_lighthouse` | `POST /v2/operation-platform/market/expert/list`（团队任务加 `expert_type=team` 过滤；不带该参数时 400 个专家里只有 1 个 team） |
+| `template_5` | `GET /console/as/support/scenes`（16 个真实场景） |
+| `Hp_Appearance` | `POST /v2/operation-platform/appearance/resources` |
+
+**拉不到就跳过该任务并如实报错，绝不退化成自造 id。** 伪造业务对象一旦被后端核对就会暴露。
+
+> `create_canvas` 是唯一确认**必须自造** id 的任务（`wb-<ms>`），因此不做。
+
+### 6.8 新增任务会自动识别（模式匹配）
+
+`TASK_PLANS` 只登记实测过的具体任务，但上游活动是滚动的：会新增同类任务，也会给同名任务换档位（如 `chat_5` → `chat_10`、`template_5` → `template_3`）。只靠精确匹配的话，新 code 会**静默落到「不做」**——明明能做却不做且不报错，这是最糟的失败方式。
+
+因此 `plan_for()` 是三层决策：
+
+```text
+1. 精确表 TASK_PLANS       实测过的具体任务（含特殊形状），优先级最高
+2. 模式规则 PATTERN_RULES  按上游命名规律匹配同类新任务与换档位
+3. 都不中 -> MANUAL        宁可不做，也不盲发未验证的事件
+```
+
+已覆盖的模式：`chat_N` / `template_N` / `expert_N` / `Expert_team_use_N` / `Model_chat_<模型>` / `*appearance*`（换肤）/ `*lighthouse*` / `skill_N` / `automation_N`。
+
+**验证**（用虚构的新 code 实测）：
+
+| 模拟的新任务 | 是否自动命中 |
+|--------------|--------------|
+| `Hp_Appearance_2` / `Xx_Appearance` / `appearance_theme` | ✅ 命中换肤 |
+| `Model_chat_GPT5` / `Model_chat_GLM4.6` | ✅ 命中模型体验 |
+| `expert_10` / `expert_20` / `Expert_team_use_5` | ✅ 命中专家类 |
+| `skill_5` / `skill_10` | ✅ 命中技能类 |
+| `template_3` / `chat_10` / `automation_3` | ✅ 命中对应档位 |
+| `SomethingWeird_99`（无规律） | ❌ 保持 MANUAL（符合预期） |
+
+模式匹配**只调用已实测验证过的触发方式**；匹配不出来的一律维持 MANUAL——没人验证过的任务类型，猜错等于往上游灌垃圾事件。
+
+### 6.9 串行执行（重要）
 
 早期实现是「先把所有待办任务批量 `accept`，再逐个触发」，实测会出现 **「已 accept 但首次触发不计数」**——上游的参与状态是**异步落库**的，紧接着发事件会被判定为「未参与」而丢弃。
 
@@ -550,7 +616,7 @@ accept → 等待落库(_ACCEPT_SETTLE=3s) → 重新读取状态
 
 账号之间另有 `_ACCOUNT_GAP=2s` 间隔。**请勿对同一账号并行执行**，否则会出现任务不成功。
 
-### 6.8 使用方式
+### 6.10 使用方式
 
 **后台界面**（推荐）：账号池页 → 点某行 🌱 图标打开任务弹窗，可看每个任务的难度 / 状态 / 进度 / 积分，支持单个完成、单个领奖、一键完成全部可自动化任务（完成后自动领奖）。工具栏「批量做任务」对全部 active 账号串行执行。
 
@@ -581,30 +647,33 @@ curl -X POST -H "X-Admin-Token: <jwt>" -H "Content-Type: application/json" \
 
 执行任务与你手动点「批量做任务」走的是**同一套代码**（`run_accounts` / `claim_accounts`），因此串行规则与节流完全一致。筛选规则：
 
-- 只做策略表里 `actionable` 的任务（需客户端完成的自动跳过）
+- 只做策略表里 `actionable` 的任务（需人工完成的自动跳过）
 - `claimed` 的跳过 —— **幂等**，重复跑不会重复领、不会白发请求
 - 单次失败只记录、不重试，避免对注定失败的任务反复请求
 
-因此运营上了新任务，**当天就会自动完成并领到积分**，无需人工干预。执行结果写入调度记录的 `last_result`：
+因此运营上了新任务，**当天就会自动完成并领到积分**，无需人工干预。同类新任务（含换档位）由[模式规则](#68-新增任务会自动识别模式匹配)自动命中。执行结果写入调度记录的 `last_result`：
 
 ```json
-{"task":"run_growth_tasks","ok":true,"accounts":9,"tasks_done":4,
- "credit":400,"energy":20,"failed_accounts":[],"elapsed_s":61.5}
+{"task":"run_growth_tasks","ok":true,"accounts":15,"tasks_done":14,
+ "credit":3000,"energy":185,"failed_accounts":[],"elapsed_s":432.2}
 ```
 
-### 6.9 实测结果
+### 6.11 实测结果
+
+**分三批实测，可自动任务从 4 个逐步扩到 14 个**（15 个活动账号全量）：
 
 ```text
-账号 A   not_accepted×4 → 4/4 completed → +400 积分 / +20 能量
-账号 B   +400 积分
-账号 C   +300 积分
-账号 D   +300 积分
-账号 E   +300 积分（含 GLM 模型体验）
-账号 F   +100 积分
-账号 G   +100 积分
+第一批  Library_read + playbook_prompt      +2100 积分
+第二批  expert_5 / template_5 / Expert_lighthouse
+        Expert_team_use_3 / Hp_Appearance    +2600 积分
+第三批  Buddy_App / Buddy_App_QQ / RichMeow_Chat
+                                             +3000 积分
+总计                                         +7700 积分
 ```
 
-单轮 9 个账号合计 **+900 积分**，所有账号「待做」清零。
+每批跑完后，对应任务的**所有账号状态均为 `claimed`**（15/15）。所有上报均为 HTTP 200 / `code=0`，无一个 400。
+
+单账号满额 **1400 积分**（14 个任务 × 100，其中 `Buddy_App_QQ` 为 50）。
 
 > 注：账号标识已完全脱敏，不暴露任何手机号、UID 或昵称。
 

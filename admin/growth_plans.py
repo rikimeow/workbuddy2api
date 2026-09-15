@@ -31,6 +31,7 @@
   SKIP   明确不处理（奖励为 0、需支付、需三方授权等）
 """
 from dataclasses import dataclass, field
+import re
 
 # 难度等级
 AUTO = "auto"        # 可直接自动完成
@@ -66,11 +67,15 @@ class TaskPlan:
     def actionable(self) -> bool:
         """是否可由本系统自动完成。
 
-        两种触发方式都算「可自动」：
+        三种触发方式都算「可自动」：
           * 有 event_codes（走 chat/completions 的 growthEvent）
           * 有 firer（走 POST /v2/report 上报真实业务事件）
+          * 有 model（用该模型真实调一次对话，用于「体验某模型」类任务）
+        少判一种就会出现「明明能自动做，面板却显示不可自动」——
+        Model_chat_GLM5.2 就是这种情况（它只靠 model 字段触发）。
         """
-        return self.level in (AUTO, MULTI) and bool(self.event_codes or self.firer)
+        return self.level in (AUTO, MULTI) and bool(
+            self.event_codes or self.firer or self.model)
 
 
 #: 任务策略表。键为 task_code。
@@ -180,11 +185,114 @@ TASK_PLANS: dict[str, TaskPlan] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 模式规则：上游会不断新增任务，且同一个任务会换档位
+# ---------------------------------------------------------------------------
+# TASK_PLANS 是「精确 code -> 策略」，只有实测过的具体任务才登记。
+# 但上游的活动是会滚动的：
+#   * 新增同类任务      如又来一个模板任务 template_3
+#   * 同名任务换档位    如 chat_5 变 chat_10、template_5 变 template_3
+# 只靠精确匹配的话，这些新 code 会全部落到 MANUAL —— 明明能做却不做，
+# 而且**不会有任何报错**，只能靠人肉发现，这是最糟的失败方式。
+#
+# 所以再加一层模式匹配：命中规则就用现成的 firer 去做。
+# 规则只覆盖「实测验证过的触发方式」，措辞按上游真实命名规律归纳：
+#   chat_5 / chat_10 / chat_20           对话次数档位
+#   template_5 / template_3              模板次数档位
+#   expert_5 / expert_10                 召唤专家次数档位
+#   Expert_team_use_3                    专家团次数档位
+#   Model_chat_<模型名>                   模型体验
+#   Hp_Appearance / *Appearance*         换肤类
+#   *lighthouse*                         轻量云专家
+#
+# 注意：模式匹配到**已实测的触发方式**才用；匹配不出来的一律维持 MANUAL，
+# 宁可不动也不盲发 —— 没人验证过的任务类型，猜错等于往上游灌垃圾事件。
+
+#: (正则, 策略工厂)。工厂统一收 (code, match)，顺序敏感：先匹配到的先用。
+PATTERN_RULES: list[tuple[str, callable]] = [
+    # 对话次数档位：chat_5 / chat_10 ...
+    (r"^chat_\d+$",
+     lambda c, m: TaskPlan(c, MULTI, ["chat_request_send"],
+                           "对话类（模式匹配）：发带 growthEvent 的对话请求，按 target 重复")),
+    # 模型体验：Model_chat_GLM5.2 / Model_chat_GPT5 ...
+    (r"^Model_chat_(.+)$",
+     lambda c, m: TaskPlan(c, AUTO, [],
+                           "模型体验（模式匹配）：请求体 model 必须是真的对应模型",
+                           times=1,
+                           model=MODEL_ALIASES.get(m.group(1), m.group(1).lower()))),
+    # 模板次数档位：template_5 / template_3 ...
+    (r"^template_\d+$",
+     lambda c, m: TaskPlan(c, MULTI, [],
+                           "使用模板（模式匹配）：用真实场景 id 上报（+100）",
+                           firer="fire_template_use")),
+    # 召唤专家次数档位：expert_5 / expert_10 ...
+    (r"^expert_\d+$",
+     lambda c, m: TaskPlan(c, MULTI, [],
+                           "召唤专家（模式匹配）：用市场真实专家 id 上报（+100）",
+                           firer="fire_expert_use")),
+    # 专家团：Expert_team_use_N
+    (r"^Expert_team_use_\d+$",
+     lambda c, m: TaskPlan(c, MULTI, [],
+                           "召唤专家团（模式匹配）：expert_type=team 过滤后上报（+100）",
+                           firer="fire_expert_team")),
+    # 轻量云专家：Expert_lighthouse ...
+    (r"^Expert_lighthouse",
+     lambda c, m: TaskPlan(c, AUTO, [],
+                           "轻量云专家（模式匹配）：关键词筛真实专家后上报（+100）",
+                           firer="fire_lighthouse_expert")),
+    # 换肤：Hp_Appearance / Hp_Appearance_2 / appearance_theme / Xx_Appearance
+    # 用 search 而不是 match —— code 可能以别的词开头（Hp_...），
+    # 用 match 会漏掉，而漏掉的后果是「能做却不做」且不报错。
+    (r"(?i)appearance",
+     lambda c, m: TaskPlan(c, AUTO, [],
+                           "主题换肤（模式匹配）：用真实主题 resourceKey 上报（+100）",
+                           firer="fire_appearance_skin")),
+    # 技能：skill_1 / skill_5 ...（实测 skill_info 事件可用）
+    (r"^skill_\d+$",
+     lambda c, m: TaskPlan(c, AUTO, ["skill_info"],
+                           "尝鲜技能（模式匹配）：skill_info 事件（+100）")),
+    # 自动化任务：automation_1 / automation_3 ...
+    (r"^automation_\d+$",
+     lambda c, m: TaskPlan(c, AUTO, ["automated_task_create_suc"],
+                           "自动化任务（模式匹配）：创建成功事件（+100）")),
+]
+
+#: 模型 code -> 真实请求用的 model id。上游任务名用的是营销名，
+#: 请求体里必须是真的模型标识。
+MODEL_ALIASES = {
+    "GLM5.2": "glm-5.2",
+    "GLM4.6": "glm-4.6",
+    "GPT5": "gpt-5",
+    "DeepSeekV4": "deepseek-v4-flash",
+}
+
+#: 模式匹配务必避开的 code —— 这些看着像某类，但实测不可做或另有语义。
+PATTERN_DENY = {
+    "expert_5_paid",       # 付费版，无收益
+}
+
+
 def plan_for(task_code: str) -> TaskPlan:
-    """取任务策略；未登记的任务按 MANUAL 处理。"""
-    return TASK_PLANS.get(task_code) or TaskPlan(
-        task_code, MANUAL, [], "未登记的任务类型，需人工确认"
-    )
+    """取任务策略。
+
+    顺序很重要：
+      1. 先查精确表 TASK_PLANS（实测过的具体任务，含特殊形状）
+      2. 再试模式规则 PATTERN_RULES（覆盖同类的未来新任务与换档位）
+      3. 都没有 -> MANUAL（宁可不做，也不盲发未验证的事件）
+    """
+    hit = TASK_PLANS.get(task_code)
+    if hit:
+        return hit
+    if task_code in PATTERN_DENY:
+        return TaskPlan(task_code, MANUAL, [], "已明确不做（付费/无收益）")
+    for pattern, factory in PATTERN_RULES:
+        # 用 search：code 可能带前缀（Hp_Appearance_2 / YY_appearance_new），
+        # 用 match 只从开头比，会漏掉这些变体。漏掉的代价是「能做却不做」
+        # 且完全静默，比多匹配更糟。规则本身已写 ^ 锚定它们要锚定的部分。
+        m = re.search(pattern, task_code)
+        if m:
+            return factory(task_code, m)
+    return TaskPlan(task_code, MANUAL, [], "未登记的任务类型，需人工确认")
 
 
 def classify(task: dict) -> dict:
@@ -206,10 +314,10 @@ def classify(task: dict) -> dict:
         **task,
         "level": level,
         "level_label": LEVEL_LABEL.get(level, "未知"),
-        # 直接用 TaskPlan.actionable，不要再重复写一遍判断条件——
-        # 之前这里单独判了 event_codes，导致「用 firer 上报」的任务
-        # 明明能自动完成，面板上却显示不可自动
-        "actionable": level in (AUTO, MULTI) and bool(plan.event_codes or plan.firer),
+        # 直接复用 TaskPlan.actionable，不要再重复写一遍判断条件——
+        # 之前这里单独判了 event_codes，导致「用 firer 上报」和「靠 model
+        # 触发」的任务明明能自动完成，面板上却显示不可自动
+        "actionable": plan.actionable and level in (AUTO, MULTI),
         "strategy": plan.reason,
         # 待触发次数：优先用任务自带 target，否则用策略表，最后兜底 1
         "need_times": (target - current) if isinstance(target, int) and target > current
