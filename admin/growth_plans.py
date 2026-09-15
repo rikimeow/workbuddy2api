@@ -140,6 +140,24 @@ TASK_PLANS: dict[str, TaskPlan] = {
         "和平精英主题：用真实主题 resourceKey 上报换肤（已实测点亮 +100）",
         firer="fire_appearance_skin",
     ),
+    # 桌面端事件链。任务说明写的「需升级到 5.5.3+」是**客户端侧**门槛，
+    # 服务端只认事件本身 —— 实测直接上报事件链即可完成，无需真装桌面端。
+    # 事件必须带桌面指纹（见 AccountSession._desktop_fingerprint）。
+    "Buddy_App": TaskPlan(
+        "Buddy_App", AUTO, [],
+        "发现应用：桌面指纹上报 buddyapp 五连事件（已实测点亮 +100）",
+        firer="fire_buddy_app",
+    ),
+    "Buddy_App_QQ": TaskPlan(
+        "Buddy_App_QQ", AUTO, [],
+        "企鹅教师助手：同一组 buddyapp 五连事件（已实测点亮 +50）",
+        firer="fire_buddy_app",
+    ),
+    "RichMeow_Chat": TaskPlan(
+        "RichMeow_Chat", AUTO, [],
+        "桌面端对话：桌面指纹上报 6 连对话事件链（已实测点亮 +100）",
+        firer="fire_desktop_chat",
+    ),
     "Expert_team_use_3": TaskPlan(
         "Expert_team_use_3", MULTI, [],
         "召唤专家团：expert_type=team 过滤取真实团队后上报（已实测点亮 +100）",
@@ -151,15 +169,7 @@ TASK_PLANS: dict[str, TaskPlan] = {
     ),
     "create_canvas": TaskPlan(
         "create_canvas", MANUAL, [],
-        "设计创意模式：需真实创建画布",
-    ),
-    "Buddy_App": TaskPlan(
-        "Buddy_App", MANUAL, [],
-        "发现应用：未找到有效事件",
-    ),
-    "Buddy_App_QQ": TaskPlan(
-        "Buddy_App_QQ", MANUAL, [],
-        "企鹅教师助手：未找到有效事件",
+        "设计创意模式：事件里要自造 wb-<ms> 画布 id，属伪造业务对象，不做",
     ),
 
     # ---------------- 明确跳过 ----------------

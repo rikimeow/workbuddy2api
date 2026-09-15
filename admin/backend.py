@@ -28,6 +28,12 @@ DESKTOP_UA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
 #: 资料库介绍页（Library_read 的 pageURL，必须是真实可访问的文档页）
 LIBRARY_DOC_URL = f"{WEB_BASE}/space/d/o0KWYeynteVv06UnAZqIFm"
 
+#: 企鹅教师助手 Buddy 应用 id。
+#: 客户端「发现应用」入口里的应用标识，无公开列表接口（探测过 open-platform /
+#: buddy 等路径均 404），只能从客户端内置清单取。一组 buddyapp 事件同时满足
+#: 「发现应用」和「企鹅教师助手」两个任务。
+BUDDY_QQ_APP = ("cb_y5Dy46tPQGGWtueMxXbe", "企鹅教师助手")
+
 
 def stable_device_id(uid: str, salt: str) -> str:
     """由 uid 稳定派生设备标识（machineId / sessionId 用）。
@@ -830,6 +836,159 @@ class AccountSession:
             "type": "unknown", "name": t["name"], "userId": self._uid(),
         }
         return self.report_billing_event([ev])
+
+    # ------------------------------------------------------------------
+    # 桌面端事件链（走 chat 域 /v2/report + 桌面指纹）
+    # ------------------------------------------------------------------
+    # 这几个任务（发现应用 / 企鹅教师助手 / 桌面端对话）上游按「桌面客户端
+    # 行为」判定。任务说明里写的「需升级到 5.5.3+」是**客户端侧**的门槛，
+    # 服务端只认事件本身，实测直接上报事件链即可完成，无需真的装桌面端。
+    # 事件必须带桌面指纹，否则不会被识别为桌面端来源。
+    # ------------------------------------------------------------------
+
+    def _desktop_headers(self) -> dict:
+        """chat 域桌面指纹请求头。"""
+        return {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json;charset=UTF-8",
+            "User-Agent": DESKTOP_UA,
+            "X-Domain": self._domain(),
+            "X-Product": "SaaS",
+            "X-Request-ID": stable_device_id(self._uid(), "req")
+                            + str(time.time_ns() % 1000000),
+            "X-User-Id": self._uid(),
+            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+        }
+
+    def _desktop_fingerprint(self) -> dict:
+        """桌面客户端公共指纹（注入每个事件，覆盖同名业务键）。
+
+        machineId / sessionId 由 uid 稳定派生：同一账号每次上报都是同一台
+        「设备」，不要每次随机 —— 频繁换设备反而是异常信号。
+        """
+        uid = self._uid()
+        now = int(time.time() * 1000)
+        return {
+            "timezone": "Asia/Shanghai", "reportDelay": 2000,
+            "userId": uid, "username": self._nick(), "userNickname": self._nick(),
+            "product": "SaaS", "releaseDate": 1789036585355,
+            "commit": "5f9692923c93033111c51ad7b003eb80204a9b75",
+            "ideName": "WorkBuddy", "ideType": "WorkBuddy", "ideVersion": "5.5.6",
+            "machineId": stable_device_id(uid, "machine"),
+            "sessionId": stable_device_id(uid, "session"),
+            "extName": "workbuddy-desktop", "extVersion": "5.5.6",
+            "os": "win32", "arch": "x64", "osVersion": "10.0.26220",
+            "cpuCores": 20, "memorySize": 24,
+            "timestamp": now, "presentAt": now,
+        }
+
+    def report_desktop_events(self, events: list[dict]) -> dict:
+        """向 chat 域批量上报桌面事件（每个事件注入桌面指纹）。"""
+        fp = self._desktop_fingerprint()
+        arr = []
+        for e in events:
+            m = dict(e)
+            m.update(fp)
+            arr.append(m)
+        url = BACKEND.rstrip("/") + "/v2/report"
+        try:
+            with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+                r = c.post(url, headers=self._desktop_headers(), json=arr)
+        except Exception as e:
+            return {"ok": False, "status": 0, "code": None, "msg": f"网络失败: {e}"}
+        try:
+            payload = r.json()
+        except Exception:
+            payload = {}
+        code = payload.get("code") if isinstance(payload, dict) else None
+        ok = r.status_code == 200 and code == 0
+        return {"ok": ok, "status": r.status_code, "code": code,
+                "msg": "" if ok else f"HTTP {r.status_code} code={code}"}
+
+    def fire_buddy_app(self) -> dict:
+        """发现应用 / 企鹅教师助手：上报五连「进入 Buddy 应用」事件。
+
+        一组事件同时满足 Buddy_App 与 Buddy_App_QQ 两个任务。
+        """
+        bid, bname = BUDDY_QQ_APP
+        ev = []
+
+        def mk(code, extra=None):
+            e = {"eventCode": code, "mode": "LOCAL", "buddyId": bid,
+                 "buddyName": bname}
+            if extra:
+                e.update(extra)
+            ev.append(e)
+
+        mk("buddyapp_discover_click")
+        mk("buddyapp_show", {"elementId": bid, "elementName": bname, "position": 2})
+        mk("buddyapp_enter_click", {"elementId": bid, "elementName": bname,
+                                    "position": 2, "isFirstPage": "1"})
+        mk("buddyapp_auth_confirm_click", {"elementId": bid, "elementName": bname})
+        mk("buddyapp_bindaccount_skip_click", {"elementId": bid, "elementName": bname})
+        return self.report_desktop_events(ev)
+
+    def fire_desktop_chat(self) -> dict:
+        """桌面端对话任务：上报 6 连「桌面端成功对话」事件链。"""
+        now = int(time.time() * 1000)
+        conv = f"wb-run-rm-{now}"
+        reqid = f"{conv}-req"
+        msgid = f"{conv}-user"
+        mid = "fast-model"
+        ev = []
+
+        def mk(code, extra):
+            e = {"eventCode": code}
+            e.update(extra)
+            ev.append(e)
+
+        mk("agent_task_created", {
+            "source": "LOCAL", "name": "working", "task_target": "local",
+            "mode": "craft", "requestModelId": mid, "requestModelName": mid,
+            "has_repo": False, "repo_type": "none", "workspace_type": "empty",
+            "has_connector": False, "connector_types": [], "has_mention": False,
+            "mention_types": [], "has_template": False, "action": "",
+            "template_name": "", "has_expert": False, "expert_id": "",
+            "expert_name": "", "expert_industry_id": "", "has_skill": False,
+            "skill_names": [], "conversationId": conv, "messageId": msgid,
+            "buddyId": "", "buddyName": ""})
+        mk("chat_message_send", {
+            "messageId": msgid + "-assistant", "historyCount": 0,
+            "isContextTruncated": False, "currentStepCount": 1, "traceId": reqid,
+            "rootRequestId": reqid, "parentConversationId": conv,
+            "agentName": "cli", "agentType": "main"})
+        mk("chat_request_send", {
+            "inputLength": 24, "isPlan": False, "isAutoExecuteTerminal": False,
+            "isAutoModify": False, "codebaseEnable": False, "maxToken": 0,
+            "maxSteps": 500, "temperature": 0, "maxRetries": 0,
+            "mentionContexts": [], "knowledgeId": [], "knowledgeName": [],
+            "codebaseId": "", "mentionContextCount": 0, "command": "",
+            "recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
+            "traceId": reqid, "rootRequestId": reqid,
+            "parentConversationId": conv, "agentName": "cli", "agentType": "main",
+            "codebuddy.session_id": conv,
+            "codebuddy.conversation_request_id": reqid})
+        mk("chat_message_response", {
+            "messageId": msgid + "-assistant", "responseModelId": mid,
+            "inputToken": 120, "outputToken": 80, "totalToken": 200,
+            "cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
+            "isSuccessful": True, "messageErrorCode": "", "finishReason": "stop",
+            "firstTokenAt": now, "traceId": reqid, "conversationId": conv,
+            "rootRequestId": reqid, "parentConversationId": conv,
+            "agentName": "cli", "agentType": "main",
+            "codebuddy.session_id": conv,
+            "codebuddy.conversation_request_id": reqid})
+        mk("chat_message_status", {
+            "messageId": msgid + "-assistant", "messageErrorCode": "0",
+            "traceId": reqid, "rootRequestId": reqid,
+            "parentConversationId": conv, "agentName": "cli", "agentType": "main"})
+        mk("chat_request_response", {
+            "mode": "craft", "toolCallCount": 0, "inputToken": 120,
+            "outputToken": 80, "totalToken": 200, "cachedTokens": 0,
+            "cachedWriteTokens": 0, "cachedMissTokens": 0, "isSuccessful": True,
+            "messageErrorCode": "", "finishReason": "stop", "rootRequestId": reqid,
+            "parentConversationId": conv})
+        return self.report_desktop_events(ev)
 
     def get_token_expiry(self) -> int:
         """返回 token 到期时间戳（毫秒），0 表示未知。"""
