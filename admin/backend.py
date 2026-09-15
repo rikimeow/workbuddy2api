@@ -625,6 +625,212 @@ class AccountSession:
             "web_element_click", LIBRARY_DOC_URL,
             "library_doc_intro_click", "WorkBuddy资料库介绍")
 
+    def _chat_headers(self) -> dict:
+        """chat 域头：市场/场景等接口用（CLI 形状，X-Domain 走账号自己的域）。"""
+        return {
+            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+            "Origin": BILL_BASE,
+            "Referer": BILL_BASE + "/",
+            "X-User-Id": self._uid(),
+            "X-Domain": self._domain(),
+        }
+
+    def _chat_json(self, path: str, body: dict | None = None) -> dict:
+        """向 chat 域发请求并返回 data 段；失败返回 {}。"""
+        url = BACKEND.rstrip("/") + path
+        try:
+            with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+                if body is None:
+                    r = c.get(url, headers=self._chat_headers())
+                else:
+                    r = c.post(url, headers=self._chat_headers(), json=body)
+            if r.status_code != 200:
+                return {}
+            return (r.json() or {}).get("data") or {}
+        except Exception:
+            return {}
+
+    # ------------------------------------------------------------------
+    # 真实对象来源（全部只读；绝不编造 id）
+    # ------------------------------------------------------------------
+    # 这些任务要求事件里带「真实存在的对象 id」。id 一律从官方接口现拉，
+    # 拉不到就放弃该任务，绝不退化成自造 id —— 伪造业务对象一旦被后端
+    # 核对就会暴露。
+    # ------------------------------------------------------------------
+
+    def _next_index(self, n: int) -> int:
+        """返回 0..n-1 的轮转下标，每次调用递增。
+
+        同一个任务要跑 N 次，必须每次用**不同的**对象 id ——
+        服务端按 id 去重，重复报同一个 id 只算一次
+        （实测 team 任务连报 3 次同一个专家，进度只 +2）。
+        用实例计数器而不是时间片，保证连续调用一定取到不同值。
+        """
+        if n <= 0:
+            return 0
+        i = getattr(self, "_rotor", 0)
+        self._rotor = i + 1
+        return i % n
+
+    def fetch_experts(self, team_only: bool = False,
+                      keyword: str | None = None, limit: int = 6) -> list[dict]:
+        """真实专家列表（市场接口）。team_only 只取专家团。"""
+        body: dict = {"page": 1, "page_size": 50}
+        if team_only:
+            # 市场支持按 expert_type 过滤；不带该参数时 400 个专家里只有 1 个 team
+            body["expert_type"] = "team"
+        if keyword:
+            body["keyword"] = keyword
+        data = self._chat_json("/v2/operation-platform/market/expert/list", body)
+        out = []
+        for e in data.get("experts") or []:
+            eid = e.get("expert_id") or e.get("source_id")
+            if not eid:
+                continue
+            etype = e.get("expert_type") or "agent"
+            if team_only and etype != "team":
+                continue
+            out.append({
+                "id": eid, "expertType": etype,
+                "name": e.get("display_name_zh") or e.get("profession_zh") or eid,
+                "category": (e.get("categories") or [""])[0] or "",
+                "version": e.get("version") or "",
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    def fetch_scenes(self, limit: int = 6) -> list[dict]:
+        """真实场景（模板）列表。"""
+        data = self._chat_json("/console/as/support/scenes?locale=zh-CN")
+        out = []
+        for s in data.get("scenes") or []:
+            if s.get("id") is None:
+                continue
+            out.append({"id": str(s["id"]), "name": s.get("name") or ""})
+            if len(out) >= limit:
+                break
+        return out
+
+    def fetch_appearance_themes(self, keyword: str = "和平精英") -> list[dict]:
+        """真实外观主题资源（走 billing 域）。"""
+        url = BILL_BASE + "/v2/operation-platform/appearance/resources"
+        body = {"platform": "client", "kind": "theme", "version": "2.63.2",
+                "lang": "zh-CN"}
+        try:
+            with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+                r = c.post(url, headers=self._chat_headers(), json=body)
+            if r.status_code != 200:
+                return []
+            data = (r.json() or {}).get("data") or {}
+        except Exception:
+            return []
+        out = []
+        for x in data.get("resources") or []:
+            nm = x.get("name") or ""
+            if keyword and keyword not in nm and keyword.lower() not in nm.lower():
+                continue
+            if not x.get("id"):
+                continue
+            out.append({"id": x["id"], "name": nm,
+                        "vipLevel": x.get("vip_level") or "free",
+                        "series": x.get("series") or "craft"})
+        return out
+
+    # ------------------------------------------------------------------
+    # 具体任务触发器
+    # ------------------------------------------------------------------
+
+    def fire_expert_use(self, team_only: bool = False) -> dict:
+        """召唤专家任务：用真实专家 id 上报 expert_actual_use。
+
+        每次调用取一个不同专家（按 uid 轮转，避免永远只报第一个）。
+        target 次数由调用方循环完成。
+        """
+        teams = team_only
+        experts = self.fetch_experts(team_only=teams, limit=12)
+        if not experts:
+            return {"ok": False, "status": 0,
+                    "msg": "取不到真实专家 id，跳过（不自造）"}
+        e = experts[self._next_index(len(experts))]
+        now = int(time.time() * 1000)
+        cid = str(uuid.uuid4())
+        ev = {
+            "eventCode": "expert_actual_use", "timestamp": now, "reportDelay": 0,
+            "mode": "CLOUD", "id": e["id"], "name": e["name"],
+            "expertTitle": e["name"], "type": e["category"],
+            "expertType": "team" if teams else (e["expertType"] or "agent"),
+            "source": "builtin", "version": e["version"], "cost": 0,
+            "characterCount": 12, "conversationId": cid,
+            "requestId": f"{cid}-{now}", "messageId": f"{cid}-{now}",
+            "requestModelId": "deepseek-v4-flash",
+            "requestModelName": "DeepSeek V4 Flash", "userId": self._uid(),
+        }
+        return self.report_billing_event([ev])
+
+    def fire_expert_team(self) -> dict:
+        """召唤专家团任务：只取 expert_type=team 的真实团队。"""
+        return self.fire_expert_use(team_only=True)
+
+    def fire_template_use(self) -> dict:
+        """使用模板任务：用真实场景 id 上报 agent_task_created_with_template。"""
+        scenes = self.fetch_scenes(limit=12)
+        if not scenes:
+            return {"ok": False, "status": 0, "msg": "取不到真实场景 id，跳过"}
+        s = scenes[self._next_index(len(scenes))]
+        now = int(time.time() * 1000)
+        cid = str(uuid.uuid4())
+        ev = {
+            "eventCode": "agent_task_created_with_template", "timestamp": now,
+            "reportDelay": 0, "isCustomModel": True, "id": s["id"],
+            "name": s["name"], "requestId": f"{cid}-{now}",
+            "conversationId": cid, "userId": self._uid(),
+        }
+        return self.report_billing_event([ev])
+
+    def fire_lighthouse_expert(self) -> dict:
+        """轻量云专家任务：关键词筛出真实轻量云专家后上报。"""
+        for kw in ("lighthouse", "轻量云"):
+            experts = self.fetch_experts(keyword=kw, limit=5)
+            for e in experts:
+                name = e["name"] or ""
+                if any(k in (e["id"] + name).lower()
+                       for k in ("lighthouse", "轻量", "light")):
+                    now = int(time.time() * 1000)
+                    cid = str(uuid.uuid4())
+                    ev = {
+                        "eventCode": "expert_actual_use", "timestamp": now,
+                        "reportDelay": 0, "mode": "CLOUD", "id": e["id"],
+                        "name": name, "expertTitle": name, "type": e["category"],
+                        "expertType": e["expertType"] or "agent",
+                        "source": "builtin", "version": e["version"], "cost": 0,
+                        "characterCount": 12, "conversationId": cid,
+                        "requestId": f"{cid}-{now}", "messageId": f"{cid}-{now}",
+                        "requestModelId": "deepseek-v4-flash",
+                        "requestModelName": "DeepSeek V4 Flash",
+                        "userId": self._uid(),
+                    }
+                    return self.report_billing_event([ev])
+        return {"ok": False, "status": 0, "msg": "未找到轻量云专家，跳过"}
+
+    def fire_appearance_skin(self) -> dict:
+        """和平精英主题任务：用真实主题 resourceKey 上报换肤。"""
+        themes = self.fetch_appearance_themes()
+        if not themes:
+            return {"ok": False, "status": 0, "msg": "取不到真实主题 id，跳过"}
+        t = themes[0]
+        now = int(time.time() * 1000)
+        ev = {
+            "eventCode": "appearance_skin_apply", "timestamp": now,
+            "reportDelay": 0, "action": "apply", "source": "settings_close",
+            "id": t["id"], "vipLevel": t["vipLevel"], "series": t["series"],
+            "type": "unknown", "name": t["name"], "userId": self._uid(),
+        }
+        return self.report_billing_event([ev])
+
     def get_token_expiry(self) -> int:
         """返回 token 到期时间戳（毫秒），0 表示未知。"""
         return self._sess_auth().get("expiresAt") or 0

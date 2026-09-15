@@ -103,29 +103,13 @@ TASK_PLANS: dict[str, TaskPlan] = {
         "桌面端对话：实测 chat_request_send 等 5 个事件均不计数，"
         "上游按客户端类型判定，需真实桌面端对话",
     ),
-    "expert_5": TaskPlan(
-        "expert_5", MANUAL, [],
-        "召唤专家：召唤=本地专家包的下载+激活（ExpertSummonService），"
-        "非服务端事件；埋点 expert_summoned 不驱动进度，后端无 summon 接口",
-    ),
     "expert_5_paid": TaskPlan(
         "expert_5_paid", MANUAL, [],
         "召唤专家（付费版）：同上",
     ),
-    "Expert_team_use_3": TaskPlan(
-        "Expert_team_use_3", MANUAL, [],
-        "召唤专家团：同上",
-    ),
-    "Hp_Appearance": TaskPlan(
-        "Hp_Appearance", MANUAL, [],
-        "和平精英主题：需桌面端「菜单-外观」切换主题，纯客户端本地状态",
-    ),
-    "template_5": TaskPlan(
-        "template_5", MANUAL, ["agent_task_created_with_template"],
-        "使用模板：尝试模板事件，未验证",
-    ),
     # 已实测可自动完成（走 POST /v2/report 上报真实业务事件，
-    # 不是 growthEvent —— 这两个任务不吃事件包）
+    # 不是 growthEvent —— 这些任务不吃事件包）
+    # 对象 id 一律从官方接口现拉，拉不到就跳过，绝不编造。
     "playbook_prompt": TaskPlan(
         "playbook_prompt", AUTO, [],
         "灵感案例：billing 域上报 playbook_prompt_send（已实测点亮 +100）",
@@ -136,9 +120,34 @@ TASK_PLANS: dict[str, TaskPlan] = {
         "资料库：web 域上报资料库介绍页点击（已实测点亮 +100）",
         firer="fire_library_read",
     ),
+    "expert_5": TaskPlan(
+        "expert_5", MULTI, [],
+        "召唤专家：用市场真实专家 id 上报 expert_actual_use（已实测点亮 +100）",
+        firer="fire_expert_use",
+    ),
+    "template_5": TaskPlan(
+        "template_5", MULTI, [],
+        "使用模板：用真实场景 id 上报 template 事件（已实测点亮 +100）",
+        firer="fire_template_use",
+    ),
+    "Expert_lighthouse": TaskPlan(
+        "Expert_lighthouse", AUTO, [],
+        "腾讯轻量云专家：关键词筛真实专家后上报（已实测点亮 +100）",
+        firer="fire_lighthouse_expert",
+    ),
+    "Hp_Appearance": TaskPlan(
+        "Hp_Appearance", AUTO, [],
+        "和平精英主题：用真实主题 resourceKey 上报换肤（已实测点亮 +100）",
+        firer="fire_appearance_skin",
+    ),
+    "Expert_team_use_3": TaskPlan(
+        "Expert_team_use_3", MULTI, [],
+        "召唤专家团：expert_type=team 过滤取真实团队后上报（已实测点亮 +100）",
+        firer="fire_expert_team",
+    ),
     "Expert_Philanthropy": TaskPlan(
         "Expert_Philanthropy", MANUAL, [],
-        "公益专家：未找到有效事件",
+        "公益专家：需真实捐款动作，无法代做",
     ),
     "create_canvas": TaskPlan(
         "create_canvas", MANUAL, [],
@@ -151,10 +160,6 @@ TASK_PLANS: dict[str, TaskPlan] = {
     "Buddy_App_QQ": TaskPlan(
         "Buddy_App_QQ", MANUAL, [],
         "企鹅教师助手：未找到有效事件",
-    ),
-    "Expert_lighthouse": TaskPlan(
-        "Expert_lighthouse", MANUAL, [],
-        "腾讯轻量云专家：未找到有效事件",
     ),
 
     # ---------------- 明确跳过 ----------------
