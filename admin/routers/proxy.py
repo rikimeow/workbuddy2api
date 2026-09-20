@@ -413,7 +413,32 @@ _MODEL_BLOCK_CODE = "11102"
 _MODEL_BLOCK_MARKERS = ("service info not found",)
 #: WAF 403 的判据：403 且**没有业务信封**（无 code 字段 / 空体 / HTML 拦截页）。
 #: 带业务信封的 403（11140 等）已在上面各层捕获，不会走到这里。
-_ENVELOPE_CODE_RE = re.compile(r'"code"\s*:\s*"?(\d+)"?')
+_ENVELOPE_CODE_RE = re.compile(r'"code"\s*:\s*"?(-?\d+)"?')
+
+#: 上游把「内部错误」包在 **HTTP 200** 响应体里返回时，HTTP 层完全看不出来。
+#: 判据来自真实故障：桌面端 10000 的底层是 JSON-RPC -32603 "Internal error"，
+#: 以及 ENOSPC 这类磁盘写满的运维级瞬时故障。这类失败**必须换号重试**，
+#: 否则用户看到的就是「接口直接报错了，但没有切换其它账号」。
+_UPSTREAM_INTERNAL_MARKERS = (
+    "-32603", "internal error", "internal server error",
+    '"category":"internal"', '"category": "internal"',
+    "enospc", "no space left on device",
+)
+
+#: 可重试（换号 / 换模型）的错误分类白名单。
+#: 集中定义一处，避免 5 个轮转循环各自内联一份而逐渐漂移 ——
+#: 任何一处漏掉一个分类，那条路径就会「报错但不重试」。
+_RETRYABLE_KINDS = frozenset({
+    "hard_credit", "session_dead", "soft_rate", "model_rate", "model_block",
+    "account_fault", "not_found", "server", "waf", "upstream_internal",
+})
+
+#: 模型级错误里，「该账号对该模型限流」换号可解（6004，账号各自的额度）；
+#: 而「该后端无此模型」是确定性答复（11102），只有换模型才有意义。
+_MODEL_SWITCH_KINDS = frozenset({"model_block"})
+
+#: 提交前探测缓冲上限：超过它就直接转发，避免为了等错误而无限期憋住正常流。
+_INBAND_PROBE_MAX = 64 * 1024
 
 
 def _json_code(body: str) -> str | None:
@@ -422,6 +447,202 @@ def _json_code(body: str) -> str | None:
         return None
     m = _ENVELOPE_CODE_RE.search(body)
     return m.group(1) if m else None
+
+
+def _looks_like_inband_error(body: str) -> bool:
+    """响应体（可能是 SSE 文本）里是否含「上游错误」信封。
+
+    上游有两类必须识别的失败，**HTTP 状态码都是 200**：
+
+    1. JSON-RPC 信封：``{"code":-32603,"message":"Internal error",...}``
+       —— 客户端报的 Error Code 10000 底层就是它；
+    2. error 字段/事件：``{"error":{...}}`` 或 SSE ``event: error``。
+
+    判定**基于解析后的结构**（error 字段 / 负 code / message 文本），
+    而不是对原始字节做 substring —— 否则模型正常回答里恰好出现
+    "internal error" 这几个字就会被误判成失败并触发换号。
+    """
+    if not body:
+        return False
+
+    def _err_text(obj) -> str:
+        """从候选错误对象里取出可匹配的文案。"""
+        if isinstance(obj, str):
+            return obj
+        if not isinstance(obj, dict):
+            return ""
+        parts = []
+        for k in ("message", "msg", "detail", "details", "reason", "error_description"):
+            v = obj.get(k)
+            if isinstance(v, str):
+                parts.append(v)
+        # data 里还可能再嵌一层 {"data":{"details":"ENOSPC ..."}}
+        d = obj.get("data")
+        if isinstance(d, dict):
+            parts.append(_err_text(d))
+        err = obj.get("error")
+        if isinstance(err, (dict, str)):
+            parts.append(_err_text(err))
+        return " ".join(parts)
+
+    def _is_error_obj(obj) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        # 显式 error 字段
+        if isinstance(obj.get("error"), (dict, str)):
+            err = obj["error"]
+            if err not in (None, "", {}, []):
+                return True
+        # JSON-RPC 负 code（-32603 等）；正数是业务码，不算
+        c = obj.get("code")
+        if isinstance(c, int) and c < 0:
+            return True
+        if isinstance(c, str) and c.startswith("-") and c[1:].isdigit():
+            return True
+        # status/category 明确 internal
+        for k in ("category", "type", "status"):
+            v = obj.get(k)
+            if isinstance(v, str) and "internal" in v.lower():
+                return True
+        return False
+
+    def _markers_hit(text: str) -> bool:
+        low = (text or "").lower()
+        return bool(low) and any(m in low for m in _UPSTREAM_INTERNAL_MARKERS)
+
+    seen_any = False
+    for candidate in _iter_json_objects(body):
+        seen_any = True
+        if _is_error_obj(candidate):
+            return True
+        if _markers_hit(_err_text(candidate)):
+            return True
+    # 有 data: 行但一行都没解析成功（截断/非 JSON）时，
+    # 只剩「整段就是错误信封」这一种可能，做一次保守的尾部匹配。
+    if not seen_any and body.lstrip().startswith("{"):
+        return _markers_hit(body)
+    return False
+
+
+def _iter_json_objects(body: str):
+    """依次产出 body 里可解析的 JSON 对象（裸 JSON 或 SSE data: 行）。"""
+    stripped = body.lstrip()
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(stripped)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            yield obj
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload in ("", "[DONE]"):
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def _sse_has_error_event(body: str) -> bool:
+    """SSE 里是否出现 ``event: error`` 行（与 data 信封独立的一种信号）。"""
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("event:") and "error" in s.lower():
+            return True
+    return False
+
+
+#: 各种协议里「真实正文增量」的字段名。只有看到其中之一，才认为这条流是健康的。
+_CONTENT_FIELDS = ("content", "reasoning_content", "text", "thinking", "tool_calls")
+
+
+def _sse_has_content(body: str) -> bool:
+    """SSE 里是否已经出现**真实正文增量**。
+
+    流式模式下只要把字节提交给客户端，就再也无法换号重试了。所以提交前
+    必须确认「这确实是正文，而不是一个 200 包着的错误信封」。
+    注意 ``delta.role`` 之类只有元信息的帧不算正文。
+    """
+    for line in body.splitlines():
+        s = line.strip()
+        if not s.startswith("data:"):
+            continue
+        payload = s[5:].strip()
+        if payload in ("", "[DONE]"):
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        # Anthropic 形态：content_block_delta {"delta":{"type":"text_delta","text":"..."}}
+        # OpenAI chat：choices[].delta.content
+        choices = obj.get("choices")
+        if isinstance(choices, list):
+            for ch in choices:
+                if not isinstance(ch, dict):
+                    continue
+                for holder in (ch.get("delta"), ch.get("message")):
+                    if isinstance(holder, dict):
+                        for f in _CONTENT_FIELDS:
+                            v = holder.get(f)
+                            if v:
+                                return True
+                # Responses API：output 数组里的文本
+                if ch.get("text"):
+                    return True
+        # Responses / Anthropic 顶层 delta
+        for holder in (obj.get("delta"), obj.get("content_block")):
+            if isinstance(holder, dict):
+                for f in _CONTENT_FIELDS:
+                    if holder.get(f):
+                        return True
+                if holder.get("type") == "text_delta" and holder.get("text"):
+                    return True
+        if isinstance(obj.get("delta"), str) and obj["delta"]:
+            return True
+        # 非流式的完整消息（聚合模式会用到）
+        if obj.get("content") or obj.get("output_text"):
+            return True
+    return False
+
+
+_EXHAUSTION_HINTS = {
+    "hard_credit": "账号积分已用完（次日 04:00 重置）",
+    "soft_rate": "上游限流中，请稍后重试",
+    "model_rate": "该模型在多个账号上都已达额度上限",
+    "model_block": "上游没有这个模型（该后端不提供）",
+    "account_fault": "账号授权异常（需重新登录/激活）",
+    "session_dead": "账号登录态失效（需重新登录）",
+    "upstream_internal": "上游服务器内部故障（如磁盘写满），非本网关问题",
+    "server": "上游服务异常",
+    "waf": "网关出口 IP 被上游 WAF 拦截",
+    "not_found": "上游接口路径不存在",
+    "transport": "与上游的网络连接异常",
+    "no_account": "号池里没有可用账号（余额或状态均不满足）",
+}
+
+
+def _exhaustion_message(kind: str, last_msg: str, tried_accounts: int,
+                        tried_models: int) -> str:
+    """把「全部失败」翻译成**可操作**的中文说明。
+
+    只在提示里带错误分类与次数，不把上游原文整段抛给客户端 ——
+    原文可能含内部细节，且对排障者没有额外价值（完整信息在网关日志里）。
+    """
+    hint = _EXHAUSTION_HINTS.get(kind or "", "未知错误")
+    tried = f"已尝试 {tried_accounts} 个账号 / {tried_models} 个候选模型"
+    base = f"{hint}；{tried}"
+    if kind == "waf" and last_msg:
+        return f"{base}，已暂停轮转；请稍后重试"
+    return f"{base}。请稍后重试，或联系管理员查看网关日志。"
 
 
 def _classify_error(status: int, body: str) -> str:
@@ -439,8 +660,11 @@ def _classify_error(status: int, body: str) -> str:
          这个号会在整天的每一次请求里都被选中并失败，白烧一次轮转 + 增加
          所有用户的延迟。宁可保守地把它按日冷却（误判代价：一个健康号当天
          少用；反向误判代价：每次请求都多一次必败重试）。
-      6. 429 / 限流文案。
-      7. 404 / 5xx / WAF 403 / 其它 4xx。
+       6. 429 / 限流文案。
+       7. 404 / 5xx / WAF 403 / 其它 4xx。
+       8. **HTTP 200 但体内是错误信封**（JSON-RPC -32603 / ENOSPC / error 字段）
+          —— 放在最后，具体业务码优先；上游确实会把内部错误塞进 200 响应，
+          这类失败必须换号重试，否则用户看到的就是「报错了但没切换账号」。
     """
     if not status and not body:
         return "transport"
@@ -491,12 +715,26 @@ def _classify_error(status: int, body: str) -> str:
         return "not_found"
     if status >= 500:
         return "server"
+    # 408 请求超时 / 425 Too Early：瞬时，换号重试即可，绝不能算客户端错误。
+    if status in (408, 425):
+        return "server"
+    # 401 上游鉴权失效：通常是该账号 token 过期/被吊销。
+    # 换号能立刻恢复服务，因此归入可重试，而不是把 401 透传给客户端。
+    if status == 401:
+        return "session_dead"
     if status == 403:
         # 走到这里说明 403 但**没有业务信封** —— 典型是 APISIX/WAF 拦截页或空体。
         # 账号级软冷却 + fail-fast（多号同时命中则判定出口 IP 被拦）。
         return "waf"
     if status >= 400:
         return "client"
+    # 8. HTTP 200 但体内是上游错误信封（JSON-RPC -32603 / ENOSPC / error 字段）。
+    #    放在最后：具体业务码（6004/11102/12153…）优先级更高，只有它们都不匹配
+    #    时才按「上游内部故障」处理。真实故障：客户端 10000 的底层就是这个。
+    if status == 200 and body and _looks_like_inband_error(body):
+        return "upstream_internal"
+    if status == 200 and body and _sse_has_error_event(body):
+        return "upstream_internal"
     return "transport"  # 网络层/无响应状态
 
 
@@ -637,6 +875,18 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
         acc.cool_kind = "not_found"
         acc.last_err_at = now
         acc.last_err_msg = (msg or "upstream 404")[:255]
+    elif kind == "upstream_internal":
+        # HTTP 200 但体内是上游内部错误（-32603 Internal error / ENOSPC 写盘失败）。
+        # 这是**瞬时运维级故障**：上游那台机器磁盘满了，换一个账号（很可能是
+        # 另一台后端）就能立刻恢复。因此：
+        #   * 做秒级短冷却，把刚刚那个后端从选号里摘出去一会儿；
+        #   * 累计连败计数（是「不知道原因的持续失败」，符合降权目标形态）；
+        #   * **不动** err_count/session_dead_fails —— 不是账号的错，不该熔断。
+        acc.cool_until = now + timedelta(seconds=max(15, settings.SOFT_RATE_SECONDS // 20))
+        acc.cool_kind = "upstream_internal"
+        acc.consecutive_fails = (acc.consecutive_fails or 0) + 1
+        acc.last_err_at = now
+        acc.last_err_msg = (msg or "upstream internal error")[:255]
     elif kind == "server" or status >= 500:
         # HTTP 5xx：熔断（指数退避），不再用「累计 5 次固定 10 分钟」——
         # 固定时长对持续坏的号太短（10 分钟后又被选中再失败），对偶发又太长。
@@ -1345,10 +1595,13 @@ async def chat_completions(
             last_err_kind = ""
             last_err_msg = ""
             rotate_idx = 0  # 轮转序号（退避按它指数增长）
+            tried_accounts = 0   # 供「全部失败」提示说明尝试规模
+            tried_models_n = 0
 
             async with httpx.AsyncClient(timeout=_stream_timeout(), limits=backend.HTTP_LIMITS) as client:
                 for m in order:
                     body["model"] = m
+                    tried_models_n += 1
                     tried_ids: set = set()
                     for attempt in range(max(1, settings.MAX_ROTATE)):
                         # WAF IP 级 fail-fast：多账号接连 403 说明是**出口 IP** 被拦，
@@ -1363,6 +1616,7 @@ async def chat_completions(
                         if not acc_i:
                             break
                         tried_ids.add(acc_i.id)
+                        tried_accounts += 1
                         # 在途租约：占满上限的号选号阶段已被过滤，
                         # 这里再 acquire 一次以闭合并发窗口（选号与占用之间有间隙）。
                         if not POOL.acquire(acc_i.uid or ""):
@@ -1393,17 +1647,17 @@ async def chat_completions(
                                     POOL.release(held_uid)
                                     held_uid = ""
                                     # 可重试：余额不足 / session 死亡 / 限流 / 模型级限流 /
-                                    # 账号故障 / 上游 5xx / 404 / WAF 都换号或换模型，
-                                    # 绝不把中断感传递给客户端。
-                                    if kind in ("hard_credit", "session_dead", "soft_rate",
-                                                "model_rate", "model_block", "account_fault",
-                                                "not_found", "server", "waf"):
+                                    # 账号故障 / 上游 5xx / 404 / WAF / 上游内部错误
+                                    # 都换号或换模型，绝不把中断感传递给客户端。
+                                    if kind in _RETRYABLE_KINDS:
                                         last_err_kind = kind
                                         last_err_msg = text
-                                        # 模型级错误换模型即可（该账号对别的模型仍可用）；
-                                        # 账号级错误才退避 —— 限流场景下退避能显著降低
-                                        # 再次撞上同一上游限流窗口的概率。
-                                        if kind in ("model_rate", "model_block"):
+                                        # 11102「该后端无此模型」是确定性答复：换号无意义，
+                                        # 只能换模型，故跳出账号循环、由外层取 order 下一项。
+                                        # 6004「该模型额度超限」是**账号级**的（每个号各自
+                                        # 计数），换号就能继续 —— 这里绝不能 break，
+                                        # 否则「限流时直接报错、不切换其它账号」正是用户踩的坑。
+                                        if kind in _MODEL_SWITCH_KINDS:
                                             break
                                         await pool.rotate_backoff_async(rotate_idx)
                                         rotate_idx += 1
@@ -1427,22 +1681,100 @@ async def chat_completions(
                                         else:
                                             yield text
                                     return
-                                # 成功连接：标记使用时刻并记录最终信息
+                                # HTTP 200 —— 但 200 **不等于**成功：上游会把内部错误
+                                # （-32603 Internal error / ENOSPC 写盘失败）塞进 200 的
+                                # 响应体里。一旦我们把字节转发给客户端，就再也无法换号了，
+                                # 所以先缓冲一小段，确认是**正文**再提交。
                                 final_model = m
                                 final_acc_id = acc_i.id
                                 final_uid = acc_i.uid or "-"
-                                acc_i.last_used_at = datetime.utcnow()
-                                # 成功后清空连续失败计数：偶发抖动不该累积成熔断
-                                _note_success(db2, acc_i)
+                                probe = ""
+                                committed = False
                                 async for chunk in r.aiter_text():
                                     if ttfb_at is None:
                                         ttfb_at = time.perf_counter()
                                     collected.append(chunk)
-                                    delivered = True
-                                    if not aggregate:
-                                        yield chunk
-                            # 流式完成 → 记账 / 表格日志
+                                    if committed:
+                                        if not aggregate:
+                                            yield chunk
+                                        continue
+                                    probe += chunk
+                                    # 看到真实正文增量就提交（此后不再换号）；
+                                    # 或缓冲到上限仍未见到正文，也不再憋着。
+                                    if _sse_has_content(probe) or len(probe) >= _INBAND_PROBE_MAX:
+                                        committed = True
+                                        delivered = True
+                                        if not aggregate:
+                                            yield probe
+                                        probe = ""
+                            # 流式完成：先判定这是不是「200 包着的错误」
                             text = "".join(collected)
+                            stream_is_error = bool(text) and (
+                                _looks_like_inband_error(text) or _sse_has_error_event(text)
+                            )
+                            # 聚合模式全程缓冲、尚未向客户端产出任何字节，可整条重试。
+                            # 流式模式只在「还没提交过字节」时才可重试。
+                            can_retry = aggregate or not committed
+                            if stream_is_error:
+                                kind = _classify_error(200, text)
+                                if can_retry:
+                                    _apply_account_policy(db2, acc_i, kind, 200, text[:500],
+                                                          model=m, reset_at=_parse_reset_at(text))
+                                    _maybe_degrade(db2, acc_i)
+                                    sess_i.close()
+                                    POOL.release(held_uid)
+                                    held_uid = ""
+                                    last_err_kind = kind
+                                    last_err_msg = text[:500]
+                                    _logger.warning(
+                                        "上游 200 但响应体是错误，换号重试 kind=%s acc=%s model=%s body=%.200s",
+                                        kind, final_uid, m, text)
+                                    # 累积内容清空：下一轮账号从零收集，
+                                    # 否则最终会把两个号的内容拼在一起。
+                                    collected.clear()
+                                    delivered = False
+                                    if kind in _RETRYABLE_KINDS:
+                                        # 11102 换模型（跳出账号循环，外层取下个模型）；
+                                        # 其余（含 -32603 / ENOSPC）换号。
+                                        if kind in _MODEL_SWITCH_KINDS:
+                                            break
+                                        await pool.rotate_backoff_async(rotate_idx)
+                                        rotate_idx += 1
+                                        continue
+                                    # 不可重试：如实把错误交给客户端
+                                    if aggregate:
+                                        yield json.dumps(
+                                            {"error": {"message": text[:500],
+                                                       "type": "upstream_error"}},
+                                            ensure_ascii=False)
+                                    else:
+                                        yield text
+                                    return
+                                # 已经把字节发给客户端了，收不回来 —— 但绝不能记成成功：
+                                # 如实标记错误，让用量/日志与真实结果一致。
+                                latency_ms = int((time.perf_counter() - request_start) * 1000)
+                                seq = _log_chat_row(None, latency_ms, final_model, mode,
+                                                    final_uid, 200, None, error_kind=kind)
+                                _record_usage(key.id, final_acc_id, final_model, 0.0, None,
+                                              client_ip=_client_ip(request),
+                                              use_case="chat-completion", seq=seq,
+                                              latency_ms=latency_ms, error_kind=kind)
+                                sess_i.close()
+                                POOL.release(held_uid)
+                                held_uid = ""
+                                _apply_account_policy(db2, acc_i, kind, 200, text[:500], model=m)
+                                return
+                            # 流式模式下若始终没识别到正文（如仅角色帧就结束），
+                            # 把缓冲原样补发给客户端，绝不静默吞掉内容。
+                            if not committed and not aggregate and probe:
+                                ttfb_at = ttfb_at or time.perf_counter()
+                                delivered = True
+                                yield probe
+                                probe = ""
+                            # 确认是健康响应后，才清空连败计数：
+                            # 「200 但体内是错误」不该被记成一次成功。
+                            acc_i.last_used_at = datetime.utcnow()
+                            _note_success(db2, acc_i)
                             usage = _parse_usage(text)
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             status_out = 200
@@ -1509,12 +1841,7 @@ async def chat_completions(
             _record_usage(key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="chat-completion", seq=seq, latency_ms=latency_ms,
                           error_kind=err_kind)
-            if err_kind == "waf":
-                err_msg = f"上游 WAF 拦截了网关出口 IP（{last_err_msg}），已暂停轮转；请稍后重试"
-            elif last_err_kind:
-                err_msg = f"所有账号/候选模型均不可用（最后错误：{last_err_kind}）"
-            else:
-                err_msg = "无可用账号或模型"
+            err_msg = _exhaustion_message(err_kind, last_err_msg, tried_accounts, tried_models_n)
             err_obj = {"error": {"message": err_msg, "type": "no_model_available"}}
             if aggregate:
                 # 聚合模式：统一产出 JSON（调用方不是 SSE 客户端，
@@ -1542,8 +1869,10 @@ async def chat_completions(
     async for chunk in _stream(aggregate=True):
         agg_out = chunk
     if not agg_out:
-        return JSONResponse(status_code=503,
-                            content={"error": {"message": "无可用账号或模型", "type": "no_model_available"}})
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": _exhaustion_message("no_account", "", 0, len(order)),
+                               "type": "no_model_available"}})
     try:
         payload_out = json.loads(agg_out)
     except Exception:
@@ -1635,6 +1964,8 @@ async def responses_proxy(
         held_uid = ""
         try:
             rotate_idx = 0
+            last_err_kind = ""
+            last_err_msg = ""
             for m in order:
                 body = dict(chat_body)
                 body["model"] = m
@@ -1673,16 +2004,37 @@ async def responses_proxy(
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
-                                if kind in ("hard_credit", "session_dead", "soft_rate",
-                                            "model_rate", "model_block", "account_fault",
-                                            "not_found", "server", "waf"):
-                                    if kind in ("model_rate", "model_block"):
-                                        break  # 换模型即可，该账号对别的模型仍可用
+                                if kind in _RETRYABLE_KINDS:
+                                    # 11102 换模型（外层取 order 下一项）；
+                                    # 6004 是账号级额度，换号即可 —— 不能 break。
+                                    if kind in _MODEL_SWITCH_KINDS:
+                                        break
                                     await pool.rotate_backoff_async(rotate_idx)
                                     rotate_idx += 1
                                     continue
                                 return JSONResponse(status_code=r.status_code,
                                                     content={"error": {"message": text, "code": r.status_code}})
+                            # HTTP 200 但体内是错误信封（-32603 / ENOSPC）：同样要换号。
+                            if _looks_like_inband_error(r.text) or _sse_has_error_event(r.text):
+                                kind = _classify_error(200, r.text)
+                                _apply_account_policy(db2, acc_i, kind, 200, r.text[:500], model=m)
+                                _maybe_degrade(db2, acc_i)
+                                sess_i.close()
+                                POOL.release(held_uid)
+                                held_uid = ""
+                                last_err_kind = kind
+                                last_err_msg = r.text[:500]
+                                _logger.warning("上游 200 但响应体是错误（responses）kind=%s acc=%s body=%.200s",
+                                                kind, acc_i.uid or "-", r.text)
+                                if kind in _RETRYABLE_KINDS:
+                                    if kind in _MODEL_SWITCH_KINDS:
+                                        break
+                                    await pool.rotate_backoff_async(rotate_idx)
+                                    rotate_idx += 1
+                                    continue
+                                return JSONResponse(status_code=502,
+                                                    content={"error": {"message": r.text[:500],
+                                                                       "type": "upstream_error"}})
                             converter = ResponsesStreamConverter(model=model_name)
                             for line in r.text.splitlines():
                                 if not line.strip():
@@ -1726,8 +2078,10 @@ async def responses_proxy(
                 return JSONResponse(status_code=503, content={"error": {
                     "message": f"上游 WAF 拦截了网关出口 IP，已暂停轮转，请 {POOL.waf.remaining()}s 后重试",
                     "type": "waf_blocked"}})
-            return JSONResponse(status_code=503,
-                                content={"error": {"message": "所有账号/候选模型均不可用", "type": "no_model_available"}})
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": _exhaustion_message(last_err_kind, last_err_msg, 0, len(order) if order else 0),
+                                   "type": "no_model_available"}})
         finally:
             if held_uid:
                 POOL.release(held_uid)
@@ -1793,12 +2147,11 @@ async def responses_proxy(
                                     sess_i.close()
                                     POOL.release(held_uid)
                                     held_uid = ""
-                                    if kind in ("hard_credit", "session_dead", "soft_rate",
-                                                "model_rate", "model_block", "account_fault",
-                                                "not_found", "server", "waf"):
+                                    if kind in _RETRYABLE_KINDS:
                                         last_err_kind = kind
                                         last_err_msg = text
-                                        if kind in ("model_rate", "model_block"):
+                                        # 11102 换模型；6004 是账号级额度，换号即可。
+                                        if kind in _MODEL_SWITCH_KINDS:
                                             break
                                         await pool.rotate_backoff_async(rotate_idx)
                                         rotate_idx += 1
@@ -1808,8 +2161,6 @@ async def responses_proxy(
                                 final_model = m
                                 final_acc_id = acc_i.id
                                 final_uid = acc_i.uid or "-"
-                                acc_i.last_used_at = datetime.utcnow()
-                                _note_success(db2, acc_i)  # 成功清零连败计数
                                 async for line in r.aiter_lines():
                                     if not line.strip():
                                         continue
@@ -1820,11 +2171,50 @@ async def responses_proxy(
                                         delivered = True
                                         yield events
                                     raw_lines.append(line)
+                            # HTTP 200 但体内是错误信封（-32603 / ENOSPC）：
+                            # 尚未向客户端产出任何事件时可安全换号重试。
+                            _raw_text = "\n".join(raw_lines)
+                            if (_looks_like_inband_error(_raw_text) or _sse_has_error_event(_raw_text)):
+                                kind = _classify_error(200, _raw_text)
+                                if not delivered:
+                                    _apply_account_policy(db2, acc_i, kind, 200, _raw_text[:500], model=m)
+                                    _maybe_degrade(db2, acc_i)
+                                    sess_i.close()
+                                    POOL.release(held_uid)
+                                    held_uid = ""
+                                    last_err_kind = kind
+                                    last_err_msg = _raw_text[:500]
+                                    _logger.warning("上游 200 但响应体是错误（resp-stream）kind=%s acc=%s body=%.200s",
+                                                    kind, final_uid, _raw_text)
+                                    raw_lines.clear()
+                                    if kind in _RETRYABLE_KINDS:
+                                        if kind in _MODEL_SWITCH_KINDS:
+                                            break
+                                        await pool.rotate_backoff_async(rotate_idx)
+                                        rotate_idx += 1
+                                        continue
+                                    yield f"data: {json.dumps({'type': 'error', 'error': {'message': _raw_text[:500]}}, ensure_ascii=False)}\n\n"
+                                    return
+                                # 已经产出过事件：收不回来，但绝不能记成成功。
+                                latency_ms = int((time.perf_counter() - request_start) * 1000)
+                                seq = _log_chat_row(None, latency_ms, final_model, "resp", final_uid,
+                                                    200, None, error_kind=kind)
+                                _record_usage(key.id, final_acc_id, final_model, 0.0, None,
+                                              client_ip=_client_ip(request), use_case="responses",
+                                              seq=seq, latency_ms=latency_ms, error_kind=kind)
+                                sess_i.close()
+                                POOL.release(held_uid)
+                                held_uid = ""
+                                _apply_account_policy(db2, acc_i, kind, 200, _raw_text[:500], model=m)
+                                return
                             finish = converter.finish()
                             if finish:
                                 delivered = True
                                 yield finish
                             text = "\n".join(raw_lines)
+                            # 健康响应才清空连败计数并更新「最近使用」。
+                            acc_i.last_used_at = datetime.utcnow()
+                            _note_success(db2, acc_i)
                             usage = _parse_usage(text)
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
@@ -1869,9 +2259,9 @@ async def responses_proxy(
                           client_ip=_client_ip(request), use_case="responses", seq=seq, latency_ms=latency_ms,
                           error_kind=err_kind)
             if err_kind == "waf":
-                msg = f"上游 WAF 拦截了网关出口 IP，已暂停轮转（{last_err_msg}）"
+                msg = _exhaustion_message("waf", last_err_msg, 0, len(order) if order else 0)
             else:
-                msg = f"所有账号/候选模型均不可用（最后错误：{err_kind}）"
+                msg = _exhaustion_message(err_kind, last_err_msg, 0, len(order) if order else 0)
             yield f"data: {json.dumps({'type': 'error', 'error': {'message': msg, 'code': 503}}, ensure_ascii=False)}\n\n"
         finally:
             # 兜底释放租约：客户端中断流时也必须归还名额，否则该账号的在途计数
@@ -1993,6 +2383,8 @@ async def anthropic_messages(
         held_uid = ""
         try:
             rotate_idx = 0
+            last_err_kind = ""
+            last_err_msg = ""
             for m in order:
                 body = dict(chat_body)
                 body["model"] = m
@@ -2031,16 +2423,37 @@ async def anthropic_messages(
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
-                                if kind in ("hard_credit", "session_dead", "soft_rate",
-                                            "model_rate", "model_block", "account_fault",
-                                            "not_found", "server", "waf"):
-                                    if kind in ("model_rate", "model_block"):
-                                        break  # 换模型即可，该账号对别的模型仍可用
+                                last_err_kind = kind
+                                last_err_msg = text
+                                if kind in _RETRYABLE_KINDS:
+                                    if kind in _MODEL_SWITCH_KINDS:
+                                        break
                                     await pool.rotate_backoff_async(rotate_idx)
                                     rotate_idx += 1
                                     continue
                                 return JSONResponse(status_code=r.status_code,
                                                     content={"error": {"message": text, "type": "upstream_error"}})
+                            # HTTP 200 但体内是错误信封（-32603 / ENOSPC）：同样换号。
+                            if _looks_like_inband_error(r.text) or _sse_has_error_event(r.text):
+                                kind = _classify_error(200, r.text)
+                                _apply_account_policy(db2, acc_i, kind, 200, r.text[:500], model=m)
+                                _maybe_degrade(db2, acc_i)
+                                sess_i.close()
+                                POOL.release(held_uid)
+                                held_uid = ""
+                                last_err_kind = kind
+                                last_err_msg = r.text[:500]
+                                _logger.warning("上游 200 但响应体是错误（anthropic）kind=%s acc=%s body=%.200s",
+                                                kind, acc_i.uid or "-", r.text)
+                                if kind in _RETRYABLE_KINDS:
+                                    if kind in _MODEL_SWITCH_KINDS:
+                                        break
+                                    await pool.rotate_backoff_async(rotate_idx)
+                                    rotate_idx += 1
+                                    continue
+                                return JSONResponse(status_code=502,
+                                                    content={"error": {"message": r.text[:500],
+                                                                       "type": "upstream_error"}})
                             conv = AnthropicStreamConverter(model=model_name)
                             raw_lines: list[str] = []
                             for line in r.text.splitlines():
@@ -2087,8 +2500,10 @@ async def anthropic_messages(
                 return JSONResponse(status_code=503, content={"error": {
                     "message": f"上游 WAF 拦截了网关出口 IP，已暂停轮转，请 {POOL.waf.remaining()}s 后重试",
                     "type": "waf_blocked"}})
-            return JSONResponse(status_code=503,
-                                content={"error": {"message": "所有账号/候选模型均不可用", "type": "no_model_available"}})
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": _exhaustion_message(last_err_kind, last_err_msg, 0, len(order) if order else 0),
+                                   "type": "no_model_available"}})
         finally:
             if held_uid:
                 POOL.release(held_uid)
@@ -2154,12 +2569,11 @@ async def anthropic_messages(
                                     sess_i.close()
                                     POOL.release(held_uid)
                                     held_uid = ""
-                                    if kind in ("hard_credit", "session_dead", "soft_rate",
-                                                "model_rate", "model_block", "account_fault",
-                                                "not_found", "server", "waf"):
+                                    if kind in _RETRYABLE_KINDS:
                                         last_err_kind = kind
                                         last_err_msg = text
-                                        if kind in ("model_rate", "model_block"):
+                                        # 11102 换模型；6004 是账号级额度，换号即可。
+                                        if kind in _MODEL_SWITCH_KINDS:
                                             break
                                         await pool.rotate_backoff_async(rotate_idx)
                                         rotate_idx += 1
@@ -2170,8 +2584,6 @@ async def anthropic_messages(
                                 final_model = m
                                 final_acc_id = acc_i.id
                                 final_uid = acc_i.uid or "-"
-                                acc_i.last_used_at = datetime.utcnow()
-                                _note_success(db2, acc_i)  # 成功清零连败计数
                                 async for line in r.aiter_lines():
                                     if not line.strip():
                                         continue
@@ -2182,10 +2594,49 @@ async def anthropic_messages(
                                     if events:
                                         delivered = True
                                         yield events
+                            # HTTP 200 但体内是错误信封（-32603 / ENOSPC）：
+                            # 尚未产出任何事件时可安全换号重试。
+                            _raw_text = "\n".join(raw_lines)
+                            if (_looks_like_inband_error(_raw_text) or _sse_has_error_event(_raw_text)):
+                                kind = _classify_error(200, _raw_text)
+                                if not delivered:
+                                    _apply_account_policy(db2, acc_i, kind, 200, _raw_text[:500], model=m)
+                                    _maybe_degrade(db2, acc_i)
+                                    sess_i.close()
+                                    POOL.release(held_uid)
+                                    held_uid = ""
+                                    last_err_kind = kind
+                                    last_err_msg = _raw_text[:500]
+                                    _logger.warning("上游 200 但响应体是错误（anthropic-stream）kind=%s acc=%s body=%.200s",
+                                                    kind, final_uid, _raw_text)
+                                    raw_lines.clear()
+                                    if kind in _RETRYABLE_KINDS:
+                                        if kind in _MODEL_SWITCH_KINDS:
+                                            break
+                                        await pool.rotate_backoff_async(rotate_idx)
+                                        rotate_idx += 1
+                                        continue
+                                    yield conv.error_event(_raw_text[:500])
+                                    return
+                                # 已产出过事件：收不回来，但绝不记成成功。
+                                latency_ms = int((time.perf_counter() - request_start) * 1000)
+                                seq = _log_chat_row(None, latency_ms, final_model, "anthropic",
+                                                    final_uid, 200, None, error_kind=kind)
+                                _record_usage(key.id, final_acc_id, final_model, 0.0, None,
+                                              client_ip=_client_ip(request), use_case="anthropic",
+                                              seq=seq, latency_ms=latency_ms, error_kind=kind)
+                                sess_i.close()
+                                POOL.release(held_uid)
+                                held_uid = ""
+                                _apply_account_policy(db2, acc_i, kind, 200, _raw_text[:500], model=m)
+                                return
                             tail = conv.finish()
                             if tail:
                                 yield tail
                             text = "\n".join(raw_lines)
+                            # 健康响应才清空连败计数并更新「最近使用」。
+                            acc_i.last_used_at = datetime.utcnow()
+                            _note_success(db2, acc_i)
                             usage = _parse_usage(text)
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
@@ -2231,9 +2682,9 @@ async def anthropic_messages(
                           client_ip=_client_ip(request), use_case="anthropic",
                           seq=seq, latency_ms=latency_ms, error_kind=err_kind)
             if err_kind == "waf":
-                msg = f"上游 WAF 拦截了网关出口 IP，已暂停轮转（{last_err_msg}）"
+                msg = _exhaustion_message("waf", last_err_msg, 0, len(order) if order else 0)
             else:
-                msg = f"所有账号/候选模型均不可用（最后错误：{err_kind}）"
+                msg = _exhaustion_message(err_kind, last_err_msg, 0, len(order) if order else 0)
             yield AnthropicStreamConverter(model=model_name).error_event(msg, "overloaded_error")
         finally:
             if held_uid:

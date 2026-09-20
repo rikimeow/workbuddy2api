@@ -59,6 +59,7 @@
   - [10.2 并发：在途租约（把并发摊平到全池）](#102-并发在途租约把并发摊平到全池)
   - [10.3 会话粘性：同一会话固定同一账号](#103-会话粘性同一会话固定同一账号)
   - [10.4 错误分类与账号处置（一张表看懂）](#104-错误分类与账号处置一张表看懂)
+    - [10.4.1 HTTP 200 不等于成功](#1041-http-200-不等于成功)
   - [10.5 WAF：IP 级 fail-fast](#105-wafip-级-fail-fast)
   - [10.6 轮转退避：指数 + 抖动](#106-轮转退避指数--抖动)
   - [10.7 超时：最要紧的一处修复](#107-超时最要紧的一处修复)
@@ -1081,7 +1082,7 @@ workbuddy2api/
 │   ├── routers/              # accounts / app_source / client_profile / groups / growth / keys / proxy / schedules / logs / stats / sync / models
 │   └── static/index.html     # 纯 HTML + TailwindCSS + FontAwesome 管理大屏
 ├── tests/                    # 本地回归测试（.gitignore 忽略，不进仓库）
-│   ├── test_pool.py          # 号池治理 / 错误分类 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包 / 端口接管（391 项）
+│   ├── test_pool.py          # 号池治理 / 错误分类 / 200 体内错误 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包 / 端口接管（433 项）
 │   ├── test_e2e_db.py        # 真实库端到端：迁移 / 保活任务 / 选号链路（48 项）
 │   └── test_gateway_smoke.py # 真实上游端到端冒烟（9 项，会消耗少量积分）
 ├── wb_install.py             # WorkBuddy 安装位置 / 版本号 / 风控配置自动发现（不写死盘符）
@@ -1161,16 +1162,51 @@ workbuddy2api/
 
 | 分类 | 触发 | 处置 | 为什么这样处置 |
 |------|------|------|----------------|
-| `model_block` | 400/404 + `11102` | 该 (账号,模型) 负缓存，指数退避封顶 24h | 官方确定「该后端无此模型」，重试无意义 |
-| `session_dead` | `12153` / "Offline user session not found" | **连续 3 次**才禁用 | 该错误会被临时触发（上游抖动、并发刷新 token），一次就禁用等于误杀健康号 |
+| `model_block` | 400/404 + `11102` | 该 (账号,模型) 负缓存，指数退避封顶 24h；**换模型** | 官方确定「该后端无此模型」，换号重试无意义，只有换模型有效 |
+| `session_dead` | `12153` / **401** / "Offline user session not found" | **连续 3 次**才禁用 | 该错误会被临时触发（上游抖动、并发刷新 token），一次就禁用等于误杀健康号；401 token 过期换号即可恢复 |
 | `account_fault` | `11140` / `14017` | 冷却 30 分钟后换号 | 账号级授权故障，常带 429 状态码，**必须先于限流判定** |
-| `model_rate` | `6004` | **只冷却该模型** | 「切个模型就能用」的号不该被整体摘出池子 |
+| `model_rate` | `6004` | **只冷却该模型**，然后**换号继续** | 6004 是**账号级**额度，换号就能继续；「切个模型就能用」的号也不该被整体摘出池子 |
 | `hard_credit` | 402/412 或余额文案 | 冷却到**次日 04:00** | 日额度在凌晨重置，04:00 是重置完成后的安全时点 |
 | `soft_rate` | 429 | 有重置时间就精确对齐，否则有界指数退避（封顶 2h） | 精确对齐避免把全池推到封顶 |
+| `upstream_internal` | **HTTP 200 但体内是错误信封**（JSON-RPC `-32603` / `ENOSPC` / `error` 字段） | 15s 短冷却 + 换号重试 + 连败计数 | 见 10.4.1。上游会把内部故障塞进 200 响应，只看状态码会误判成成功 |
 | `waf` | 403 且**无业务信封** | 短冷却 + IP 级 fail-fast | 见 11.5 |
-| `server` | 5xx | 熔断，指数退避封顶 6h | 比原「累计 5 次固定 10 分钟」更贴合：固定时长对持续坏的号太短、对偶发又太长 |
+| `server` | 5xx / **408 / 425** | 熔断，指数退避封顶 6h | 比原「累计 5 次固定 10 分钟」更贴合：固定时长对持续坏的号太短、对偶发又太长；408/425 是瞬时错误，绝不能算客户端错误 |
 | `not_found` | 404 | 60s 短冷却，**不累计** errCount | 防雪崩 |
 | `transport`/`client` | 网络抖动 / 其它 4xx | 只记时间 + 连败计数 | 不是账号的错，不叠加权威惩罚 |
+
+分类元组集中定义在 `_RETRYABLE_KINDS` / `_MODEL_SWITCH_KINDS`，五处轮转循环
+**共用同一份**（`test_rotation_call_sites_share_one_policy` 静态校验）。
+历史教训：每处各复制一份列表，改了一处漏了另一处，就会出现「某条路径报错但不换号」这种极难复现的漂移 bug。
+
+#### 10.4.1 HTTP 200 不等于成功
+
+上游会把**内部故障**塞进 HTTP 200 的响应体里返回，例如客户端看到的
+`Error Code: 10000`，其底层是：
+
+```json
+{"code":-32603,"message":"Internal error",
+ "data":{"details":"ENOSPC: no space left on device, write","category":"internal"}}
+```
+
+**只看 HTTP 状态码的实现会把这种响应当成成功** —— 于是既不换号、也不重试、
+不记任何失败日志，客户端却拿到一个错误体。这正是「接口直接报错了但没有重试切换其它账号」的根因。
+
+三层修复：
+
+1. **分类**：`_classify_error(200, body)` 现在会解析响应体，识别 `error` 字段、
+   负 `code`（JSON-RPC）、`category: internal` 与 `ENOSPC` 等标记，归为 `upstream_internal`。
+   该判定**放在最后一层**，因此具体业务码（6004 / 11102 / 12153…）优先级更高。
+2. **不误判**：判定基于**解析后的结构**而非原始字节 substring，
+   所以模型正常回答里出现 "internal error" / "ENOSPC" 这几个字**不会**被当成失败
+   （`test_inband_error_detection` 有反向用例）。
+3. **提交前探测**：流式响应一旦把字节发给客户端就无法换号了。因此现在先缓冲，
+   直到 `_sse_has_content()` 确认真实正文增量（`delta.content` / `reasoning_content` /
+   `text_delta`）才提交；只含 `role` 等元信息的帧不算正文。若整条流结束时发现
+   体内是错误且**尚未提交**，就换号重试；缓冲上限 `_INBAND_PROBE_MAX`（64 KB）
+   保证正常流不会被无限期憋住。
+   若错误到达时已经提交过字节（收不回来），则**如实记为失败**而不是记成功，
+   并给账号打上冷却 —— 绝不再把失败伪装成 `error_kind="success"`。
+
 
 两个防累积设计：
 
@@ -1588,7 +1624,7 @@ cache miss     5.2 ms      每 30 秒最多一次
 ### 10.12 这批改动的验证
 
 ```bash
-.venv\Scripts\python.exe tests\test_pool.py            # 391 项，不依赖库/网络
+.venv\Scripts\python.exe tests\test_pool.py            # 433 项，不依赖库/网络
 .venv\Scripts\python.exe test_upstream_compat.py       #  74 项，上游协议兼容/思考开关（本地文件，不入仓库）
 .venv\Scripts\python.exe tests\test_e2e_db.py          #  48 项，连真实 MySQL（只读 + 幂等迁移）
 .venv\Scripts\python.exe tests\test_gateway_smoke.py   #   9 项，真实上游端到端（会消耗少量积分）
@@ -1667,7 +1703,7 @@ cache miss     5.2 ms      每 30 秒最多一次
 - 客户端参数档案（UA / 版本号 / 风控头 / 桌面指纹）的**探测→保存→生效→同步**闭环；
 - 后台一键拆包与路径自动补齐（`ADMIN_DEV_TOOLS`）；
 - `create_canvas` 的真实 id 口径与两段式状态机（`accept` → 完成 → `claim`）；
-- 全部测试（`test_pool.py` 391 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
+- 全部测试（`test_pool.py` 433 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
 
 ### 如果引用有误
 
