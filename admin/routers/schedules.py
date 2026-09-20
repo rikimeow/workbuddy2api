@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from admin.db import get_db
 from admin.models import Schedule
-from admin.scheduler import run_task
+from admin.scheduler import run_task, _dump_result
 from admin.security import require_admin
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
@@ -21,6 +21,7 @@ TASK_LABELS = {
     "daily_checkin": "每日签到领取积分",
     "refresh_growth_tasks": "每日更新成长任务列表",
     "run_growth_tasks": "每日自动做成长任务",
+    "keepalive_tokens": "token 保活（按整点）",
 }
 
 
@@ -127,14 +128,26 @@ def toggle_schedule(sid: int, _: bool = Depends(require_admin), db: Session = De
 
 @router.post("/{sid}/run")
 def run_now(sid: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """立即执行一次（后台「执行」按钮）。
+
+    与调度器写的是同一份 last_result —— 所以必须复用 `_dump_result`，
+    不能在这里再写一次 `json.dumps(...)[:500]`：截断会产出非法 JSON，
+    前端 `JSON.parse` 失败，用户就看到「一堆 json 数据」（其实是半个）。
+    """
     s = db.query(Schedule).filter(Schedule.id == sid).first()
     if not s:
         raise HTTPException(status_code=404, detail="任务不存在")
     now = datetime.utcnow()
-    _run = run_task(s.task, db, s)
+    try:
+        _run = run_task(s.task, db, s)
+        s.last_result = _dump_result(_run)
+    except Exception as e:
+        # 手动执行失败同样要落库，否则界面还显示上一次的成功结果，
+        # 用户会以为这次也成功了。
+        _run = {"ok": False, "error": str(e)}
+        s.last_result = _dump_result(_run)
     s.last_run_at = now
     s.next_run_at = now + timedelta(minutes=s.interval_minutes or 60)
-    s.last_result = __import__("json").dumps(_run, ensure_ascii=False)[:500]
     db.commit()
     return {"id": s.id, "result": _run}
 

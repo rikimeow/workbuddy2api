@@ -19,6 +19,63 @@ from admin.config import settings
 #: 账号间保活节流间隔（秒），从配置读取，缺省 0.8。
 _KEEPALIVE_ACCOUNT_GAP = settings.KEEPALIVE_ACCOUNT_GAP
 
+#: last_result 是 TEXT，存得下完整 JSON；但仍给一个上限，
+#: 防止某个任务的明细异常膨胀把这一行撑爆。
+_RESULT_LIMIT = 20000
+
+
+def _account_label(a) -> str:
+    """给账号起个**人认得出**的短标签。
+
+    后台只显示 `acc12` 的话，用户看到「acc12 没领成功」还得自己去号池里
+    对 id，等于没说。优先用账号名（多数是手机号或昵称），没有才退回 id。
+    手机号做脱敏：中间四位打码，既够辨认又不把完整号码写进结果里
+    （结果会被截图、也会随日志流转）。
+    """
+    name = str(getattr(a, "name", "") or "").strip()
+    if name:
+        if len(name) == 11 and name.isdigit():
+            return f"{name[:3]}****{name[-4:]}"
+        return name[:20]
+    return f"账号#{getattr(a, 'id', '?')}"
+
+
+def _short_error(e) -> str:
+    """把异常压成一句可读原因（去掉类名前缀与多余空白）。"""
+    msg = str(e).strip() or e.__class__.__name__
+    return msg[:160]
+
+
+def _dump_result(result: dict) -> str:
+    """序列化任务结果。
+
+    这里**绝不能截断 JSON 字符串**：以前是 `json.dumps(...)[:500]`，
+    一截断就成了非法 JSON，前端 `JSON.parse` 直接失败，用户看到的是
+    一段被腰斩的原始文本 —— 正是「别只显示一堆 json 数据」的成因之一。
+    超长时改为丢弃明细数组里的项，保住 JSON 结构完整。
+    """
+    try:
+        text = json.dumps(result, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return json.dumps({"ok": False, "error": "结果无法序列化"},
+                          ensure_ascii=False)
+    if len(text) <= _RESULT_LIMIT:
+        return text
+    # 超长：先砍 detail（逐账号明细），保留计数与 summary
+    slim = dict(result)
+    detail = slim.get("detail")
+    if isinstance(detail, list):
+        for keep in (50, 20, 5, 0):
+            slim["detail"] = detail[:keep]
+            slim["detail_truncated"] = True
+            text = json.dumps(slim, ensure_ascii=False)
+            if len(text) <= _RESULT_LIMIT:
+                return text
+    slim.pop("detail", None)
+    text = json.dumps(slim, ensure_ascii=False)
+    return text if len(text) <= _RESULT_LIMIT else text[:_RESULT_LIMIT - 40] + '"}'
+
+
 
 def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
     """执行某个任务，返回结果摘要字典。"""
@@ -26,16 +83,27 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         from admin.routers import accounts as acc_router
         from admin.models import Account
         ok = fail = 0
+        failed_names: list[str] = []
         for a in db.query(Account).filter(Account.status == "active").all():
             if acc_router._refresh_balance(a):
                 ok += 1
             else:
                 fail += 1
+                failed_names.append(_account_label(a))
             db.commit()
-        return {"task": task, "refreshed": ok, "failed": fail}
+        return {"task": task, "ok": True, "refreshed": ok, "failed": fail,
+                "failed_accounts": failed_names[:10],
+                "summary": (f"刷新成功 {ok} 个账号"
+                            + (f"，{fail} 个失败：{'、'.join(failed_names[:3])}"
+                               if fail else ""))}
     if task == "sync_models":
         from admin.routers import models as models_router
-        return models_router._do_sync_models(db)
+        res = models_router._do_sync_models(db)
+        if isinstance(res, dict) and "summary" not in res:
+            res["summary"] = (f"新增 {res.get('added', 0)} 个、"
+                              f"更新 {res.get('updated', 0)} 个，"
+                              f"共 {res.get('total_in_db', 0)} 个模型")
+        return res
     if task == "daily_checkin":
         return run_daily_checkin(db, schedule)
     if task == "refresh_growth_tasks":
@@ -136,9 +204,17 @@ def run_keepalive_tokens(db) -> dict:
                 except Exception:
                     pass
 
+    summary = f"保活成功 {ok}/{total}"
+    if refreshed:
+        summary += f"，其中 {refreshed} 个刷新了 token"
+    if dead_disabled:
+        summary += f"，{dead_disabled} 个登录态失效已禁用"
+    if failed and not dead_disabled:
+        summary += f"，{failed} 个失败"
     return {"task": "keepalive_tokens", "ok": True, "total": total,
             "alive": ok, "refreshed": refreshed, "failed": failed,
-            "disabled": dead_disabled, "errors": errors}
+            "disabled": dead_disabled, "errors": errors,
+            "summary": summary}
 
 
 
@@ -194,7 +270,27 @@ def run_growth_tasks() -> dict:
                 for t in (a.get("tasks") or []) if t.get("ok") and not t.get("skipped"))
     failed_acc = [a["account_id"] for a in results if not a.get("ok")]
 
-    return {
+    # 逐账号明细：失败原因同样要落到具体账号上，而不是只给一个数字
+    labels = {a.id: _account_label(a) for a in accounts}
+    detail = []
+    for r in results:
+        aid = r.get("account_id")
+        label = labels.get(aid, f"账号#{aid}")
+        credit_i = int(r.get("credit") or 0)
+        n_done = sum(1 for t in (r.get("tasks") or [])
+                     if t.get("ok") and not t.get("skipped"))
+        if r.get("ok"):
+            detail.append({"account_id": aid, "account": label,
+                           "ok": True, "credit": credit_i,
+                           "tasks_done": n_done,
+                           "reason": f"完成 {n_done} 个任务、+{credit_i} 积分"
+                           if n_done else "无待做任务"})
+        else:
+            detail.append({"account_id": aid, "account": label,
+                           "ok": False, "credit": credit_i, "tasks_done": n_done,
+                           "reason": _short_error(r.get("error") or "未知原因")})
+
+    result = {
         "task": "run_growth_tasks",
         "ok": True,
         "accounts": len(ids),
@@ -203,7 +299,31 @@ def run_growth_tasks() -> dict:
         "energy": energy,
         "failed_accounts": failed_acc[:10],
         "elapsed_s": round((datetime.utcnow() - started).total_seconds(), 1),
+        "detail": detail,
     }
+    result["summary"] = _growth_summary(result)
+    return result
+
+
+def _growth_summary(r: dict) -> str:
+    """成长任务结果的一句话摘要。"""
+    parts = []
+    done = r.get("tasks_done") or 0
+    if done:
+        parts.append(f"完成 {done} 个任务")
+    if r.get("credit"):
+        parts.append(f"+{r['credit']} 积分")
+    if r.get("energy"):
+        parts.append(f"+{r['energy']} 能量")
+    if not done:
+        parts.append("本轮无待做任务")
+    bad = [d for d in (r.get("detail") or []) if not d.get("ok")]
+    if bad:
+        who = "；".join(f"{d['account']}（{d['reason']}）" for d in bad[:3])
+        more = f" 等 {len(bad)} 个" if len(bad) > 3 else ""
+        parts.append(f"{len(bad)} 个账号失败：{who}{more}")
+    return "，".join(parts)
+
 
 
 def run_refresh_growth_tasks() -> dict:
@@ -224,24 +344,29 @@ def run_refresh_growth_tasks() -> dict:
         return {"task": "refresh_growth_tasks", "ok": False, "error": str(e)}
 
     tasks = data.get("tasks") or []
+    actionable = sum(1 for t in tasks if t.get("actionable"))
     return {
         "task": "refresh_growth_tasks",
         "ok": True,
         "total": len(tasks),
-        "actionable": sum(1 for t in tasks if t.get("actionable")),
+        "actionable": actionable,
         "synced_at": data.get("synced_at"),
         "source_account_id": data.get("source_account_id"),
+        "summary": f"共 {len(tasks)} 个任务，其中 {actionable} 个可自动完成",
     }
 
 
 def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
-    """遍历活跃账号执行每日签到领取 100 积分。
+    """遍历活跃账号执行每日签到领取积分。
 
     风控要点：
       - 全部请求经 CredentialManager 注入 X-Device-Token（与桌面端一致）。
       - 若任务配置了 stop_after（下次停止领取时间），到达后直接跳过，不再发领取请求，
         避免活动下线后继续请求触发上游风控。
       - 若某账号领取返回 EventEnded(1003)，自动把 stop_after 设为今天，后续不再尝试。
+
+    结果里除了计数，还逐账号记录「领到多少分 / 没领成功的原因」：
+    只给一个 `failed: 3` 等于没说 —— 用户真正想知道的是**哪个号**失败了、**为什么**。
     """
     from admin.models import Account
     from admin.backend import AccountSession
@@ -251,48 +376,115 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
     # 停止领取时间：到达则跳过
     if schedule is not None and schedule.stop_after is not None:
         if now > schedule.stop_after:
-            return {"task": "daily_checkin", "skipped": "已超过停止领取时间，不再请求",
+            return {"task": "daily_checkin", "ok": True,
+                    "skipped": "已超过停止领取时间，不再请求",
                     "stop_after": schedule.stop_after.isoformat()}
 
+    accounts = (db.query(Account).filter(Account.status == "active")
+                .order_by(Account.id.asc()).all())
+    if not accounts:
+        return {"task": "daily_checkin", "ok": True, "total": 0,
+                "msg": "没有可用账号"}
+
     claimed = skipped_already = failed = 0
+    total_credit = 0
     ended = False
-    errors: list[str] = []
-    for a in db.query(Account).filter(Account.status == "active").all():
+    errors: list[str] = []          # 保留旧字段，兼容既有调用方
+    detail: list[dict] = []         # 新增：逐账号明细（供后台展示）
+
+    for a in accounts:
+        label = _account_label(a)
         try:
             with AccountSession(a.auth_json) as sess:
                 st = sess.get_checkin_status()
                 if st.get("today_checked_in"):
                     skipped_already += 1
+                    detail.append({"account_id": a.id, "account": label,
+                                   "ok": True, "status": "already",
+                                   "credit": 0, "reason": "今日已领过"})
                 else:
                     res = sess.claim_daily_checkin()
                     if res.get("ok"):
+                        credit = int(res.get("credit") or 0)
                         claimed += 1
+                        total_credit += credit
+                        detail.append({
+                            "account_id": a.id, "account": label, "ok": True,
+                            "status": "claimed", "credit": credit,
+                            "streak_days": int(res.get("streak_days") or 0),
+                            "reason": f"+{credit} 积分",
+                        })
                     elif res.get("status") == "event_ended":
                         ended = True
                         failed += 1
-                        errors.append(f"acc{a.id}:活动已结束")
+                        reason = "活动已结束"
+                        errors.append(f"{label}:{reason}")
+                        detail.append({"account_id": a.id, "account": label,
+                                       "ok": False, "status": "event_ended",
+                                       "credit": 0, "reason": reason})
                     else:
                         failed += 1
-                        errors.append(f"acc{a.id}:{res.get('status') or res.get('msg')}")
+                        reason = res.get("status") or res.get("msg") or "未知原因"
+                        errors.append(f"{label}:{reason}")
+                        detail.append({"account_id": a.id, "account": label,
+                                       "ok": False, "status": "failed",
+                                       "credit": 0, "reason": str(reason)})
                 # 写回可能已刷新的 token（签到请求会触发鉴权头刷新）
                 a.auth_json = sess.updated_json()
         except Exception as e:
             failed += 1
-            errors.append(f"acc{a.id}:{e}")
+            reason = _short_error(e)
+            errors.append(f"{label}:{reason}")
+            detail.append({"account_id": a.id, "account": label, "ok": False,
+                           "status": "error", "credit": 0, "reason": reason})
 
     # 发现活动已结束：自动把停止时间设为今天，防止后续继续请求
     if ended and schedule is not None:
         schedule.stop_after = now
         db.commit()
 
-    return {
+    result = {
         "task": "daily_checkin",
+        "ok": True,
+        "total": len(accounts),
         "claimed": claimed,
         "skipped_already": skipped_already,
         "failed": failed,
+        "credit": total_credit,
         "activity_ended": ended,
         "errors": errors[:10],
+        "detail": detail,
     }
+    result["summary"] = _checkin_summary(result)
+    return result
+
+
+def _checkin_summary(r: dict) -> str:
+    """把签到结果写成一句人话，后台直接显示这句。"""
+    if r.get("skipped"):
+        return f"已跳过：{r['skipped']}"
+    if r.get("msg"):
+        return r["msg"]
+    parts = []
+    claimed = r.get("claimed") or 0
+    credit = r.get("credit") or 0
+    if claimed:
+        parts.append(f"今日新领 {claimed} 个账号，共 +{credit} 积分")
+    already = r.get("skipped_already") or 0
+    if already:
+        parts.append(f"{already} 个今日已领过")
+    failed = r.get("failed") or 0
+    if failed:
+        # 带上具体是哪个号、什么原因 —— 这才是用户要的信息
+        bad = [d for d in (r.get("detail") or []) if not d.get("ok")]
+        who = "；".join(f"{d['account']}（{d['reason']}）" for d in bad[:3])
+        more = f" 等 {len(bad)} 个" if len(bad) > 3 else ""
+        parts.append(f"{failed} 个未领成功：{who}{more}" if who
+                     else f"{failed} 个未领成功")
+    if r.get("activity_ended"):
+        parts.append("活动已结束，已自动停止")
+    return "，".join(parts) if parts else "无可领取账号"
+
 
 
 def _run_one(s: Schedule, db, now: datetime):
@@ -305,9 +497,10 @@ def _run_one(s: Schedule, db, now: datetime):
         return
     try:
         result = run_task(s.task, db, s)
-        s.last_result = json.dumps(result, ensure_ascii=False)[:500]
+        s.last_result = _dump_result(result)
     except Exception as e:  # 单个任务失败不影响调度循环
-        s.last_result = f"执行失败: {e}"[:500]
+        s.last_result = json.dumps(
+            {"ok": False, "error": _short_error(e)}, ensure_ascii=False)[:2000]
     s.last_run_at = now
     if s.task == "keepalive_tokens":
         s.next_run_at = _next_keepalive_at(now)

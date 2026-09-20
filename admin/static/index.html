@@ -353,6 +353,29 @@
         </div>
       </div>
       <p class="text-xs text-slate-400 mb-3">统计平台全部 Key 的用量：请求数、Token、积分与平均耗时。数据来自本地 usage_logs，随请求实时累计。</p>
+
+      <!-- 筛选：按 Key / 模型 / 端点。筛选后所有图与卡片同步变化。 -->
+      <div class="card p-3 mb-4">
+        <div class="flex flex-wrap gap-2 items-end">
+          <div class="flex-1 min-w-[150px]">
+            <div class="text-[11px] text-slate-400 mb-1">按 Key</div>
+            <div id="usageKeySel"></div>
+          </div>
+          <div class="flex-1 min-w-[150px]">
+            <div class="text-[11px] text-slate-400 mb-1">按模型</div>
+            <div id="usageModelSel"></div>
+          </div>
+          <div class="flex-1 min-w-[150px]">
+            <div class="text-[11px] text-slate-400 mb-1">按端点</div>
+            <div id="usageCaseSel"></div>
+          </div>
+          <button onclick="resetUsageFilters()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50 whitespace-nowrap">
+            <i class="fa-solid fa-filter-circle-xmark mr-1"></i> 清除筛选
+          </button>
+        </div>
+        <div id="usageFilterHint" class="text-[11px] text-slate-400 mt-2 hidden"></div>
+      </div>
+
       <div id="usageOverview" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4"></div>
       <div class="grid md:grid-cols-2 gap-4 mb-4">
         <div class="card p-4">
@@ -2676,23 +2699,49 @@ async function changePassword(){
 
 /* ==================== 定时任务 ==================== */
 let _schedules = [];
+
+// 任务类型 -> 人话名称。结果里有 summary 就用它，这样每个任务都统一可读。
+// keepalive_tokens 是既有任务（保活）但两张表都漏了它，显得像"未知任务"。
+const TASK_LABELS = {
+  daily_checkin: "每日签到领取积分",
+  refresh_balances: "刷新平台总积分",
+  sync_models: "同步模型列表",
+  refresh_growth_tasks: "更新成长任务列表",
+  run_growth_tasks: "自动做成长任务",
+  keepalive_tokens: "token 保活（按整点）",
+};
+
 function scheduleResultSummary(s){
   const raw = s.last_result || "";
   if(!raw) return '<span class="text-slate-400">尚未运行</span>';
   let obj = null;
   try { obj = JSON.parse(raw); } catch(e) {}
-  if(!obj) return `<span class="text-slate-500">${esc(raw.slice(0,120))}</span>`;
+  // 解析失败：多半是历史数据（旧版会截断 JSON）。如实说明，别假装是数据。
+  if(!obj) {
+    return `<span class="text-amber-600" title="历史结果格式已不可解析">
+      <i class="fa-solid fa-triangle-exclamation mr-1"></i>历史结果（旧格式，点详情查看）</span>`;
+  }
   if(obj.error) return `<span class="text-red-500">失败：${esc(String(obj.error))}</span>`;
+  if(obj.skipped) return `<span class="text-slate-500">已跳过：${esc(String(obj.skipped))}</span>`;
+
+  // 后端已经给出人话摘要 —— 优先用它，避免前后端两套口径不一致
+  if(obj.summary){
+    const bad = (obj.detail||[]).filter(x=>!x.ok).length;
+    const cls = bad ? "text-amber-700" : "text-slate-600";
+    const elapsed = obj.elapsed_s ? `<span class="text-slate-400 ml-1">${obj.elapsed_s}s</span>` : "";
+    return `<span class="${cls}">${esc(String(obj.summary))}</span>${elapsed}`;
+  }
+
+  // 兜底：老数据没有 summary 时，按类型拼
   let parts = [];
   if(s.task === "daily_checkin"){
-    if(obj.skipped) parts.push(`已跳过(${esc(obj.skipped)})`);
-    else parts.push(`领取 ${obj.claimed||0}`);
+    if(obj.claimed) parts.push(`新领 ${obj.claimed}`);
+    if(obj.credit) parts.push(`<span class="text-amber-600 font-medium">+${obj.credit} 积分</span>`);
     parts.push(`已领 ${obj.skipped_already||0}`);
-    if(obj.failed) parts.push(`失败 ${obj.failed}`);
-    if(obj.activity_ended) parts.push(`活动已结束`);
+    if(obj.failed) parts.push(`<span class="text-red-500">失败 ${obj.failed}</span>`);
   } else if(s.task === "refresh_balances"){
     parts.push(`刷新 ${obj.refreshed||0}`);
-    if(obj.failed) parts.push(`失败 ${obj.failed}`);
+    if(obj.failed) parts.push(`<span class="text-red-500">失败 ${obj.failed}</span>`);
   } else if(s.task === "sync_models"){
     parts.push(`新增 ${obj.added||0}`);
     parts.push(`更新 ${obj.updated||0}`);
@@ -2706,20 +2755,99 @@ function scheduleResultSummary(s){
     if(obj.credit) parts.push(`<span class="text-amber-600 font-medium">+${obj.credit} 积分</span>`);
     if(obj.energy) parts.push(`+${obj.energy} 能量`);
     if(!obj.tasks_done) parts.push("无待做");
-    if(obj.failed_accounts && obj.failed_accounts.length) parts.push(`<span class="text-red-500">失败 ${obj.failed_accounts.length}</span>`);
+  } else if(s.task === "keepalive_tokens"){
+    parts.push(`成功 ${obj.alive||0}/${obj.total||0}`);
+    if(obj.disabled) parts.push(`<span class="text-red-500">禁用 ${obj.disabled}</span>`);
   } else {
     parts.push(esc(raw.slice(0,120)));
   }
   const fmt = obj.elapsed_s ? `<span class="text-slate-400 ml-1">${obj.elapsed_s}s</span>` : "";
   return `<span class="text-slate-600">${parts.join(" · ")}</span>${fmt}`;
 }
+
+// 详情弹窗：把 JSON 变成「概览 + 逐账号表格 + 原因」，而不是一坨 JSON
 function showScheduleResult(id){
   const s = (_schedules||[]).find(x => x.id === id);
   if(!s) return;
-  let pretty = s.last_result || "（无）";
-  try { pretty = JSON.stringify(JSON.parse(s.last_result), null, 2); } catch(e){}
-  openModal(`<h3 class="font-bold mb-2"><i class="fa-solid fa-circle-info mr-1"></i> 上次运行结果 — ${esc(s.name)}</h3>
-    <pre class="text-xs bg-slate-50 rounded-lg p-3 overflow-auto max-h-[60vh] whitespace-pre-wrap">${esc(pretty)}</pre>
+  const raw = s.last_result || "";
+  let obj = null;
+  try { obj = JSON.parse(raw); } catch(e) {}
+
+  const title = esc(TASK_LABELS[s.task] || s.name || "任务");
+  const head = `<h3 class="font-bold mb-3"><i class="fa-solid fa-circle-info mr-1"></i>
+      上次运行结果 — ${esc(s.name)}</h3>`;
+
+  if(!obj){
+    // 旧格式：给出原文，并说明为什么不能结构化展示
+    openModal(`${head}
+      <p class="text-xs text-amber-600 mb-2">该结果由旧版本写入（JSON 被截断，无法解析），
+      仅能显示原文；下次运行后即为可读格式。</p>
+      <pre class="text-xs bg-slate-50 rounded-lg p-3 overflow-auto max-h-[60vh] whitespace-pre-wrap">${esc(raw||"（无）")}</pre>
+      <div class="flex justify-end mt-3"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
+    return;
+  }
+
+  // 概览行：把标量字段挑出来展示（跳过 detail/errors 这类复杂字段）
+  const skip = new Set(["detail","errors","failed_accounts","task"]);
+  const kv = Object.entries(obj).filter(([k,v]) =>
+      !skip.has(k) && (typeof v !== "object" || v === null));
+  const ovHtml = kv.length ? `<div class="grid grid-cols-2 md:grid-cols-3 gap-2 mb-3">
+      ${kv.map(([k,v]) => `<div class="bg-slate-50 rounded-lg px-3 py-2">
+        <div class="text-[11px] text-slate-400">${esc(k)}</div>
+        <div class="text-sm font-medium text-slate-700">${esc(String(v))}</div>
+      </div>`).join("")}
+    </div>` : "";
+
+  // 摘要单独突出显示
+  const sumHtml = obj.summary
+    ? `<div class="mb-3 text-sm bg-emerald-50 text-emerald-800 rounded-lg px-3 py-2">
+         ${esc(String(obj.summary))}</div>` : "";
+
+  // 逐账号明细表（签到/成长任务最关键的信息）
+  let detailHtml = "";
+  if(Array.isArray(obj.detail) && obj.detail.length){
+    const rows = obj.detail.map(d => {
+      const ok = d.ok;
+      const icon = ok
+        ? '<i class="fa-solid fa-circle-check text-emerald-500"></i>'
+        : '<i class="fa-solid fa-circle-xmark text-red-500"></i>';
+      const credit = d.credit ? `<span class="text-amber-600 font-medium">+${d.credit}</span>` : "—";
+      return `<tr class="border-t">
+        <td class="py-1.5 pr-2">${icon}</td>
+        <td class="py-1.5 pr-3 text-slate-700">${esc(String(d.account ?? d.account_id ?? ""))}</td>
+        <td class="py-1.5 pr-3">${credit}</td>
+        <td class="py-1.5 text-slate-600">${esc(String(d.reason ?? ""))}</td>
+      </tr>`;
+    }).join("");
+    const trunc = obj.detail_truncated
+      ? `<p class="text-[11px] text-slate-400 mt-1">明细过长，仅显示前 ${obj.detail.length} 条。</p>` : "";
+    detailHtml = `<div class="mb-2">
+      <div class="text-xs font-semibold text-slate-500 mb-1">逐账号结果</div>
+      <div class="max-h-64 overflow-auto rounded-lg border">
+        <table class="w-full text-xs"><tbody>${rows}</tbody></table>
+      </div>${trunc}</div>`;
+  }
+
+  // 失败账号名单（成长任务用它，没有 detail 时也有信息）
+  let failHtml = "";
+  if(Array.isArray(obj.failed_accounts) && obj.failed_accounts.length && !detailHtml){
+    failHtml = `<div class="mb-2 text-xs"><span class="text-slate-500">失败账号：</span>
+      <span class="text-red-500">${obj.failed_accounts.map(esc).join("、")}</span></div>`;
+  }
+  let errHtml = "";
+  if(Array.isArray(obj.errors) && obj.errors.length){
+    errHtml = `<details class="mb-2"><summary class="text-xs text-slate-500 cursor-pointer">
+      错误明细（${obj.errors.length}）</summary>
+      <pre class="text-[11px] bg-slate-50 rounded-lg p-2 mt-1 overflow-auto max-h-40 whitespace-pre-wrap">${esc(obj.errors.join("\n"))}</pre>
+      </details>`;
+  }
+
+  // 原始 JSON 收进折叠区：需要时才看，不占主视觉
+  const rawHtml = `<details class="mt-2"><summary class="text-xs text-slate-400 cursor-pointer">原始 JSON</summary>
+      <pre class="text-[11px] bg-slate-50 rounded-lg p-2 mt-1 overflow-auto max-h-40 whitespace-pre-wrap">${esc(JSON.stringify(obj,null,2))}</pre>
+    </details>`;
+
+  openModal(`${head}${sumHtml}${ovHtml}${detailHtml}${failHtml}${errHtml}${rawHtml}
     <div class="flex justify-end mt-3"><button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button></div>`);
 }
 async function loadSchedules(){
@@ -3165,51 +3293,174 @@ function trendChart(rows) {
     </div>`;
 }
 
-/* 使用记录工具栏的两个下拉：首次进入时渲染一次 */
+/* 使用记录工具栏的下拉：首次进入时渲染一次；
+ * Key/模型/端点三个筛选下拉的选项来自「窗口内真实出现过的值」。 */
 let _usageSelReady = false;
+let _usageFilterReady = false;
+// 筛选下拉的选项缓存。声明必须在使用它的 _usageQuery / loadUsageFilterOptions
+// **之前**：虽是顶层 let（会被提升到 TDZ），但函数可能在任何位置被调用，
+// 声明靠后容易踩「Cannot access before initialization」。放前面最省心。
+let _usageOpts = { keys: [], models: [], use_cases: [] };
+
 function initUsageSelects() {
   if (_usageSelReady) return;
   _usageSelReady = true;
   const daysBox = $("#usageDaysSel");
   if (daysBox) daysBox.outerHTML = uiSelectHTML("usageDaysSel", {
-    value: "14",
+    // 默认近 1 天 + 按小时：最常见的诉求是「今天怎么样」，
+    // 默认 14 天会把当天异常稀释进两周曲线里
+    value: "1",
     options: [
       { value: "1", label: "近 1 天" },
+      { value: "3", label: "近 3 天" },
       { value: "7", label: "近 7 天" },
       { value: "14", label: "近 14 天" },
       { value: "30", label: "近 30 天" },
       { value: "90", label: "近 90 天" },
     ],
-    onChange: () => loadUsageStats(),
+    onChange: () => { loadUsageFilterOptions(); loadUsageStats(); },
   });
   const gBox = $("#usageGrainSel");
   if (gBox) gBox.outerHTML = uiSelectHTML("usageGrainSel", {
-    value: "day",
+    value: "hour",
     options: [
-      { value: "day", label: "按天" },
       { value: "hour", label: "按小时" },
+      { value: "day", label: "按天" },
     ],
     onChange: () => loadUsageStats(),
   });
 }
 
+// 渲染 Key/模型/端点筛选下拉。
+// 选项只列窗口内真实出现过的值 —— 否则下拉里塞满从没用过的模型，
+// 选中后筛出空结果，用户会以为"功能坏了"。
+async function loadUsageFilterOptions() {
+  const days = uiSelectValue("usageDaysSel") || 1;
+  let opts = { models: [], use_cases: [], keys: [] };
+  try {
+    const r = await api(`/api/stats/usage/options?days=${days}`);
+    const { ok, data } = await safeJson(r);
+    if (ok) opts = data || opts;
+  } catch (e) { /* 选项拉取失败不阻塞统计展示 */ }
+  _usageOpts = opts;
+
+  // 保留当前选择；但若该值本次不在选项里（换了时间窗后消失），
+  // 必须回落到"全部"，否则会出现「标签写着全部、实际仍在筛选」的假象。
+  const keep = (id, val, list) =>
+    (val && list.some(x => String(x) === val)) ? val : "";
+
+  const curKey = uiSelectValue("usageKeySel") || "";
+  const curModel = uiSelectValue("usageModelSel") || "";
+  const curCase = uiSelectValue("usageCaseSel") || "";
+  const keyVals = (opts.keys || []).map(k => String(k.id));
+
+  const keyBox = $("#usageKeySel");
+  if (keyBox) {
+    keyBox.outerHTML = uiSelectHTML("usageKeySel", {
+      value: keep("usageKeySel", curKey, keyVals),
+      options: [{ value: "", label: "全部 Key" }].concat(
+        (opts.keys || []).map(k => ({ value: String(k.id), label: k.name || ("#" + k.id) }))),
+      onChange: () => loadUsageStats(),
+    });
+  }
+  const mBox = $("#usageModelSel");
+  if (mBox) {
+    mBox.outerHTML = uiSelectHTML("usageModelSel", {
+      value: keep("usageModelSel", curModel, opts.models || []),
+      options: [{ value: "", label: "全部模型" }].concat(
+        (opts.models || []).map(m => ({ value: m, label: m }))),
+      onChange: () => loadUsageStats(),
+    });
+  }
+  const cBox = $("#usageCaseSel");
+  if (cBox) {
+    cBox.outerHTML = uiSelectHTML("usageCaseSel", {
+      value: keep("usageCaseSel", curCase, opts.use_cases || []),
+      options: [{ value: "", label: "全部端点" }].concat(
+        (opts.use_cases || []).map(c => ({ value: c, label: c }))),
+      onChange: () => loadUsageStats(),
+    });
+  }
+  _usageFilterReady = true;
+}
+
+function resetUsageFilters() {
+  // 必须走 uiSelectSet：下拉的真实状态在 _uiSelectMap 里，
+  // 直接改 DOM 的 dataset 只会让标签变了、筛选值还在。
+  uiSelectSet("usageKeySel", "");
+  uiSelectSet("usageModelSel", "");
+  uiSelectSet("usageCaseSel", "");
+  loadUsageStats();
+}
+
+/* 当前筛选条件 -> query string，并生成一句人话提示 */
+function _usageQuery() {
+  const days = uiSelectValue("usageDaysSel") || 1;
+  const grain = uiSelectValue("usageGrainSel") || "hour";
+  const key = uiSelectValue("usageKeySel") || "";
+  const model = uiSelectValue("usageModelSel") || "";
+  const cs = uiSelectValue("usageCaseSel") || "";
+  const qs = new URLSearchParams({ days, granularity: grain });
+  if (key) qs.set("key_id", key);
+  if (model) qs.set("model", model);
+  if (cs) qs.set("use_case", cs);
+
+  const keyName = ((_usageOpts.keys || []).find(k => String(k.id) === key) || {}).name || key;
+  const conds = [];
+  if (key) conds.push(`Key=${keyName}`);
+  if (model) conds.push(`模型=${model}`);
+  if (cs) conds.push(`端点=${cs}`);
+  return { qs: qs.toString(), conds };
+}
+
+// 空结果说明：区分「本来就没量」和「被筛选条件筛没了」，
+// 后者要提示清除筛选，否则用户会以为数据丢了。
+function _usageEmpty(conds) {
+  const tip = conds.length
+    ? `当前筛选条件（${conds.join("，")}）下没有记录，试试放宽时间范围或
+       <a href="javascript:resetUsageFilters()" class="text-emerald-600 underline">清除筛选</a>`
+    : "该时间范围内没有任何请求记录";
+  return `<div class="text-sm text-slate-400 py-8 text-center">${tip}</div>`;
+}
+
 async function loadUsageStats() {
   initUsageSelects();
-  const days = uiSelectValue("usageDaysSel") || 14;
-  const grain = uiSelectValue("usageGrainSel") || "day";
+  if (!_usageFilterReady) await loadUsageFilterOptions();
+
+  const { qs, conds } = _usageQuery();
   const ov = $("#usageOverview");
+  const hint = $("#usageFilterHint");
   if (ov) ov.innerHTML = `<div class="col-span-4 text-sm text-slate-400">加载中...</div>`;
+  if (hint) {
+    if (conds.length) {
+      hint.classList.remove("hidden");
+      hint.innerHTML = `<i class="fa-solid fa-filter mr-1"></i>已筛选：${esc(conds.join("，"))}（下方所有图表与卡片均限于此条件）`;
+    } else {
+      hint.classList.add("hidden");
+    }
+  }
   try {
-    const r = await api(`/api/stats/usage?days=${days}&granularity=${grain}`);
+    const r = await api(`/api/stats/usage?${qs}`);
     const { ok, data: d } = await safeJson(r);
     if (!ok) { if (ov) ov.innerHTML = `<div class="col-span-4 text-sm text-red-500">加载失败: ${esc(d.detail || "")}</div>`; return; }
 
     const o = d.overview || {};
+    const failTip = o.failed_requests ? `（含失败 ${fmtNum(o.failed_requests)}）` : "";
     if (ov) ov.innerHTML = `
-      ${card("总请求数", fmtNum(o.requests), "fa-paper-plane", "text-indigo-600")}
+      ${card("总请求数", fmtNum(o.requests) + failTip, "fa-paper-plane", "text-indigo-600")}
       ${card("总 Token", fmtNum(o.total_tokens), "fa-cube", "text-amber-600")}
       ${card("总消费", fmtCredit(o.credits), "fa-coins", "text-emerald-600")}
       ${card("平均耗时", (o.avg_latency_ms ? (o.avg_latency_ms / 1000).toFixed(2) : "0.00") + "s", "fa-stopwatch", "text-violet-600")}`;
+
+    // 空结果时明确说明，而不是留一片空白让人以为没加载出来
+    const empty = !(d.trend || []).length;
+    if (empty) {
+      $("#usageModelChart").innerHTML = _usageEmpty(conds);
+      $("#usageKeyChart").innerHTML = _usageEmpty(conds);
+      $("#usageEndpointChart").innerHTML = _usageEmpty(conds);
+      $("#usageTrendChart").innerHTML = _usageEmpty(conds);
+      return;
+    }
 
     $("#usageModelChart").innerHTML = donutChart(d.by_model, "credits");
     $("#usageKeyChart").innerHTML = donutChart(d.by_key, "credits");

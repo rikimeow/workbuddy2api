@@ -42,6 +42,8 @@
 - [一、逆向工程：解包 WorkBuddy 桌面端源码（app_source）](#一逆向工程解包-workbuddy-桌面端源码app_source)
 - [二、逆向反代核心（workbuddy2api 网关）](#二逆向反代核心workbuddy2api-网关)
 - [三、多账号代理共享平台（admin）](#三多账号代理共享平台admin)
+  - [3.7 使用记录：默认近 1 天，可按 Key / 模型筛选](#37-使用记录默认近-1-天可按-key--模型筛选)
+  - [3.8 定时任务结果：人话摘要](#38-定时任务结果人话摘要)
 - [四、环境安装与项目运行](#四环境安装与项目运行)
 - [五、每日签到定时任务（daily_checkin）](#五每日签到定时任务daily_checkin)
 - [六、成长计划任务（growth）](#六成长计划任务growth)
@@ -65,8 +67,8 @@
   - [10.10 客户端版本与逆向产物：自动发现 / 自动产出](#1010-客户端版本与逆向产物自动发现--自动产出)
   - [10.11 非流式：一个必须修的协议违约](#1011-非流式一个必须修的协议违约)
   - [10.12 这批改动的验证](#1012-这批改动的验证)
-  - [10.13 什么不进仓库](#1013-什么不进仓库)
 - [十一、免责声明与协议](#十一免责声明与协议)
+- [十二、致谢与引用声明（Credits & References）](#十二致谢与引用声明credits--references)
 
 ---
 
@@ -247,16 +249,16 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 - **API Key 管理**：后台创建 Key 给别人用，可设每个 Key 的积分上限
 - **模型分组**：把模型划进分组，Key 绑定分组后**只能调用组内模型**（越权返回 `403 model_not_in_group`）
 - **配额拦截**：Key 已用积分 ≥ 上限时，代理直接返回 `402 {"error":{"message":"积分已耗尽","type":"quota_exceeded"}}`
-- **用量记录与统计**：每次调用落 `usage_logs`，可按 Key / 账号 / 模型 / 端点追溯，并出积分与 token 的消耗趋势图表
+- **用量记录与统计**：每次调用落 `usage_logs`，可按 Key / 账号 / 模型 / 端点追溯，并出积分与 token 的消耗趋势图表。**默认统计近 1 天**，支持按 Key / 模型 / 端点筛选，筛选后卡片与图表同步变化 —— 见 [3.7](#37-使用记录默认近-1-天可按-key--模型筛选)
 
 **号池自动化运营**（纯协议实现，不需要桌面端开机 / CLI 常驻）
 
 - **每日签到领积分**：自动为号池内每个账号领取每日签到奖励；已领自动跳过，活动下线自动停手保护账号 —— 见 [五](#五每日签到定时任务daily_checkin)
 - **成长计划任务自动化**：拉取任务列表 → 自动参与 → 自动完成 → **自动领取积分**，全流程闭环，支持批量一键执行 —— 见 [六](#六成长计划任务growth)
 - **猫猫旅行**：同意协议 → 首次领养（+300）→ 派猫 → 到站领奖，支持批量
-- **定时调度**：内置调度器，签到 / 刷余额 / 同步模型列表 / 拉取成长任务列表均可按间隔自动跑，后台可增删改查与「立即运行」
+- **定时调度**：内置调度器，签到 / 刷余额 / 同步模型列表 / 拉取成长任务列表均可按间隔自动跑，后台可增删改查与「立即运行」。**运行结果是人话摘要**（今天签到领了多少积分、哪个账号没成功、原因是什么），不是一坨 JSON —— 见 [3.8](#38-定时任务结果人话摘要)
 
-> 自动化请求全部走**正常业务接口**（正常 200 响应、免费模型、最小输出），不伪造畸形请求，详见 [6.4](#64-为什么不用直接发完成包-直接发事件)。
+> 自动化请求全部走**正常业务接口**（正常 200 响应、免费模型、最小输出），不伪造畸形请求，详见 [6.4](#64-为什么不用直接发完成包--直接发事件)。
 
 ### 3.2 稳定性设计
 
@@ -351,6 +353,77 @@ Anthropic 端点（`/v1/messages`）相关：
 - 后端未回传 `credits` 时，按 `completion_tokens × COST_PER_TOKEN` 估算扣费（经验值）
 - 配额扣减在流式结束后的 `finally` 里提交，高并发下非严格原子（极端竞态可能短暂超额）
 - 余额刷新受腾讯后端限流影响（约每日 15:12 UTC+8 重置窗口），刷新失败余额保持不变
+
+### 3.7 使用记录：默认近 1 天，可按 Key / 模型筛选
+
+**默认窗口是「近 1 天 + 按小时」**，不是 14 天。
+
+理由是使用场景：打开「使用记录」时最常问的是「**今天**跑得怎么样 / 刚才那波为什么慢」。
+默认 14 天会把当天的异常**稀释**进两周的曲线里 —— 今天积分翻倍，在 14 天的图上
+只是一个看不出的小凸起。要长期趋势再手动切 7/30/90 天。
+
+筛选维度：
+
+| 维度 | 参数 | 说明 |
+|------|------|------|
+| 时间窗 | `days` | 1 / 3 / 7 / 14 / 30 / 90（默认 1） |
+| 粒度 | `granularity` | `hour` / `day`（默认 hour） |
+| **按 Key** | `key_id` | 某个 Key 今天花了多少 |
+| **按模型** | `model` | 某个模型的消耗与请求数 |
+| 按端点 | `use_case` | `chat-completion` / `responses` / `messages` |
+| 按账号 | `account_id` | 追溯到具体账号 |
+
+**筛选是全局生效的**：卡片、三个分布图、趋势图走的是**同一份 where 条件**
+（代码里只构造一次 `filters` 列表，所有查询都过 `_f()`）。这一点是刻意的 ——
+分开写条件极易出现「卡片数字和图表对不上」这种自相矛盾的页面。
+
+下拉选项来自 `/api/stats/usage/options`，**只列窗口内真实出现过的** Key / 模型 / 端点。
+否则下拉里会塞满从没用过的模型，选中后筛出空结果，用户会以为功能坏了。
+
+两个刻意的边界处理：
+
+- **筛不到结果时给解释**，不是留一片空白：会说明「当前筛选条件下没有记录」
+  并给一个「清除筛选」的链接，让用户区分「本来就没量」和「被自己筛没了」。
+- **换时间窗后失效的选项自动回落**：原来选的模型在新区间里没了，选择会重置为
+  「全部」而不是保留一个永远筛不出东西的隐藏条件。
+
+概览卡片额外给出**失败请求数**（`总请求数（含失败 N）`）：只报成功数会让人
+误以为请求没发出去，而失败恰恰是最该被看见的。
+
+### 3.8 定时任务结果：人话摘要
+
+以前「上次结果」是一坨 JSON，得自己去数：
+
+```json
+{"task":"daily_checkin","claimed":6,"skipped_already":7,"failed":2,"errors":["acc3:活动已结束","acc9:无领取资格"]}
+```
+
+现在直接给你要的答案：
+
+> 今日新领 6 个账号，共 +42 积分，7 个今日已领过，2 个未领成功：
+> 177\*\*\*\*5501（活动已结束）；修猫（无领取资格）
+
+实现上分两层：
+
+1. **后端给 `summary`**：每个任务自己写一句人话（`_checkin_summary` /
+   `_growth_summary` 等），并附 `detail` 逐账号明细 `{account, ok, credit, reason}`；
+2. **前端优先用 `summary`**，展开详情时把 `detail` 渲染成表格（✓/✗ + 账号 + 积分 + 原因），
+   原始 JSON 收进折叠区。
+
+**顺带修掉一个真 bug**：原来写库是 `json.dumps(...)[:500]`。
+500 字符一截，JSON 就成了非法字符串，前端 `JSON.parse` 直接失败，
+于是兜底显示原始文本 —— 这正是「只显示一堆 json 数据」的成因之一。
+现在改为 `_dump_result()`：**绝不截断 JSON 结构**，超长时改为逐级丢弃明细数组
+（2000 → 50 → 20 → 5 → 0 条）并标记 `detail_truncated`，保证任何情况下都是合法 JSON。
+`last_result` 本身就是 TEXT 列，容量不是问题。
+
+> 同一个截断 bug 在**手动「立即运行」**那条路径上也有（`routers/schedules.py`），
+> 两条路径现已统一走 `_dump_result()`。手动执行失败也会落库，
+> 否则界面还会显示上一次的成功结果，让人以为这次也成功了。
+
+**账号标签做脱敏**：结果里用 `177****5501` 而不是完整手机号。
+既够辨认是哪个号（正是「哪个账号没领成功」需要的信息），
+又不把完整号码写进会被截图、会随日志流转的地方；没有名字才回落到 `账号#12`。
 
 ---
 
@@ -475,7 +548,6 @@ docker run -d --name workbuddy2api -p 8787:8787 \
 - `admin/models.py` — `Schedule.stop_after` 字段（「下次停止领取」）
 - `admin/routers/schedules.py` — `daily_checkin` 接入 `TASK_CHOICES` + `stop_after` 读写
 - `admin/db.py` — `init_db()` 补 `schedules.stop_after` 列迁移
-- `scripts/test_daily_checkin.py` — 查状态 + 仅对未领账号真实领取的验证脚本
 
 ### 5.3 配置定时任务
 
@@ -494,10 +566,9 @@ curl -X POST http://127.0.0.1:8790/api/schedules \
 
 ### 5.4 验证
 
-```bash
-# 仅查状态 + 对「今日未领」账号真实领取（不影响已领账号）
-PYTHONPATH=. python scripts/test_daily_checkin.py
-```
+后台「定时任务」页点该任务的 **执行**，结果列会直接给出人话摘要，例如
+「今日已领 6 个账号，共 +42 积分；2 个未领成功：xxx（活动已结束）」——
+不需要再去翻 JSON。详见 §7.4。
 
 已验证：活动 `开学季`，`end_time=2026-09-15 23:59:59`；未领账号各领到 100 积分，已领账号自动跳过；今日领完后调度器 `claimed=0, skipped_already=5`（不重复领、不误发请求）；`stop_after` 过期直接跳过。
 
@@ -649,8 +720,8 @@ not_accepted ──accept──► accepted ──触发──► in_progress �
 早期结论是「事件里要自造 `wb-<ms>` 画布 id，属伪造业务对象，不做」。这个结论**只对了一半**：
 真实画布 id 拿得到，只是必须**真的去创建一个画布**。
 
-关键证据来自官方客户端源码（`D:\WorkBuddy\resources\app.asar.unpacked`，
-用 `scripts/asar_grep.py` 检索到的 ardot 遥测模块）：
+关键证据来自官方客户端源码（解包产物 `app_source/`，用后台
+「设置 → 逆向产物 → 源码检索」或 `wb_asar.py search` 检索到的 ardot 遥测模块）：
 
 1. 画布 id 的真实口径是**纯数字**——`/\bfileId\s+(\d+)\b/`、URL 路径 `/file/(\d+)`。
    所以 `ardot-file-xxxxxxxx` 或 `wb-1789870000000` 在**形状上**就不可能是真实画布 id。
@@ -747,20 +818,8 @@ not_accepted --accept--> accepted --完成行为--> completed --claim--> claimed
 Runner 两步都会做：执行前对 `not_accepted` 调 `growth_accept`，跑完后把
 `completed` 的逐个 `growth_claim`（见 `admin/routers/growth.py`）。
 
-#### 自查脚本（都在 `scripts/`）
-
-| 脚本 | 用途 |
-|------|------|
-| `survey_ardot_token.py` | 盘点所有账号能否换到 Ardot token |
-| `provision_ardot_all.py` | 为所有未绑定账号建立 Ardot 绑定（`--do` 才写） |
-| `survey_canvas_tasks.py` | 盘点所有账号的 `create_canvas` 状态与进度 |
-| `run_canvas_task.py <id>` | 跑单个账号的完整链路（accept→完成→claim） |
-| `dump_create_design_schema.py` | 打印 `create_design` 的完整 inputSchema |
-| `verify_create_canvas.py --dry\|--report` | 真机建画布 |
-| `probe_shadow_connect.py <id>` | 单独验证影子账号 `/connect`（`--do` 才写） |
-| `check_create_canvas_progress.py` | 核对成长中心进度与积分 |
-
-
+怀疑某个账号没走完链路时，用后台「成长任务」页的进度与日志排查即可
+（每个账号的 `accept` / 完成 / `claim` 状态都在页面上）。
 
 ### 6.8 新增任务会自动识别（模式匹配）
 
@@ -982,24 +1041,7 @@ workbuddy2api/
 ├── start_converter.bat       # 本机直连网关一键启动（本地用，不进仓库）
 ├── start_admin.bat           # 管理后台一键启动（强密码 + 固定 JWT secret；本地用，不进仓库）
 ├── requirements.txt / Dockerfile / docker-compose.yml
-├── scripts/                  # 逆向取证 / 诊断脚本（.gitignore 忽略，不进仓库）
-│   ├── asar_grep.py                     # 在 app.asar 里按字节检索关键词（逆向取证）
-│   ├── asar_slice.py                    # 按字节区间抽取 app.asar 片段
-│   ├── find_account.py                  # 按手机号/uid/name 定位账号及其池状态
-│   ├── survey_ardot_token.py            # 盘点所有账号能否换到 Ardot token
-│   ├── provision_ardot_all.py           # 为未绑定账号建立 Ardot 绑定（--do 才写）
-│   ├── survey_canvas_tasks.py           # 盘点所有账号的画布任务状态与进度
-│   ├── run_canvas_task.py               # 跑单账号画布完整链路（accept→完成→claim）
-│   ├── probe_canvas.py                  # 「发对话拿 fileId」旧假设的实证记录（已证伪）
-│   ├── probe_ardot_mcp.py               # 探测上游是否回原生 tool_calls + Ardot 端点鉴权
-│   ├── probe_ardot_mcp_live.py          # initialize + tools/list，确认 create_design 可用
-│   ├── probe_ardot_oauth_meta.py        # 探测 Ardot OAuth 元数据与 connector 接口
-│   ├── probe_shadow_connect.py          # 单独验证影子账号 /connect（--do 才写）
-│   ├── dump_create_design_schema.py     # 打印 create_design 完整 inputSchema
-│   ├── dump_canvas_task.py              # 打印画布任务原始 JSON（看 accept_status）
-│   ├── verify_create_canvas.py          # 真机建画布（--dry 只建 / --report 连遥测）
-│   ├── check_create_canvas_progress.py  # 核对成长中心 create_canvas 进度与积分
-│   ├── refresh_balances_report.py       # 刷新并打印全账号上游余额（核对奖励是否到账）
+├── scripts/                  # 部署脚本 + 本地诊断脚本（*.py 被 .gitignore 忽略，不进仓库）
 │   └── daemon.ps1                       # 部署用守护脚本（**保留在仓库内**）
 ├── admin/                    # 多账号管理后台（FastAPI + MySQL + Redis）
 │   ├── server.py             # FastAPI 入口、登录、静态页挂载、converter 挂 /gw
@@ -1032,8 +1074,8 @@ workbuddy2api/
 <安装目录>\resources\app.asar.unpacked\native\turing-sdk\   # 设备风控原生模块
 ```
 
-> `scripts/*.py` 与 `tests/` 都被 `.gitignore` 忽略（见 [10.13](#1013-什么不进仓库)）。
-> 它们在本机检出里仍然可用，只是不进仓库。
+> `scripts/*.py` 与 `tests/` 都被 `.gitignore` 忽略（本地回归工具，不进仓库）。
+> 它们在本机检出里仍然可用。
 
 ---
 
@@ -1279,9 +1321,8 @@ python wb_asar.py search "wbx_design" # 字节检索
 `~/.cache/...`）而**不是项目里** —— 200MB+ 放进仓库会被 git 追着跑。
 需要固定位置时用 `WORKBUDDY_SOURCE_DIR` 指定。
 
-`scripts/asar_grep.py` / `asar_slice.py` 也已改为委托 `wb_asar`，
-不再需要 Node。
-
+`wb_asar.py` 已把 asar 读取/抽取/检索全部收进来（纯标准库），
+命令行用法见上一节，后台也有「一键拆包」按钮，都不需要 Node。
 #### 后台一键拆包：不用记命令，也不用装 Node
 
 命令行能做，但对「只想看看源码」的人来说门槛仍在（要记住 `wb_asar.py` 的
@@ -1526,15 +1567,15 @@ cache miss     5.2 ms      每 30 秒最多一次
 ### 10.12 这批改动的验证
 
 ```bash
-.venv\Scripts\python.exe tests\test_pool.py            # 341 项，不依赖库/网络
-.venv\Scripts\python.exe test_upstream_compat.py       # 74 项，上游协议兼容/思考开关（本地文件，不入仓库）
+.venv\Scripts\python.exe tests\test_pool.py            # 375 项，不依赖库/网络
+.venv\Scripts\python.exe test_upstream_compat.py       #  74 项，上游协议兼容/思考开关（本地文件，不入仓库）
 .venv\Scripts\python.exe tests\test_e2e_db.py          #  48 项，连真实 MySQL（只读 + 幂等迁移）
 .venv\Scripts\python.exe tests\test_gateway_smoke.py   #   9 项，真实上游端到端（会消耗少量积分）
 .venv\Scripts\python.exe scripts\verify_client_profile_sync.py  # 客户端参数同步链路（DB 只改后还原）
 ```
 
-> `tests/` 与 `scripts/*.py` 已在 `.gitignore` 中（见 §10.13），
-> 属于本地回归工具，不进仓库；上面的命令在本地检出里照常可跑。
+> `tests/` 与 `scripts/*.py` 属本地回归工具，已在 `.gitignore` 中，不进仓库；
+> 上面的命令在本地检出里照常可跑。
 
 **三层验证缺一不可**，因为每层能抓到的问题不同：
 
@@ -1554,20 +1595,6 @@ cache miss     5.2 ms      每 30 秒最多一次
 > 同一个会话看不到接收端刚提交的行 —— 这不是产品 bug，但会让验证脚本假失败
 > （实测踩过一次）。
 
-### 10.13 什么不进仓库
-
-`.gitignore` 把「本地工具」与「产品代码」分开：
-
-| 忽略项 | 原因 |
-|--------|------|
-| `test_*.py` / `tests/` / `*_test.py` | 回归测试属本地工具，含真实账号 id 与内部排查口径 |
-| `scripts/*.py` | 逆向取证与一次性诊断脚本，依赖本机安装包与真实账号；有的还记录了**已被证伪**的假设，放在仓库里会误导 |
-| `.env` / `backup_*.sql` | 含真实凭据与账号 token |
-| `ssh_*.py` / `sync_auth.*` / `start_*.bat` | 含服务器 IP 与密码 |
-| `*.zip` / `*.log` / `.venv/` | 构建产物与运行时产物 |
-
-`scripts/daemon.ps1` 是部署脚本，保留在仓库内。
-`wb_install.py`、`turing_helper.js` 是产品代码（自动发现逻辑），也保留。
 
 `test_e2e_db.py` 在真实数据上验证：迁移幂等、保活任务注册在配置整点、
 选号链路可用、**模型级冷却不影响同账号的其它模型**、在途占满的号被排除、
@@ -1586,4 +1613,48 @@ cache miss     5.2 ms      每 30 秒最多一次
 
 协议：[MIT](./LICENSE)
 
-> 致谢：本项目基于 [HanHan666666/codebuddy2openai](https://github.com/HanHan666666/codebuddy2openai) 的思路演进而来，感谢原作者的开源贡献。
+---
+
+## 十二、致谢与引用声明（Credits & References）
+
+本项目的**协议转换与多账号共享**的起步思路，来自社区已有的开源实现。
+这里把「参考了什么、参考到什么程度」写清楚，既是对原作者的尊重，
+也避免读者误以为这些设计是本项目原创。
+
+### 主要参考项目
+
+| 项目 | 作者 | 许可 | 本项目参考的内容 |
+|------|------|------|------------------|
+| [HanHan666666/codebuddy2openai](https://github.com/HanHan666666/codebuddy2openai) | HanHan666666 | MIT | 最早期的思路来源：把桌面端登录态转成 OpenAI 兼容接口 |
+| [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | Sliverkiss | MIT | 多账号池、错误分类与账号处置、会话粘性、限速/保活等**设计思路** |
+| [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) | linguo2625469 | MIT | 可视化运维面板的信息架构与交互设计思路 |
+
+### 参考的**程度**：思路，不是代码
+
+这一点必须说明白，否则容易引起误解：
+
+- 上述项目是 **Go** 语言实现，本项目是 **Python**；
+- 语言与架构都不同，**没有复制、没有移植、没有逐行翻译**任何代码；
+- 参考的是**问题清单与设计取向**——比如「要按错误类型分别处置账号」
+  「同一会话要固定同一账号」「要主动保活 token」这类**该做什么**的判断；
+  具体实现（三因子加权选号、在途租约、`500ms·2ⁿ` 抖动退避、WAF IP 闸门、
+  错误码到冷却策略的映射等）都是本项目自己写并实测的。
+
+### 本项目独立完成、并非来自参考项目的部分
+
+- `app.asar` 的纯标准库读取/抽取器（`wb_asar.py`），不依赖 Node/npm；
+- 客户端参数档案（UA / 版本号 / 风控头 / 桌面指纹）的**探测→保存→生效→同步**闭环；
+- 后台一键拆包与路径自动补齐（`ADMIN_DEV_TOOLS`）；
+- `create_canvas` 的真实 id 口径与两段式状态机（`accept` → 完成 → `claim`）；
+- 全部测试（`test_pool.py` 341 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
+
+### 如果引用有误
+
+若你是上述项目的作者，认为此处的署名、许可标注或「参考程度」描述不准确，
+请提 Issue 告知，会立即更正或移除相关表述。
+
+### 上游服务
+
+本项目与**腾讯、WorkBuddy、CodeBuddy、OpenAI、Anthropic 均无官方关联**，
+不是任何一方的官方客户端或 SDK。请仅在你**合法拥有订阅**的前提下使用。
+
