@@ -17,6 +17,13 @@ converter 已在 admin/server.py 中挂载到 /gw 前缀，因此无需再单独
   python main.py                  # 前台常驻，监听 0.0.0.0:8790
   python main.py --port 8790
   python main.py --host 127.0.0.1
+  python main.py --restart        # 端口被占用时强制结束占用者再启动
+
+端口占用处理:
+  直接再跑一次 `python main.py` 就能重启 —— 检测到占用端口的**是本项目自己的
+  旧实例**（uvicorn admin.server:app / 路径指向本项目）时会自动结束它并接管。
+  只有占用者是**别的程序**时才拒绝启动（避免误杀），此时若确认要停掉它，
+  用 `--restart`（等价于旧版的 `--force`）。
 
 环境变量（可选，覆盖默认；部署务必设置）:
   ADMIN_PORT / ADMIN_HOST
@@ -145,7 +152,10 @@ def _build_admin_cmd(args) -> tuple[list[str], int, str]:
 
 
 #: 宝塔面板的 pid 文件路径。写在这里，面板「停止」按钮才杀得对进程。
-_PIDFILE = Path("/www/server/python_project/vhost/pids/workbuddy2api.pid")
+#: Windows 上没有该目录树（`/www/...` 会被解析成 `<盘符>:\www\...`，
+#: 于是在项目之外凭空造目录），改用项目内的隐藏文件。
+_PIDFILE = (Path("/www/server/python_project/vhost/pids/workbuddy2api.pid")
+            if os.name != "nt" else ROOT / ".workbuddy2api.pid")
 
 
 def _write_pidfile() -> None:
@@ -205,30 +215,226 @@ def _port_in_use(host: str, port: int) -> bool:
         return s.connect_ex((probe_host, port)) == 0
 
 
-def _pid_listening_on(port: int) -> list[int]:
-    """返回正在监听指定端口的 pid 列表（仅 Linux；失败返回空列表）。"""
-    pids: list[int] = []
+# ---------------------------------------------------------------------------
+# 进程 / 端口识别（跨平台）
+#
+# 为什么需要这一层：原先的实现**只认 Linux** ——
+#   * `_pid_listening_on()` 调用 `ss -lntpH`；
+#   * `_is_our_instance()` 读 `/proc/<pid>/cwd`。
+# 在 Windows 上前者抛异常（没有 ss）、后者恒为 False，于是
+# 「被本项目的旧实例占用 → 接管」这条分支**永远不可能命中**：
+# 第二次 `python main.py` 只会拿到一句「端口已被占用」然后退出 ——
+# 明明是自己上次没关干净，却没有任何办法重启。
+# ---------------------------------------------------------------------------
+
+def _norm_text(s) -> str:
+    """路径/命令行归一化，便于跨平台比较（统一斜杠、忽略大小写）。"""
+    return str(s or "").replace("\\", "/").lower()
+
+
+def _run_quiet(cmd: list[str], timeout: float = 15.0) -> str:
+    """执行命令并返回 stdout；任何失败都返回空串。
+
+    识别进程失败不该让「启动」这件事崩掉，所以这里吞掉所有异常。
+    """
     try:
-        import subprocess as _sp
-        # -lntp: 只列 LISTEN、不做域名解析、显示进程
-        out = _sp.run(["ss", "-lntpH", f"sport = :{port}"],
-                      capture_output=True, text=True, timeout=5).stdout
-        import re as _re
-        for m in _re.finditer(r"pid=(\d+)", out):
-            pid = int(m.group(1))
-            if pid not in pids:
-                pids.append(pid)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return r.stdout or ""
     except Exception:
-        pass
+        return ""
+
+
+#: PowerShell：列出「pid<TAB>命令行」。整表一次取出，而不是逐个 pid 起进程 ——
+#: 每次 PowerShell 启动要几百毫秒，逐个查会慢到无法接受。
+_PS_LIST_PROCS = (
+    "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+    "Get-CimInstance Win32_Process | "
+    'ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }'
+)
+
+
+def _listener_pids(port: int) -> list[int]:
+    """返回监听指定端口的 pid 列表（Windows: netstat → CIM；Linux: ss）。"""
+    if os.name == "nt":
+        # netstat 最快且系统自带；解析不出来再退回 CIM（更准但慢）
+        return _listener_pids_netstat(port) or _listener_pids_cim(port)
+    return _listener_pids_ss(port)
+
+
+def _listener_pids_ss(port: int) -> list[int]:
+    import re as _re
+    out = _run_quiet(["ss", "-lntpH", f"sport = :{port}"], timeout=5.0)
+    pids: list[int] = []
+    for m in _re.finditer(r"pid=(\d+)", out):
+        pid = int(m.group(1))
+        if pid not in pids:
+            pids.append(pid)
     return pids
 
 
+def _listener_pids_netstat(port: int) -> list[int]:
+    """解析 `netstat -ano` 的 LISTENING 行（Windows）。
+
+    形如：  TCP    0.0.0.0:8790    0.0.0.0:0    LISTENING    12345
+    """
+    out = _run_quiet(["netstat", "-ano", "-p", "TCP"], timeout=10.0)
+    want = f":{port}"
+    pids: list[int] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 5:
+            continue
+        proto, local, _remote, state, pid_s = parts
+        if proto.upper() != "TCP" or not state.upper().startswith("LISTEN"):
+            continue
+        # 用 endswith 而非等值：本地地址可能是 0.0.0.0:8790 或 [::]:8790
+        if not local.endswith(want):
+            continue
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid not in pids:
+            pids.append(pid)
+    return pids
+
+
+def _listener_pids_cim(port: int) -> list[int]:
+    out = _run_quiet(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+         f"Get-NetTCPConnection -LocalPort {port} -State Listen "
+         "-ErrorAction SilentlyContinue | "
+         "Select-Object -ExpandProperty OwningProcess"],
+        timeout=20.0)
+    pids: list[int] = []
+    for line in out.splitlines():
+        s = line.strip()
+        if s.isdigit():
+            pid = int(s)
+            if pid not in pids:
+                pids.append(pid)
+    return pids
+
+
+def _cmdline_of(pid: int) -> str:
+    """取某进程的命令行（取不到返回空串，不抛异常）。"""
+    if os.name != "nt":
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return f.read().replace(b"\0", b" ").decode("utf-8", "ignore").strip()
+        except Exception:
+            return ""
+    out = _run_quiet(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+         f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"])
+    if out.strip():
+        return out.strip()
+    # 老系统上 wmic 仍在，作为兜底
+    out = _run_quiet(["wmic", "process", "where", f"processid={pid}",
+                      "get", "commandline", "/value"], timeout=10.0)
+    for line in out.splitlines():
+        if line.lower().startswith("commandline="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
 def _is_our_instance(pid: int) -> bool:
-    """该 pid 是否就是本项目的服务进程（工作目录 == 本项目根目录）。"""
-    try:
-        return os.path.realpath(f"/proc/{pid}/cwd") == os.path.realpath(str(ROOT))
-    except Exception:
-        return False
+    """该 pid 是否就是**本项目**的进程（宁松勿严：认出自己人才敢动手）。
+
+    两个判据，任一命中即可：
+      * Linux：`/proc/<pid>/cwd` 指向本项目根目录；
+      * 通用 ：命令行里出现本项目根目录的绝对路径。
+
+    第二条是关键 —— uvicorn 子进程的命令行形如
+    `<项目>/.venv/Scripts/python.exe -m uvicorn admin.server:app ...`，
+    本身就带着项目路径，所以**在 Windows 上也能认出来**。
+    """
+    if os.name != "nt":
+        try:
+            if os.path.realpath(f"/proc/{pid}/cwd") == os.path.realpath(str(ROOT)):
+                return True
+        except Exception:
+            pass
+    cmd = _cmdline_of(pid)
+    return bool(cmd) and _norm_text(ROOT) in _norm_text(cmd)
+
+
+def _our_related_pids() -> list[int]:
+    """命令行里带本项目**入口**的所有进程（含 main.py 包装进程）。
+
+    结束监听端口的 uvicorn 后，拉起它的 `main.py` 通常会发现子进程没了而自行退出；
+    但它若卡住就会留下一个不占端口的孤儿，下次启动仍会困惑。这里一并收掉。
+
+    ⚠️ 判据必须严：**不能**只看「命令行里出现项目路径」。实测发现那样会命中
+    无关进程 —— 例如在本目录下启动的编辑器、终端、其它工具链（它们的命令行或
+    cwd 参数里同样含这个路径）。误杀的代价不可逆，所以这里复用
+    `_looks_like_our_service()`：必须是我们的 ASGI app，或确实在跑本项目入口脚本。
+    """
+    me = os.getpid()
+    protected = _ancestor_pids() | {me}
+    pids: list[int] = []
+    if os.name == "nt":
+        out = _run_quiet(["powershell", "-NoProfile", "-NonInteractive",
+                          "-Command", _PS_LIST_PROCS], timeout=25.0)
+        for line in out.splitlines():
+            if "\t" not in line:
+                continue
+            pid_s, cmd = line.split("\t", 1)
+            if not _looks_like_our_service(cmd):
+                continue
+            try:
+                pid = int(pid_s.strip())
+            except ValueError:
+                continue
+            if pid not in protected and pid not in pids:
+                pids.append(pid)
+    else:
+        try:
+            for name in os.listdir("/proc"):
+                if not name.isdigit():
+                    continue
+                pid = int(name)
+                if pid in protected or pid in pids:
+                    continue
+                if _looks_like_our_service(_cmdline_of(pid)):
+                    pids.append(pid)
+        except Exception:
+            pass
+    return pids
+
+
+def _terminate_tree(pid: int) -> None:
+    """结束一个进程及其子进程（跨平台，尽力而为，失败不抛）。"""
+    if os.name == "nt":
+        # /T 连子进程一起收；必须带 /F —— 控制台进程对不带 /F 的 taskkill
+        # 通常不响应（会回一句 could not be terminated）。
+        _run_quiet(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=20.0)
+        return
+    # POSIX：优先整组结束（子进程以 start_new_session 启动、自成进程组）
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(pid), sig)
+        except Exception:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                return
+            except Exception:
+                return
+        time.sleep(1.0 if sig == signal.SIGTERM else 0.3)
+
+
+def _wait_port_released(host: str, port: int, timeout: float) -> bool:
+    """等端口释放；返回是否真的释放了。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _port_in_use(host, port):
+            return True
+        time.sleep(0.3)
+    return not _port_in_use(host, port)
 
 
 #: 重启场景下，等待旧实例释放端口的最长时间（秒）。
@@ -237,70 +443,194 @@ def _is_our_instance(pid: int) -> bool:
 _RESTART_WAIT = 25.0
 
 
-def _ensure_port_free(host: str, port: int) -> None:
+#: 本服务独有的命令行特征：uvicorn 的 ASGI 目标。
+#: 比「路径里含项目名」更硬 —— 即使解释器在项目目录之外（系统 Python、
+#: managed venv）也能认出这是我们自己的 uvicorn，而不是别人的服务。
+_OUR_UVICORN_TARGET = "admin.server:app"
+
+#: 本项目的入口脚本。仅当命令行里**同时**出现项目根目录与其中之一时，
+#: 才认定是「我们的进程」。单看路径不够：在项目目录下开着的编辑器、终端、
+#: 其它工具链，命令行里同样会带这个路径。
+_OUR_ENTRY_SCRIPTS = ("main.py", "converter.py", "admin/server.py")
+
+
+def _looks_like_our_service(cmd: str) -> bool:
+    """命令行是否属于**本项目**的服务进程（严格判据，宁可漏杀不可误杀）。
+
+    命中任一：
+      1. 含 uvicorn 目标 `admin.server:app` —— 最强特征，与路径无关；
+      2. 命令行以 **python 解释器** 开头，且含项目根目录与本项目入口脚本名。
+
+    为什么不能只看「路径出现在命令行里」：实测踩过两次 ——
+      * 在项目目录下启动的编辑器 / 终端 / node 工具链，命令行里也含该路径；
+      * **外面那层 shell**：`powershell -Command "...Start-Process python main.py..."`，
+        命令行同时含项目路径与 `main.py`，结果把「启动服务的那个 shell」杀掉了。
+    这个判据会用来决定**结束进程**，误杀的代价不可逆，所以必须严。
+    """
+    c = (cmd or "").replace("\\", "/")
+    if not c:
+        return False
+    if _OUR_UVICORN_TARGET in c:
+        return True
+    if _norm_text(ROOT) not in _norm_text(c):
+        return False
+    low = c.lower()
+    if not any(s in low for s in _OUR_ENTRY_SCRIPTS):
+        return False
+    # 必须真由 python 解释器执行。cmd/powershell/bash 这层「包装器」不算 ——
+    # 杀掉它等于杀掉用户自己的终端。
+    return _is_python_exe(_first_token(c))
+
+
+def _is_python_exe(token: str) -> bool:
+    """该可执行文件名是否像 python 解释器（python / python3.13 / pythonw …）。"""
+    name = token.replace("\\", "/").rsplit("/", 1)[-1].strip('"').lower()
+    name = name[:-4] if name.endswith(".exe") else name
+    return name.startswith("python") or name.startswith("pypy")
+
+
+def _first_token(cmd: str) -> str:
+    """取命令行首个 token，正确处理带空格的引号路径。"""
+    s = (cmd or "").lstrip()
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        return s[1:end] if end > 0 else s
+    return s.split(" ", 1)[0]
+
+
+def _ancestor_pids() -> set[int]:
+    """本进程的所有祖先 pid。**绝不能**结束它们 —— 那是用户的终端/启动器。"""
+    out: set[int] = set()
+    try:
+        if os.name == "nt":
+            raw = _run_quiet(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                 "Get-CimInstance Win32_Process | "
+                 'ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }'],
+                timeout=25.0)
+            parent: dict[int, int] = {}
+            for line in raw.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    parent[int(parts[0])] = int(parts[1])
+            cur = os.getpid()
+            for _ in range(64):
+                nxt = parent.get(cur)
+                if not nxt or nxt in out or nxt == cur:
+                    break
+                out.add(nxt)
+                cur = nxt
+        else:
+            cur = os.getpid()
+            for _ in range(64):
+                with open(f"/proc/{cur}/status", encoding="utf-8") as f:
+                    ppid = 0
+                    for line in f:
+                        if line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                            break
+                if not ppid or ppid in out or ppid == cur:
+                    break
+                out.add(ppid)
+                cur = ppid
+    except Exception:
+        pass
+    return out
+
+
+def _describe_pid(pid: int) -> str:
+    cmd = _cmdline_of(pid)
+    if not cmd:
+        return f"    pid {pid}: (取不到命令行)"
+    if len(cmd) > 200:
+        cmd = cmd[:197] + "..."
+    return f"    pid {pid}: {cmd}"
+
+
+def _ensure_port_free(host: str, port: int, force: bool = False) -> None:
     """启动前检查端口，避免「撞端口 → 无限重启」的重启风暴。
 
     线上症状：systemd 与宝塔面板同时在拉起本服务，后启动的因
     `address already in use` 立刻退出，而 `Restart=always` 让它每 5 秒重试，
     累计重启 12603 次，日志被刷爆。这里在 bind 之前就明确判断：
 
-      * 端口空闲              → 正常启动；
-      * 被**本项目的旧实例**占用 → 说明是「重启」：结束旧实例、等端口释放后接管；
-      * 被**其它进程**占用      → 明确报错并退出，绝不盲目重启、更不误杀别人。
+      * 端口空闲                → 正常启动；
+      * 被**本项目的旧实例**占用  → 说明是「重启」：结束旧实例、等端口释放后接管；
+      * 被**其它进程**占用        → 报错退出；只有显式 `--force` 才结束它。
 
     为什么要主动接管而不是直接退出：实测发现，宝塔停止项目时若只 kill 了
     `main.py` 而没能带走它派生的 uvicorn 子进程，端口就会被这个孤儿一直占着。
     此时新实例若只是「退出报错」，面板会显示启动失败，且 pid 文件记录的是
     已死的进程 —— 之后每次「停止」都杀不掉真正在跑的 uvicorn，形成死结。
     主动接管可以自愈这种情况。
+
+    参数 `force` 由 `--force` 传入：**只**用于「明知占端口的不是本项目、但
+    确认要重启」的场景（例如上次是别的方式拉起来的、命令行特征对不上）。
+    默认关闭，因为误杀别人的服务是不可逆的。
     """
     if not _port_in_use(host, port):
         return
 
-    pids = _pid_listening_on(port)
-    ours = [p for p in pids if _is_our_instance(p)]
+    pids = _listener_pids(port)
 
-    # 情况一：被本项目的旧实例占用 —— 这是一次重启，接管它
+    # 拿不到 pid 时不做任何猜测（例如权限不足）：直接报错，交给用户处理。
+    if not pids:
+        _log(f"❌ 端口 {port} 已被占用，但无法识别占用进程的 pid"
+             f"（可能是权限不足，试试以管理员/root 运行）。")
+        _log(f"    → 或改用其他端口： python main.py --port {port + 1}")
+        sys.exit(3)
+
+    cmds = {p: _cmdline_of(p) for p in pids}
+    # 祖先进程绝不能杀（那是调用我们的终端 / 启动器）。若发现端口的持有者
+    # 竟是自己的祖先，说明判断链有问题，宁可停手报错。
+    ancestors = _ancestor_pids() | {os.getpid()}
+    danger = [p for p in pids if p in ancestors]
+    if danger:
+        _log(f"❌ 端口 {port} 的占用进程 {danger} 是本进程的祖先（终端/启动器），"
+             f"拒绝结束以免杀掉你自己。")
+        _log("    → 请手动处理，或改用其他端口。")
+        sys.exit(3)
+
+    ours = [p for p in pids if _looks_like_our_service(cmds.get(p, ""))]
+
     if ours and len(ours) == len(pids):
-        _log(f"[main] 端口 {port} 被本项目的旧实例占用（pid {', '.join(map(str, ours))}），"
-             f"按「重启」处理：先结束旧实例…")
-        for pid in ours:
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.kill(pid, sig)
-                except ProcessLookupError:
-                    break
-                except Exception:
-                    break
-                time.sleep(1.0 if sig == signal.SIGTERM else 0.2)
-                if not _port_in_use(host, port):
-                    break
-        deadline = time.time() + _RESTART_WAIT
-        while time.time() < deadline and _port_in_use(host, port):
-            time.sleep(0.5)
-        if _port_in_use(host, port):
+        _log(f"[main] 端口 {port} 被本项目的旧实例占用"
+             f"（pid {', '.join(map(str, ours))}），按「重启」处理：先结束旧实例…")
+    elif force:
+        _log(f"[main] ⚠️  --force：端口 {port} 被非本项目进程占用"
+             f"（pid {', '.join(map(str, pids))}），仍按你的要求结束它…")
+    else:
+        _log(f"❌ 端口 {port} 已被占用，无法启动（占用者不是本项目进程）。")
+        for pid in pids:
+            _log(_describe_pid(pid))
+        _log(f"    → 确认它确实该停，再强制重启： python main.py --force"
+             f"（会结束 pid {', '.join(map(str, pids))}）")
+        _log(f"    → 或改用其他端口： python main.py --port {port + 1}")
+        _log("    提示：同一端口只应由一个管理器负责（systemd 或宝塔面板，二选一）。")
+        sys.exit(3)
+
+    # 结束监听进程（含子进程）。先杀监听者，再清理同项目的残留包装进程。
+    for pid in pids:
+        _log(f"    → 结束 pid {pid}")
+        _terminate_tree(pid)
+
+    if not _wait_port_released(host, port, _RESTART_WAIT):
+        # 最后手段：再杀一轮同项目的相关进程（有时真正握着 socket 的是兄弟进程）
+        extra = [p for p in _our_related_pids() if p not in pids]
+        if extra:
+            _log(f"    端口仍未释放，继续结束同项目的相关进程：{extra}")
+            for pid in extra:
+                _terminate_tree(pid)
+        if not _wait_port_released(host, port, 8.0):
             _log(f"❌ 旧实例在 {_RESTART_WAIT:.0f}s 内仍未释放端口 {port}，本次不启动。")
+            still = _listener_pids(port)
+            for pid in still:
+                _log(_describe_pid(pid))
             _log("    → 请手动检查后重试。")
             sys.exit(3)
-        _log("[main] 旧实例已结束，端口已释放，继续启动。")
-        return
 
-    # 情况二：被其它进程占用 —— 绝不动它，直接失败
-    _log(f"❌ 端口 {port} 已被占用，无法启动（当前已有实例在运行）。")
-    if pids:
-        _log(f"    占用进程 pid: {', '.join(str(p) for p in pids)}")
-        for pid in pids:
-            try:
-                with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    cmdline = f.read().replace(b"\0", b" ").decode(errors="ignore").strip()
-                if cmdline:
-                    _log(f"    pid {pid}: {cmdline}")
-            except Exception:
-                pass
-        _log(f"    → 若确认要重启，请先停掉旧进程： kill {' '.join(str(p) for p in pids)}")
-    _log(f"    → 或改用其他端口： python main.py --port {port + 1}")
-    _log("    提示：同一端口只应由一个管理器负责（systemd 或宝塔面板，二选一）。")
-    sys.exit(3)
+    _log("[main] 旧实例已结束，端口已释放，继续启动。")
 
 
 def main() -> None:
@@ -317,12 +647,19 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="workbuddy2api 一键启动（单端口：管理后台 + 内嵌网关）")
     ap.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
     ap.add_argument("--port", type=int, default=8790, help="服务端口（默认 8790）")
+    ap.add_argument("--restart", action="store_true",
+                    help="端口被占用时先结束占用者再启动（本项目旧实例默认就会自动接管；"
+                         "此开关用于占用者是其它进程、但确认要强制重启的情况）")
+    ap.add_argument("--force", action="store_true",
+                    help="--restart 的别名（强制结束占用端口的进程，慎用）")
     args = ap.parse_args()
 
     # 端口自检：已有实例在跑就明确退出，绝不反复撞端口（线上重启风暴的根因）。
+    # 本项目的旧实例会被自动接管（等价于重启）；别人的进程默认不碰，除非 --restart/--force。
     _check_port = int(os.getenv("ADMIN_PORT", str(args.port)))
     _check_host = os.getenv("ADMIN_HOST", args.host)
-    _ensure_port_free(_check_host, _check_port)
+    _ensure_port_free(_check_host, _check_port,
+                      force=bool(args.restart or args.force))
 
     # 部署安全检查
     secret = os.getenv("ADMIN_JWT_SECRET", "")

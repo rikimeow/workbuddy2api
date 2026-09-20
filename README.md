@@ -464,7 +464,28 @@ python3 -m venv .venv && source .venv/bin/activate && pip install -r requirement
 python main.py
 # 或指定监听
 python main.py --host 0.0.0.0 --port 8790
+# 端口被别的程序占用时，强制结束它再启动
+python main.py --restart
 ```
+
+**重启 = 再跑一次，不用先手动杀进程。** `main.py` 在 bind 之前会先看端口：
+
+| 占用者 | 行为 |
+|--------|------|
+| 端口空闲 | 正常启动 |
+| **本项目自己的旧实例**（uvicorn `admin.server:app` / 项目路径 + 入口脚本） | **自动结束旧实例并接管**，等价于一次重启 |
+| 别的程序 | 报错退出并打印它的 pid 与命令行，**不动它**；确认要停才加 `--restart` |
+
+为什么要自动接管：实测中宝塔「重启」是 stop → sleep(1) → start，
+若旧进程优雅退出略慢于 1 秒，端口就仍被占着；更常见的是停止时只 kill 了
+`main.py` 而没带走它派生的 uvicorn 子进程，端口被这个孤儿一直占着，
+面板于是显示「启动失败」，pid 文件记的还是已死的进程 —— 之后每次「停止」
+都杀不掉真正在跑的 uvicorn，形成死结。主动接管可自愈这种情况。
+
+> 为什么默认**不**杀别的程序：判据一旦放宽就可能误杀无关进程（本机实测过
+> 误伤编辑器与终端），误杀的代价不可逆。所以判据很严：要么 uvicorn 目标是
+> `admin.server:app`，要么「命令行由 python 解释器执行 + 含项目根目录 + 含本项目入口脚本」。
+> 调用本服务的**祖先进程**（终端 / 启动器）永不结束。
 
 启动后：
 
@@ -1060,7 +1081,7 @@ workbuddy2api/
 │   ├── routers/              # accounts / app_source / client_profile / groups / growth / keys / proxy / schedules / logs / stats / sync / models
 │   └── static/index.html     # 纯 HTML + TailwindCSS + FontAwesome 管理大屏
 ├── tests/                    # 本地回归测试（.gitignore 忽略，不进仓库）
-│   ├── test_pool.py          # 号池治理 / 错误分类 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包（341 项）
+│   ├── test_pool.py          # 号池治理 / 错误分类 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包 / 端口接管（391 项）
 │   ├── test_e2e_db.py        # 真实库端到端：迁移 / 保活任务 / 选号链路（48 项）
 │   └── test_gateway_smoke.py # 真实上游端到端冒烟（9 项，会消耗少量积分）
 ├── wb_install.py             # WorkBuddy 安装位置 / 版本号 / 风控配置自动发现（不写死盘符）
@@ -1567,7 +1588,7 @@ cache miss     5.2 ms      每 30 秒最多一次
 ### 10.12 这批改动的验证
 
 ```bash
-.venv\Scripts\python.exe tests\test_pool.py            # 375 项，不依赖库/网络
+.venv\Scripts\python.exe tests\test_pool.py            # 391 项，不依赖库/网络
 .venv\Scripts\python.exe test_upstream_compat.py       #  74 项，上游协议兼容/思考开关（本地文件，不入仓库）
 .venv\Scripts\python.exe tests\test_e2e_db.py          #  48 项，连真实 MySQL（只读 + 幂等迁移）
 .venv\Scripts\python.exe tests\test_gateway_smoke.py   #   9 项，真实上游端到端（会消耗少量积分）
@@ -1646,7 +1667,7 @@ cache miss     5.2 ms      每 30 秒最多一次
 - 客户端参数档案（UA / 版本号 / 风控头 / 桌面指纹）的**探测→保存→生效→同步**闭环；
 - 后台一键拆包与路径自动补齐（`ADMIN_DEV_TOOLS`）；
 - `create_canvas` 的真实 id 口径与两段式状态机（`accept` → 完成 → `claim`）；
-- 全部测试（`test_pool.py` 341 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
+- 全部测试（`test_pool.py` 391 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
 
 ### 如果引用有误
 
