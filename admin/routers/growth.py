@@ -357,6 +357,21 @@ def run_accounts(account_ids: list[int], task_codes: list[str] | None,
                     times = max(1, min(times, _MAX_TIMES))
 
                     fire_model = plan.model or model
+                    # Ardot 类任务的前置条件：账号必须已绑定 Ardot，否则取票会
+                    # 得到 10101 access token not found，任务**必然**失败。
+                    # 实测 15 个账号里 10 个初始未绑定，所以这里主动补绑定，
+                    # 而不是让用户看到一条「未换取 Ardot access token」的报错。
+                    if plan.firer == "fire_design_canvas":
+                        try:
+                            if not s.ensure_ardot_connected():
+                                item["last_error"] = (
+                                    "账号未能绑定 Ardot（connector 授权失败），"
+                                    "该任务需要先完成 Ardot 授权")
+                                acc_log["tasks"].append(item)
+                                continue
+                        except Exception as e:
+                            item["last_error"] = f"Ardot 绑定检查失败：{e}"
+
                     fired = 0
                     for _ in range(times):
                         # 两种触发方式：

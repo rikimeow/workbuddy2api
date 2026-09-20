@@ -42,6 +42,28 @@ import upstream_compat
 _HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
 
 
+def _stream_timeout() -> httpx.Timeout:
+    """流式/SSE 聚合请求的超时：只约束静默，不设响应总时长。
+
+    为什么不用 `timeout=300`：它会展开成 connect/read/write/pool **各** 300s。
+    read=300 本身是对的（上游在持续吐字就一直续期），但 connect=300 意味着
+    一个连不上的账号要让我们干等最多 5 分钟才换号 —— 这才是「卡住不动」的主因。
+
+    更要紧的是必须避免「给流式响应设总时长」这个坑。依据是官方客户端自己的
+    源码（D:\\WorkBuddy\\resources\\app.asar.unpacked 内 ardot-mcp-app 的
+    `_workbuddy-runtime/mcp-app-bootstrap.cjs`）：官方把 Node 18+ 默认的
+    `http.Server.requestTimeout = 300000`（**总时长**）显式锁到 0，因为到点会
+    在流仍活跃时强行掐断长连接 SSE，客户端只看到 undici `TypeError: terminated`。
+    我们这边同理：绝不给流式响应设 deadline。
+    """
+    return httpx.Timeout(
+        connect=float(os.getenv("ADMIN_STREAM_CONNECT_TIMEOUT", "15")),
+        read=float(os.getenv("ADMIN_STREAM_IDLE_TIMEOUT", "180")),
+        write=float(os.getenv("ADMIN_STREAM_WRITE_TIMEOUT", "60")),
+        pool=float(os.getenv("ADMIN_STREAM_POOL_TIMEOUT", "20")),
+    )
+
+
 def _client_ip_headers(request: Request, purpose: str = "conversation") -> dict:
     """提取真实客户端 IP 与用途/产品头，透传给上游，避免请求用量里 client/agentPurpose 为空。
 
@@ -99,25 +121,83 @@ from anthropic_adapter import (
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
-USER_AGENT = "codebuddy2openai/2.0"
+#: 出站 User-Agent：**必须**伪装成官方客户端。
+#: 原来这里是 `codebuddy2openai/2.0` —— 一个自报家门的网关标识，上游「使用端」
+#: 列会直接显示它，等于对风控举手。（官方无任何 UA 随机化，故这里保持确定性。）
+#: 形状对齐官方桌面端三段式：`WorkBuddy/<客户端版本> WorkBuddy/<版本> CLI/<CLI版本>`。
+#:
+#: **取值走「客户端参数档案」**（`admin/client_profile.py`），优先级：
+#:     环境变量 > （现场探测 / 后台保存）> 内置兜底
+#:
+#: 为什么不只读 wb_install：用户在后台改了版本号、或者线上实例根本没装客户端，
+#: 都只能靠档案（可保存、可同步）才能报出正确版本。真实来源见 `wb_install`。
+#: 覆盖方式：WORKBUDDY_DESKTOP_VERSION / WORKBUDDY_CLI_VERSION / WORKBUDDY_USER_AGENT。
+from admin import client_profile as cprofile  # noqa: E402  客户端参数档案
+
+# 模块导入期的常量：**不查库**（standalone converter 可能没配 MySQL）。
+# 运行期发请求走 client_user_agent()，那里才读后台保存值。
+_PROFILE_AT_IMPORT = cprofile.effective_local()
+DESKTOP_VERSION = _PROFILE_AT_IMPORT["desktop_version"]
+CLI_VERSION = _PROFILE_AT_IMPORT["cli_version"]
+USER_AGENT = _PROFILE_AT_IMPORT["user_agent"]
+
+
+def client_user_agent() -> str:
+    """**实时的**出站 UA（后台改版本号后立即生效，无需重启）。
+
+    `USER_AGENT` 常量在导入时算好，适合静态引用；发请求建议用本函数，
+    它会问档案（内部 30 秒缓存，保存时立即失效，开销可忽略）。
+    """
+    return cprofile.ua()
+
+
+def describe_client() -> str:
+    """一行客户端诊断信息（启动日志 / 排障用）。
+
+    UA 走档案（可能与探测值不同 —— 比如后台改过版本号），
+    后半段 `WB.describe()` 给的是**安装包**的真实探测来源，两者对照着看
+    最容易发现「线上在报兜底版本」这类问题。
+    """
+    ua = cprofile.ua()
+    try:
+        from wb_install import WB
+        return f"UA={ua}｜{WB.describe()}"
+    except Exception:
+        return f"UA={ua}"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
 # ---------------------------------------------------------------------------
 
 def auth_dirs() -> list[Path]:
+    """返回按优先级排列的候选 auth 目录。
+
+    优先级：
+      1. 显式配置的 CODEBUDDY_AUTH_DIR（部署在服务器上时应始终配置它）
+      2. 平台默认的桌面端数据目录
+      3. 项目内 `auth/`（把凭据随项目一起部署时用）
+      4. /opt/workbuddy2api/auth（历史部署路径）
+
+    3/4 是兜底：服务器（尤其 Linux 上没装桌面端）常常既没有平台默认目录，
+    也忘了配 CODEBUDDY_AUTH_DIR，结果 /gw 下所有端点 503。多列几个候选能让
+    「凭据放对地方」就自动生效，而不是必须记得配环境变量。
+    """
     env_dir = os.environ.get("CODEBUDDY_AUTH_DIR")
     if env_dir:
         return [Path(env_dir)]
     home = Path.home()
     plat = sys.platform
     if plat == "darwin":
-        return [home / "Library" / "Application Support" / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
-    if plat == "win32":
+        dirs = [home / "Library" / "Application Support" / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
+    elif plat == "win32":
         local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
-        return [local / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
-    xdg = Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share"))
-    return [xdg / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
+        dirs = [local / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
+    else:
+        xdg = Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share"))
+        dirs = [xdg / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
+    dirs.append(Path(__file__).resolve().parent / "auth")
+    dirs.append(Path("/opt/workbuddy2api/auth"))
+    return dirs
 
 
 def find_auth_file() -> Path | None:
@@ -230,7 +310,7 @@ class CredentialManager:
             "X-Enterprise-Id": account.get("enterpriseId", ""),
             "X-Tenant-Id": account.get("enterpriseId", ""),
             "X-Domain": domain,
-            "User-Agent": USER_AGENT,
+            "User-Agent": client_user_agent(),
         }
         # 风控设备头：与桌面端 Turing Shield 一致，缺失会被上游识别为异常客户端。
         # 取不到（桌面端未安装 / SDK 不支持）时优雅降级为不带该头，不影响主流程。
@@ -840,7 +920,7 @@ async def chat_completions(request: Request,
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        async with httpx.AsyncClient(timeout=300, limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -1041,7 +1121,10 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                 saw_filter = True
 
     try:
-        async with httpx.AsyncClient(timeout=None, limits=_HTTP_LIMITS) as c:
+        # 原来是 timeout=None（完全不设限）：连接一旦静默死掉就永久挂住，
+        # 既不报错也不归还资源。改成静默超时 —— 有数据就续期、静默到上限才判死，
+        # 等价于参考实现 internal/upstream/idle.go 的空闲监控，且不设总时长。
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -1109,7 +1192,10 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
 
 
 async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, bytes]:
-    async with httpx.AsyncClient(timeout=120, limits=_HTTP_LIMITS) as c:
+    # 这也是在消费一个 SSE 流（只是聚合成一次性字节），所以用同一套超时：
+    # connect 短、read 管静默、**不设总时长**。原来的 timeout=120 会把 connect
+    # 也设成 120s，遇到连不上的节点就一直挂着不换号。
+    async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
         async with c.stream("POST", url, headers=headers, json=body) as r:
             chunks: list[bytes] = []
             async for chunk in r.aiter_bytes():
@@ -1334,7 +1420,7 @@ async def create_message(request: Request,
 
     # 非流式：聚合后端 SSE → 组装单个 Anthropic Message 对象
     try:
-        async with httpx.AsyncClient(timeout=300, limits=_HTTP_LIMITS) as c:
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
             async with c.stream("POST", url, headers=headers, json=chat_body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -1401,7 +1487,10 @@ async def _stream_anthropic(url: str, headers: dict, body: dict,
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async with httpx.AsyncClient(timeout=None, limits=_HTTP_LIMITS) as c:
+        # 原来是 timeout=None（完全不设限）：连接一旦静默死掉就永久挂住，
+        # 既不报错也不归还资源。改成静默超时 —— 有数据就续期、静默到上限才判死，
+        # 等价于参考实现 internal/upstream/idle.go 的空闲监控，且不设总时长。
+        async with httpx.AsyncClient(timeout=_stream_timeout(), limits=_HTTP_LIMITS) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()

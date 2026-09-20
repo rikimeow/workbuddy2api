@@ -25,9 +25,9 @@
 
 **成长任务是本项目的核心亮点**：逆向出任务进度由**两条通道**驱动——一条是模型请求体里的 `extra_vars.growthEvent`，另一条是**客户端真实业务事件上报**（`POST /v2/report`）。两条通道都用**完全合法的请求**（正常 200 响应、免费模型或零成本事件、真实业务对象 id），因此能完成其中绝大多数任务并顺带把奖励领到手。详见 [第六章](#六成长计划任务growth)。
 
-> 共有 **14 个可自动完成的任务**（单账号满额 1400 积分），覆盖对话、技能、自动化、模型体验、资料库、灵感案例、召唤专家、专家团、换肤、桌面端应用等类型。触发方式分两类：`growthEvent` 与**真实业务事件上报**，详见 [6.6](#66-两类触发通道关键区分)。新增的同类任务会被[模式规则](#68-新增任务会自动识别模式匹配)自动识别。
+> 共有 **15 个可自动完成的任务**（单账号满额 1700 积分），覆盖对话、技能、自动化、模型体验、资料库、灵感案例、召唤专家、专家团、换肤、桌面端应用、**设计画布**等类型。触发方式分三类：`growthEvent`、**真实业务事件上报**、以及 **Ardot MCP 工具直调**（`create_canvas`），详见 [6.6](#66-两类触发通道关键区分)。新增的同类任务会被[模式规则](#68-新增任务会自动识别模式匹配)自动识别。
 >
-> 唯一不做的是 `create_canvas`（事件里要自造画布 id，属伪造业务对象）、`expert_5_paid`（付费）与 `Expert_Philanthropy`（需真实捐款）。
+> 不做的只剩付费与需真实捐款的：`expert_5_paid`（付费）、`Expert_Philanthropy`（需真实捐款）。
 
 ---
 
@@ -52,7 +52,21 @@
 - [七、客户端接入](#七客户端接入)
 - [八、日志与排障](#八日志与排障)
 - [九、项目结构](#九项目结构)
-- [十、免责声明与协议](#十免责声明与协议)
+- [十、稳定性与流量治理（限速 / 并发 / 保活）](#十稳定性与流量治理限速--并发--保活)
+  - [10.1 选号：三因子加权 + Top-N 抽签](#101-选号三因子加权--top-n-抽签)
+  - [10.2 并发：在途租约（把并发摊平到全池）](#102-并发在途租约把并发摊平到全池)
+  - [10.3 会话粘性：同一会话固定同一账号](#103-会话粘性同一会话固定同一账号)
+  - [10.4 错误分类与账号处置（一张表看懂）](#104-错误分类与账号处置一张表看懂)
+  - [10.5 WAF：IP 级 fail-fast](#105-wafip-级-fail-fast)
+  - [10.6 轮转退避：指数 + 抖动](#106-轮转退避指数--抖动)
+  - [10.7 超时：最要紧的一处修复](#107-超时最要紧的一处修复)
+  - [10.8 token 保活](#108-token-保活)
+  - [10.9 拟人化请求头](#109-拟人化请求头)
+  - [10.10 客户端版本与逆向产物：自动发现 / 自动产出](#1010-客户端版本与逆向产物自动发现--自动产出)
+  - [10.11 非流式：一个必须修的协议违约](#1011-非流式一个必须修的协议违约)
+  - [10.12 这批改动的验证](#1012-这批改动的验证)
+  - [10.13 什么不进仓库](#1013-什么不进仓库)
+- [十一、免责声明与协议](#十一免责声明与协议)
 
 ---
 
@@ -60,16 +74,19 @@
 
 本项目在落地反代逻辑、补齐风控头之前，先对 **WorkBuddy 桌面端** 做了逆向分析，目的是拿到「真实接口形态 / 必需请求头 / 活动结束时间等字段」，而不是盲猜。产物是 `app_source/`（解包后的前端 + 主进程源码）。
 
-> `app_source/` 是 **逆向产物，不在本仓库内**（存在于 `D:\workbuddy\app_source`），本仓库只收录「解包流程」与「反代实现」。
+> `app_source/` 是 **逆向产物，不在本仓库内**（本机解包在 `workbuddy/resources/app_source`），本仓库只收录「解包流程」与「反代实现」。
 
 ### 1.1 目标与边界
 
+> 下表的路径以本机为例。**安装位置因人而异**，运行时代码全部自动发现，
+> 不依赖这里的路径（见 [10.10](#1010-客户端版本与逆向产物自动发现--自动产出)）。
+
 | 项 | 说明 |
 |------|------|
-| 安装目录 | `D:\workbuddy`（Windows，Git Bash 风格） |
-| 主程序包 | `D:\workbuddy\resources\app.asar`（Electron 打包，约 287MB） |
-| 解包产物 | `D:\workbuddy\app_source`（cli / main / preload / renderer） |
-| 原生模块 | 桌面端安装目录下的 `resources/app.asar.unpacked/native/turing-sdk`（运行时由 `turing_helper.js` 自动发现本机安装位置，可用 `WORKBUDDY_TURING_SDK_DIR` 覆盖） |
+| 安装目录 | `D:\workbuddy` 或 `D:\WorkBuddy`（Windows） |
+| 主程序包 | `<安装目录>\resources\app.asar`（Electron 打包，约 287MB） |
+| 解包产物 | `<安装目录>\app_source`（cli / main / preload / renderer） |
+| 原生模块 | 桌面端安装目录下的 `resources/app.asar.unpacked/native/turing-sdk`（运行时由 `turing_helper.js` 自动发现本机安装位置，可用 `WORKBUDDY_TURING_SDK_DIR` / `WORKBUDDY_INSTALL_DIR` 覆盖） |
 
 解包不是为了修改桌面端，而是为了 **确认接口契约**：
 
@@ -80,7 +97,23 @@
 
 ### 1.2 解包步骤
 
-> 前置：本机已装 **Node.js**（含 npm）。as工具用 `asar` npm 包。
+> **推荐做法：用项目内置的纯 Python 抽取器**，不需要 Node、npm，也不用先装
+> `asar` npm 包（服务器上照样能跑）：
+>
+> ```bash
+> python wb_asar.py extract                 # 抽到用户缓存目录
+> python wb_asar.py extract --dest D:/wb_source
+> python wb_asar.py list --grep canvas      # 只想看某些文件
+> python wb_asar.py read /package.json      # 读单个文件（unpacked 自动分流）
+> ```
+>
+> 它会**自动定位** app.asar（不用手填路径），并且正确处理 `unpacked`：
+> 数据在 asar 里的定位读，标记 `unpacked` 的去 `app.asar.unpacked/` 读。
+> 实测全量抽取 **2242 个文件 / 225MB / 14 秒，0 缺失**。
+>
+> 下面保留**Node 方案**作为参考（知道官方工具链怎么用也有价值）。
+
+> 前置：本机已装 **Node.js**（含 npm）。asar 工具用 `asar` npm 包。
 
 **（1）安装 asar 工具**（在 WorkBuddy 的 managed node workspace 里装，避免污染全局）：
 
@@ -95,6 +128,7 @@ npm install asar --no-save
 
 ```js
 const asar = require('asar');
+// 路径按本机实际情况改；运行时逻辑不受影响（自动发现）
 const src  = 'D:\\workbuddy\\resources\\app.asar';
 const dest = 'D:\\workbuddy\\app_source';
 const prefixes = ['main', 'preload', 'renderer'];
@@ -118,15 +152,19 @@ for (const file of files) {
 node extract_source_files.js
 ```
 
-产物结构：
+产物结构（`python wb_asar.py extract` 产出相同结构）：
 
 ```text
-D:\workbuddy\app_source\
+<安装目录>\app_source\        # 或 WORKBUDDY_SOURCE_DIR 指定处
 ├── cli/          # product.json（含 turingSdk.channelId、版本号等配置）
 ├── main/         # Electron 主进程：AuthService、server.js、tar.js、index.js（Turing SDK 桥接）
 ├── preload/      # 预加载脚本（renderer ↔ main IPC 通道）
 └── renderer/     # 前端打包代码（assets/*.js、国际化 zh-cn-*.js）
 ```
+
+> 注意：用 Node 方案时，`cli/product.json`、`cli/dist/codebuddy.js`、
+> `native/turing-sdk/` 在官方包里是 **unpacked** 的，`asar extract` 会因为
+> 找不齐二进制而中途失败。`wb_asar.py` 对这两类文件分别处理，所以能一次抽全。
 
 ### 1.3 关键逆向发现（直接驱动了反代实现）
 
@@ -220,17 +258,28 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 
 > 自动化请求全部走**正常业务接口**（正常 200 响应、免费模型、最小输出），不伪造畸形请求，详见 [6.4](#64-为什么不用直接发完成包-直接发事件)。
 
-### 3.2 稳定性设计（借鉴 `workbuddy2ap-2`）
+### 3.2 稳定性设计
+
+> 详细原理、失效模式与官方源码依据见 [第十章](#十稳定性与流量治理限速--并发--保活)。这里只列位置索引。
 
 | 机制 | 实现位置 | 说明 |
 |------|----------|------|
 | **连接池** | `converter.py` / `admin/backend.py` | `httpx.Limits(max_connections=100, max_keepalive_connections=20)`，减少 TLS 握手 |
-| **账号级重试** | `admin/routers/proxy.py` | 单请求最多 3 次账号轮换；429/5xx/网络错误自动换号，401 session 死亡直接禁用 |
-| **错误分类** | `_classify_error` | 余额不足 / 429 / 404 / 5xx / session 死亡 / 网络层 分别处理 |
-| **errCount 策略** | `_apply_account_policy` | 网络层错误不累计；404 短冷却不累计；HTTP 5xx 累计，阈值 5 触发 10m 冷却 |
-| **防撞号** | `_select_account` | `last_picked_at` 100ms 窗口，同一账号高并发时不被重复选中 |
-| **状态持久化** | `accounts` 表 + `init_db` 迁移 | 冷却/错误计数/禁用原因直接落库，进程重启不丢失（DB 等价于 state.json） |
-| **凭证续期** | `converter.CredentialManager._refresh` | token 临近过期自动刷新，刷新失败在代理层禁用账号 |
+| **分级超时** | `admin/routers/proxy.py::_stream_timeout` | connect/read/write/pool 四项分设。**流式绝不设总时长**；read 承担 SSE 静默监控 |
+| **账号轮换** | `admin/routers/proxy.py` | 轮换次数可配（`ADMIN_POOL_MAX_ROTATE`）；错误按分类自动换号/换模型 |
+| **在途租约** | `admin/pool.py::InFlight` | 单账号在途上限，占满的号不参与选号；`finally` 兜底释放 |
+| **会话粘性** | `admin/pool.py::StickyRouter` | 同会话固定同账号（TTL 滚动续期），成功后重绑到实际成功的号 |
+| **加权选号** | `admin/pool.py::weighted_pick` | 三因子权重 + Top-5 短名单抽签（`ADMIN_ACCOUNT_SELECT=weighted`） |
+| **错误分类** | `_classify_error` | 6004 模型级 / 11102 无此模型 / 11140 / 14017 / 12153 / 429 / 402 / WAF 403 分层判定 |
+| **错误处置** | `_apply_account_policy` + `_note_success` | 每类错误各自的恢复依据；冷却取「或门」；**成功即清零连败计数** |
+| **熔断 / 降权** | `breaker_until` / `degrade_until` | 连续失败按指数退避熔断；连败降权临时出池 |
+| **模型级冷却** | `AccountModelCooldown` 表 | `(账号, 模型)` 粒度：6004 只冷却该模型，账号对别的模型照常可用 |
+| **WAF IP 闸** | `admin/pool.py::WafIpGate` | 60s 内 ≥2 个不同账号 403 → 判定出口 IP 被拦，停止轮转 |
+| **轮转退避** | `admin/pool.py::backoff_after_ms` | `500ms·2^n` 封顶 8s，再 ±25% 抖动（打散重试聚团） |
+| **防撞号** | `admin/pool.py::RecentPick` | 100ms 内存窗口（不再每次选号都 commit 数据库） |
+| **token 保活** | `admin/scheduler.py::run_keepalive_tokens` | 每日整点串行节流刷新全部活跃账号，保登录态存活 |
+| **状态持久化** | `accounts` 表 + `init_db` 迁移 | 冷却/熔断/连败/禁用原因直接落库，进程重启不丢失 |
+| **凭证续期** | `converter.CredentialManager._refresh` | token 临近过期自动刷新，刷新失败在代理层按分类处置 |
 | **请求级表格日志** | `_log_chat_row` | 每个 `/v1/chat/completions` 请求出口打印 `seq / TTFB / uid / tokens / latency / error_kind` |
 
 ### 3.3 技术栈
@@ -267,7 +316,22 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 
 ### 3.5 环境变量（admin）
 
-`ADMIN_DATABASE_URL` · `ADMIN_REDIS_URL` · `ADMIN_BACKEND` · `ADMIN_USERNAME` · `ADMIN_PASSWORD` · `ADMIN_JWT_SECRET`（≥32 字节）· `ADMIN_JWT_EXPIRE_HOURS` · `ADMIN_COST_PER_TOKEN` · `ADMIN_ACCOUNT_SELECT`（`remain` / `lru`）· `ADMIN_PORT` · `ADMIN_CLIENT_AUTH_DIR`
+`ADMIN_DATABASE_URL` · `ADMIN_REDIS_URL` · `ADMIN_BACKEND` · `ADMIN_USERNAME` · `ADMIN_PASSWORD` · `ADMIN_JWT_SECRET`（≥32 字节）· `ADMIN_JWT_EXPIRE_HOURS` · `ADMIN_COST_PER_TOKEN` · `ADMIN_ACCOUNT_SELECT`（`remain` / `lru` / `weighted`）· `ADMIN_PORT` · `ADMIN_CLIENT_AUTH_DIR`
+
+流量治理（详见 [第十章](#十稳定性与流量治理限速--并发--保活)，完整清单见 `.env.example`）：
+
+- `ADMIN_POOL_MAX_IN_FLIGHT`（默认 `3`，`0`=不限）—— 单账号最大在途请求数
+- `ADMIN_POOL_MAX_ROTATE`（默认 `3`）—— 单请求最多换号次数
+- `ADMIN_SESSION_STICKY`（默认 `1`）· `ADMIN_SESSION_STICKY_TTL`（1800）· `ADMIN_SESSION_STICKY_GC`（300）
+- `ADMIN_POOL_SOFT_RATE` / `ADMIN_POOL_SOFT_RATE_MAX`（600 / 7200）—— 429 冷却基数与封顶
+- `ADMIN_POOL_BREAKER_THRESHOLD` / `_COOLDOWN` / `_COOLDOWN_MAX`（5 / 600 / 21600）—— 熔断
+- `ADMIN_POOL_SESSION_DEAD_THRESHOLD`（默认 `3`）—— 连续几次 12153 才禁用账号
+- `ADMIN_POOL_MODEL_SOFT_RATE`（600）· `ADMIN_POOL_MODEL_BLOCK`（21600）—— 模型级冷却 TTL
+- `ADMIN_STREAM_CONNECT_TIMEOUT`（15）· `ADMIN_STREAM_IDLE_TIMEOUT`（180）· `ADMIN_STREAM_WRITE_TIMEOUT`（60）· `ADMIN_STREAM_POOL_TIMEOUT`（20）
+- `ADMIN_KEEPALIVE_ENABLED`（`1`）· `ADMIN_KEEPALIVE_HOURS`（`22`，可逗号分隔多个）· `ADMIN_KEEPALIVE_ACCOUNT_GAP`（`0.8`）
+
+> ⚠️ `ADMIN_STREAM_IDLE_TIMEOUT` 是**静默**上限（有数据就续期），不是响应总时长。
+> 不要试图把它改成「总超时」语义 —— 那会掐断长时间推理的活跃流（见 §10.7）。
 
 Anthropic 端点（`/v1/messages`）相关：
 
@@ -528,15 +592,20 @@ not_accepted ──accept──► accepted ──触发──► in_progress �
 | `Buddy_App` 发现应用 | 简单 | 桌面指纹 buddyapp 五连事件 | ✅ |
 | `Buddy_App_QQ` 企鹅教师助手 | 简单 | 同一组五连事件 | ✅ |
 | `RichMeow_Chat` 桌面端对话 | 简单 | 桌面指纹 6 连对话事件链 | ✅ |
+| `create_canvas` 设计创意模式 | 简单 | **真实调 Ardot MCP `create_design` 创建画布**，用返回的真实 fileId 上报遥测 | ✅ +300 |
 
 **不做 / 跳过**：
 
 | 任务 | 分级 | 原因 |
 |------|------|------|
-| `create_canvas` 设计创意模式 | 复杂 | 事件里要自造 `wb-<ms>` 画布 id，属**伪造业务对象**，不做 |
 | `expert_5_paid` 付费召唤专家 | 复杂 | 付费任务，无收益 |
 | `Expert_Philanthropy` 公益专家 | 复杂 | 需真实捐款动作，无法代做 |
 | `black_cat` 夜猫子折扣 | 跳过 | 奖励为 0 |
+
+> `create_canvas` 从「不做」变为「可自动」的过程见 [6.7](#67-对象-id-一律现拉绝不编造)。
+> 关键点是：真实画布 id 完全可以拿到，只是**必须真的去创建画布**，而不是编一个 id。
+> 已真机验证：账号 19 上报后成长中心显示 `create_canvas` **1/1、+300 分、已领取**。
+
 
 **「模型体验」类任务**（`Model_chat_GLM5.2`）的完成条件是 **请求体里的 `model` 必须真的是 `glm-5.2`**，发事件包一律无效。用 `max_tokens=1` 最小输出调用一次即可，倍率 0.79、单次成本极低。
 
@@ -558,7 +627,7 @@ not_accepted ──accept──► accepted ──触发──► in_progress �
 | `chat`（copilot.tencent.com） | 市场/场景接口、桌面事件 | 桌面事件需注入**桌面指纹** |
 | `web`（workbuddy.cn） | 浏览器行为 | 浏览器 UA + `Origin`/`Referer` + `x-client-platform: web` |
 
-**桌面指纹**（`Buddy_App` / `RichMeow_Chat` 必需）：`ideName=WorkBuddy`、`extName=workbuddy-desktop`、`ideVersion=5.5.6`，其中 `machineId` / `sessionId` **由 uid 稳定派生**——同一账号每次都是同一台「设备」。频繁换设备反而是异常信号。缺这些头会被判为非桌面端来源，事件不计数。
+**桌面指纹**（`Buddy_App` / `RichMeow_Chat` 必需）：`ideName=WorkBuddy`、`extName=workbuddy-desktop`、`ideVersion` / `extVersion` / `commit` / `releaseDate` **均从本机安装包动态读取**（见 [10.10](#1010-客户端版本与逆向产物自动发现--自动产出)），其中 `machineId` / `sessionId` **由 uid 稳定派生**——同一账号每次都是同一台「设备」。频繁换设备反而是异常信号。缺这些头会被判为非桌面端来源，事件不计数。
 
 > 关于任务说明里的「需升级到电脑端 5.5.3 或以上版本」「需下载并使用桌面端」：那是**客户端侧**的提示文案，**服务端只认上报的事件本身**。实测直接上报事件链即可完成，无需真的安装桌面端——这和换肤任务同理（能上报就能完成）。
 
@@ -571,10 +640,127 @@ not_accepted ──accept──► accepted ──触发──► in_progress �
 | `expert_5` / `Expert_team_use_3` / `Expert_lighthouse` | `POST /v2/operation-platform/market/expert/list`（团队任务加 `expert_type=team` 过滤；不带该参数时 400 个专家里只有 1 个 team） |
 | `template_5` | `GET /console/as/support/scenes`（16 个真实场景） |
 | `Hp_Appearance` | `POST /v2/operation-platform/appearance/resources` |
+| `create_canvas` | Ardot MCP `create_design`（见下） |
 
 **拉不到就跳过该任务并如实报错，绝不退化成自造 id。** 伪造业务对象一旦被后端核对就会暴露。
 
-> `create_canvas` 是唯一确认**必须自造** id 的任务（`wb-<ms>`），因此不做。
+#### `create_canvas`：不是不能做，是必须真的去做
+
+早期结论是「事件里要自造 `wb-<ms>` 画布 id，属伪造业务对象，不做」。这个结论**只对了一半**：
+真实画布 id 拿得到，只是必须**真的去创建一个画布**。
+
+关键证据来自官方客户端源码（`D:\WorkBuddy\resources\app.asar.unpacked`，
+用 `scripts/asar_grep.py` 检索到的 ardot 遥测模块）：
+
+1. 画布 id 的真实口径是**纯数字**——`/\bfileId\s+(\d+)\b/`、URL 路径 `/file/(\d+)`。
+   所以 `ardot-file-xxxxxxxx` 或 `wb-1789870000000` 在**形状上**就不可能是真实画布 id。
+2. 那个 id 来自 **Ardot MCP 工具 `create_design`**（appId `ardot/create_design`），
+   而 MCP 工具由客户端 MCP Host 执行，**不是** chat/completions 服务端
+   （官方 mcp-app-policy：「Host 不再 bootstrap tools/call」）。
+   所以「发一条设计对话，等上游回 fileId」是走不通的——实测模型只会把
+   `create_design` 调用**以文本形式**写出来，并明说「无法直接返回真实 fileId」。
+
+因此正确做法是**自己当 MCP 客户端**（`AccountSession.create_ardot_canvas`）：
+
+```text
+0. 确保账号已绑定 Ardot（见下「两个坑」，未绑定的账号取不到 token）
+1. 用账号凭据换 Ardot token
+   GET {账号域}/v2/as/connector/oauth/ardot/accesstoken
+   -> {"code":0,"data":{"access_token":"<JWT>","expire_at":...}}
+   （依据官方 ardot/access-token.ts）
+2. initialize + tools/call create_design  （https://ardot.tencent.com/mcp）
+3. 取回真实纯数字 fileId（拿不到就如实失败，绝不补假的）
+4. 用这个真实 id 上报 wbx_design_canvas_task_create / _open
+```
+
+> 参考项目 `workbuddy2api-panel` 在这里是自造 id（`"ardot-file-" + requestID[-8:]`）。
+> 同一个项目在专家任务里却明确写过「自造 id 不计数」，属于自相矛盾的取巧。
+> 我们走的是完整正路：**真的建一个画布，报一个真的 id**。
+
+#### 两个必须踩对的坑（否则大部分账号直接失败）
+
+**坑一：Ardot 绑定是「按账号」的，不是全局的。**
+
+实测 15 个真实账号里**只有 5 个**天然已绑定，其余 10 个取 token 会返回：
+
+```json
+HTTP 422 {"code":10101,"msg":"access token not found"}
+```
+
+`/status` 显示 `not_connected`。**未绑定 = create_canvas 永远做不了**，
+而报错信息看起来像是「网关取不到 token」，很容易被误判成代码 bug。
+
+修法是照官方 `ardot-manager.ts` 的「影子账号」流程建绑定：
+
+```text
+POST {账号域}/v2/as/connector/oauth/ardot/connect?code=shadow_account_grant
+  -> {"code":0,"data":{"access_token":"<JWT>", ...}}   # 绑定并直接给票
+```
+
+**坑二：`code` 必须是 query，不能当 JSON body 发。**
+
+官方 `callConnectorOauthApi(method, path, deps, query, body, ...)` 的第 4 个
+参数是 **query**。把它当 body 发会得到：
+
+```text
+HTTP 302 -> Location: .../agents/callback?code=10001&httpstatus=400
+           &msg=authorization+code+empty
+```
+
+绑定建不起来。**这个坑很隐蔽**：HTTP 不是 4xx/5xx，而是一个 302 跳转，
+如果只看状态码会以为「请求发出去了」。（实测踩过并修正。）
+
+另外还有「半失效态」自愈：服务端记录还在但凭证失效时，`/connect` 返回
+`409 user already connect`（同样是 302 回跳），重试多少次都一样，
+**必须先 `POST .../revoke` 清掉记录再重绑**。官方的判据刻意放在「取票失败」
+之后——`already connect` 本身不代表凭证坏了，记录在且票能取到就该原样放过，
+此时 revoke 等于白删一个好绑定。
+
+三点都实现在 `AccountSession.connect_ardot()` / `ensure_ardot_connected()`，
+并且成长任务 runner 在执行画布任务前会**主动确保绑定**，所以不会再把
+「账号未绑定」暴露成一条莫名报错。
+
+#### 实测结果
+
+| 账号 | 初始绑定 | 画布 id（真实） | 成长中心 |
+|------|----------|------------------|----------|
+| 19 | 已绑定 | `727757335678209` | 1/1、+300、`claimed` |
+| 38（用户报障） | **未绑定** | `727781592533691` | 1/1、+300、`claimed` |
+| 其余 13 个 | 10 未绑定 | 各自真实 id | 全部 1/1、`claimed` |
+
+**最终 15/15 账号全部 `claimed`，Ardot 绑定 15/15 `connected`。**
+
+#### 任务状态机：必须先「参与」
+
+`create_canvas` 与其它成长任务一样是**两段式**，缺一段都不计数：
+
+```text
+not_accepted --accept--> accepted --完成行为--> completed --claim--> claimed
+                  ↑                        ↑                    ↑
+            不计进度，做了也白做     进度 1/1 但没领奖      奖励到账
+```
+
+- **`accept`**：`POST /v2/activity/growth/tasks/accept`，未参与时进度**不累计**；
+- **`claim`**：`POST /v2/activity/growth/tasks/{code}/claim`，`completed` 不会自动到账。
+  重复领返回 `already_claimed: true`、`credit: 0`（这是正常的，不是失败）。
+
+Runner 两步都会做：执行前对 `not_accepted` 调 `growth_accept`，跑完后把
+`completed` 的逐个 `growth_claim`（见 `admin/routers/growth.py`）。
+
+#### 自查脚本（都在 `scripts/`）
+
+| 脚本 | 用途 |
+|------|------|
+| `survey_ardot_token.py` | 盘点所有账号能否换到 Ardot token |
+| `provision_ardot_all.py` | 为所有未绑定账号建立 Ardot 绑定（`--do` 才写） |
+| `survey_canvas_tasks.py` | 盘点所有账号的 `create_canvas` 状态与进度 |
+| `run_canvas_task.py <id>` | 跑单个账号的完整链路（accept→完成→claim） |
+| `dump_create_design_schema.py` | 打印 `create_design` 的完整 inputSchema |
+| `verify_create_canvas.py --dry\|--report` | 真机建画布 |
+| `probe_shadow_connect.py <id>` | 单独验证影子账号 `/connect`（`--do` 才写） |
+| `check_create_canvas_progress.py` | 核对成长中心进度与积分 |
+
+
 
 ### 6.8 新增任务会自动识别（模式匹配）
 
@@ -673,7 +859,7 @@ curl -X POST -H "X-Admin-Token: <jwt>" -H "Content-Type: application/json" \
 
 每批跑完后，对应任务的**所有账号状态均为 `claimed`**（15/15）。所有上报均为 HTTP 200 / `code=0`，无一个 400。
 
-单账号满额 **1400 积分**（14 个任务 × 100，其中 `Buddy_App_QQ` 为 50）。
+单账号满额 **1700 积分**（15 个任务，其中 `Buddy_App_QQ` 为 50、`create_canvas` 为 300）。
 
 > 注：账号标识已完全脱敏，不暴露任何手机号、UID 或昵称。
 
@@ -788,35 +974,613 @@ workbuddy2api/
 ├── responses_projection.py   # Codex / agent 请求投影压缩
 ├── anthropic_adapter.py      # Anthropic Messages ↔ Chat 适配
 ├── desensitize.py            # 运行时文本压缩与零宽脱敏
+├── wb_install.py             # WorkBuddy 安装位置 / 版本号 / 风控配置自动发现（不写死盘符）
+├── wb_asar.py                # 纯标准库的 Electron asar 读取/抽取/检索（不需要 Node/npm）
+├── wb_envcheck.py            # 运行环境自检：Python/Node/依赖/桌面端/风控 SDK/MySQL/Redis
 ├── turing_helper.js          # Node：调用桌面端 Turing Shield SDK 取设备风控 token
-├── sync_auth.py / .bat       # 同步本机登录态到服务器
-├── start_converter.bat       # 本机直连网关一键启动
-├── start_admin.bat           # 管理后台一键启动（强密码 + 固定 JWT secret）
+├── sync_auth.py / .bat       # 同步本机登录态到服务器（本地用，不进仓库）
+├── start_converter.bat       # 本机直连网关一键启动（本地用，不进仓库）
+├── start_admin.bat           # 管理后台一键启动（强密码 + 固定 JWT secret；本地用，不进仓库）
 ├── requirements.txt / Dockerfile / docker-compose.yml
-├── scripts/
-│   └── test_daily_checkin.py # 签到验证脚本（仅对未领账号真实领取）
+├── scripts/                  # 逆向取证 / 诊断脚本（.gitignore 忽略，不进仓库）
+│   ├── asar_grep.py                     # 在 app.asar 里按字节检索关键词（逆向取证）
+│   ├── asar_slice.py                    # 按字节区间抽取 app.asar 片段
+│   ├── find_account.py                  # 按手机号/uid/name 定位账号及其池状态
+│   ├── survey_ardot_token.py            # 盘点所有账号能否换到 Ardot token
+│   ├── provision_ardot_all.py           # 为未绑定账号建立 Ardot 绑定（--do 才写）
+│   ├── survey_canvas_tasks.py           # 盘点所有账号的画布任务状态与进度
+│   ├── run_canvas_task.py               # 跑单账号画布完整链路（accept→完成→claim）
+│   ├── probe_canvas.py                  # 「发对话拿 fileId」旧假设的实证记录（已证伪）
+│   ├── probe_ardot_mcp.py               # 探测上游是否回原生 tool_calls + Ardot 端点鉴权
+│   ├── probe_ardot_mcp_live.py          # initialize + tools/list，确认 create_design 可用
+│   ├── probe_ardot_oauth_meta.py        # 探测 Ardot OAuth 元数据与 connector 接口
+│   ├── probe_shadow_connect.py          # 单独验证影子账号 /connect（--do 才写）
+│   ├── dump_create_design_schema.py     # 打印 create_design 完整 inputSchema
+│   ├── dump_canvas_task.py              # 打印画布任务原始 JSON（看 accept_status）
+│   ├── verify_create_canvas.py          # 真机建画布（--dry 只建 / --report 连遥测）
+│   ├── check_create_canvas_progress.py  # 核对成长中心 create_canvas 进度与积分
+│   ├── refresh_balances_report.py       # 刷新并打印全账号上游余额（核对奖励是否到账）
+│   └── daemon.ps1                       # 部署用守护脚本（**保留在仓库内**）
 ├── admin/                    # 多账号管理后台（FastAPI + MySQL + Redis）
 │   ├── server.py             # FastAPI 入口、登录、静态页挂载、converter 挂 /gw
 │   ├── config.py             # 配置（环境变量覆盖）
 │   ├── db.py                 # SQLAlchemy 引擎 / 会话 / 建库建表 / 列迁移
-│   ├── models.py             # Account / ApiKey / UsageLog / Schedule ORM
+│   ├── models.py             # Account / AccountModelCooldown / ApiKey / UsageLog / Schedule ORM
 │   ├── security.py           # JWT、Key 哈希、配额拦截
-│   ├── backend.py            # 复用 converter.CredentialManager 操作单账号（含签到 / 成长任务）
+│   ├── backend.py            # 复用 converter.CredentialManager 操作单账号（含签到 / 成长任务 / Ardot 画布）
+│   ├── pool.py               # 流量治理原语：在途租约 / 会话粘性 / 防撞号 / WAF IP 闸 / 三因子加权选号
 │   ├── growth_plans.py       # 成长任务分级与完成策略表（实测结论沉淀处）
-│   ├── scheduler.py          # 轻量定时任务：refresh_balances / sync_models / daily_checkin / refresh_growth_tasks / run_growth_tasks
+│   ├── scheduler.py          # 轻量定时任务：refresh_balances / sync_models / daily_checkin / refresh_growth_tasks / run_growth_tasks / keepalive_tokens
 │   ├── turing_token.py       # Python 侧 X-Device-Token 提供器（subprocess 调 helper）
-│   ├── routers/              # accounts / groups / growth / keys / proxy / schedules / logs / stats / sync / models
+│   ├── client_profile.py     # 客户端参数档案：UA/版本号/风控头/指纹的探测→保存→生效→同步
+│   ├── wb_paths.py           # 客户端路径覆盖（安装目录/产物目录）落库并注入 wb_install
+│   ├── jobrunner.py          # 后台任务执行器（拆包等耗时操作异步化 + 进度轮询）
+│   ├── routers/              # accounts / app_source / client_profile / groups / growth / keys / proxy / schedules / logs / stats / sync / models
 │   └── static/index.html     # 纯 HTML + TailwindCSS + FontAwesome 管理大屏
+├── tests/                    # 本地回归测试（.gitignore 忽略，不进仓库）
+│   ├── test_pool.py          # 号池治理 / 错误分类 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包（341 项）
+│   ├── test_e2e_db.py        # 真实库端到端：迁移 / 保活任务 / 选号链路（48 项）
+│   └── test_gateway_smoke.py # 真实上游端到端冒烟（9 项，会消耗少量积分）
+├── wb_install.py             # WorkBuddy 安装位置 / 版本号 / 风控配置自动发现（不写死盘符）
+├── wb_asar.py                # 纯标准库 asar 读取/解包/搜索（无需 Node）；逆向产物自动产出
+├── wb_envcheck.py            # 环境自检：Python/依赖/Node/桌面端/逆向产物/MySQL/Redis
+├── turing_helper.js          # Node：调桌面端 Turing Shield SDK 取设备 token（同样自动发现）
 └── README.md
 
-# 逆向产物（不在本仓库，存在于 D:\workbuddy）
-D:\workbuddy\app_source\      # cli / main / preload / renderer 解包源码
-D:\workbuddy\resources\app.asar.unpacked\native\turing-sdk\   # 设备风控原生模块（运行时不写死此路径，由 turing_helper.js 自动发现）
+# 逆向产物（不在本仓库；路径因人而异，运行时由 wb_install 自动发现）
+<安装目录>\app_source\      # cli / main / preload / renderer 解包源码
+<安装目录>\resources\app.asar.unpacked\native\turing-sdk\   # 设备风控原生模块
 ```
+
+> `scripts/*.py` 与 `tests/` 都被 `.gitignore` 忽略（见 [10.13](#1013-什么不进仓库)）。
+> 它们在本机检出里仍然可用，只是不进仓库。
 
 ---
 
-## 十、免责声明与协议
+## 十、稳定性与流量治理（限速 / 并发 / 保活）
+
+本章是「把号池跑稳」的部分。原则是**只借该借的**：参考项目的成熟设计拿来加固既有实现，
+而不是照抄重写；每条改动都对应一个具体失效模式，并尽量落到官方源码或真机实测上。
+
+### 10.1 选号：三因子加权 + Top-N 抽签
+
+`ADMIN_ACCOUNT_SELECT=weighted` 时启用（默认仍是 `remain`）：
+
+```text
+权重 = 1 + 余额/池内最高余额 × 10
+        + 快过期积分/余额 × 8
+        + min(闲置小时数 × 0.5, 5)
+```
+
+取 **Top-5 短名单**再在名单内加权抽签，而不是直接排序取第一 —— 抽签是**概率倾斜**
+而非硬排序，能把流量摊开；纯排序会让余额最高的号承担几乎全部流量（热点），
+且余额一旦回落就骤停。
+
+> 一个踩过的坑：权重全等时按 uid 字典序截断，会让排序靠后的账号**永远**进不了
+> 短名单。实测出现过某号占 79/100 的惊群。因此检出并列时先洗牌再截断。
+
+### 10.2 并发：在途租约（把并发摊平到全池）
+
+粘性路由与加权选号都会**倾向**少数账号；叠加长连接（SSE）后单号容易过载。
+上游按账号限速时，单号过载会直接表现为成片 429/5xx，然后这些号被冷却、
+流量整体挤到下几个号，形成雪崩。
+
+`admin/pool.py` 的 `InFlight` 给每个账号一个在途计数，占满上限（`ADMIN_POOL_MAX_IN_FLIGHT`，
+默认 3）的账号**不参与选号**。要点：
+
+- 上限 `<= 0` 表示不限（计数仍累加，供观测）；
+- `release` 幂等（重复释放不会把计数扣成负数）；
+- 代理层在 `finally` 里兜底释放 —— 客户端中断流时也必须归还名额，
+  否则该账号的在途计数永远减不回去，最终被**永久**排除在选号之外。
+
+### 10.3 会话粘性：同一会话固定同一账号
+
+`ADMIN_SESSION_STICKY=1`（默认开）。两个收益：
+
+1. **上游前缀缓存不碎** —— 换号等于换一份服务端上下文缓存，多轮对话每次都重新计费、也更慢；
+2. **拟人** —— 真实用户的一次会话属于同一台设备/同一个账号；一次会话在号池里
+   逐轮跳号是很容易被识别的批量特征。
+
+会话键优先级：`metadata.conversation_id` → `metadata.conversationId` → `conversation_id`
+→ `conversationId` → `prompt_cache_key`；OpenAI 兼容协议没有这些字段时，用
+**首条 user 消息的 sha256** 兜底（会话内历史不断追加而首条恒定 → 同会话恒同键）。
+
+> 刻意**不**把 `metadata.user_id` 当粘性键：它的粒度太粗，会把一个用户的所有并行
+> 对话钉到同一个账号上，远粗于上游「对话级」的缓存边界。
+> 反过来，请求体带 `user_id` 时**关闭**首条 prompt 兜底，避免同一个问题从另一头发生。
+
+绑定是滚动的（每次命中续期），账号不可用时自动解绑重分配；请求成功后把会话
+**重绑到实际成功的账号**，让多轮收敛到「对该会话持续成功」的那个号。
+
+### 10.4 错误分类与账号处置（一张表看懂）
+
+`_classify_error()` 的分层顺序是**语义具体优先**，每层都为防止一种误判：
+
+| 分类 | 触发 | 处置 | 为什么这样处置 |
+|------|------|------|----------------|
+| `model_block` | 400/404 + `11102` | 该 (账号,模型) 负缓存，指数退避封顶 24h | 官方确定「该后端无此模型」，重试无意义 |
+| `session_dead` | `12153` / "Offline user session not found" | **连续 3 次**才禁用 | 该错误会被临时触发（上游抖动、并发刷新 token），一次就禁用等于误杀健康号 |
+| `account_fault` | `11140` / `14017` | 冷却 30 分钟后换号 | 账号级授权故障，常带 429 状态码，**必须先于限流判定** |
+| `model_rate` | `6004` | **只冷却该模型** | 「切个模型就能用」的号不该被整体摘出池子 |
+| `hard_credit` | 402/412 或余额文案 | 冷却到**次日 04:00** | 日额度在凌晨重置，04:00 是重置完成后的安全时点 |
+| `soft_rate` | 429 | 有重置时间就精确对齐，否则有界指数退避（封顶 2h） | 精确对齐避免把全池推到封顶 |
+| `waf` | 403 且**无业务信封** | 短冷却 + IP 级 fail-fast | 见 11.5 |
+| `server` | 5xx | 熔断，指数退避封顶 6h | 比原「累计 5 次固定 10 分钟」更贴合：固定时长对持续坏的号太短、对偶发又太长 |
+| `not_found` | 404 | 60s 短冷却，**不累计** errCount | 防雪崩 |
+| `transport`/`client` | 网络抖动 / 其它 4xx | 只记时间 + 连败计数 | 不是账号的错，不叠加权威惩罚 |
+
+两个防累积设计：
+
+- **成功即清零**（`_note_success`）：没有这个，任何长期运行的池子最终都会因零星失败
+  把健康号一个个摘出去；
+- **冷却取「或门」**：`cool_until` / `breaker_until` / `degrade_until` 任一未到期即不可选。
+  原实现共用一个 `cool_until`，后写的短冷却会**覆盖**先写的长冷却，等于提前放行一个坏号。
+
+### 10.5 WAF：IP 级 fail-fast
+
+WAF 403 拦的是**网关出口 IP**，不是账号（实测 3 个账号 1 秒内全 403）。
+账号级冷却在这种场景下不够：轮转会把一次客户端请求放大 `MaxRotate` 倍，
+同一出口 IP 继续打上游只会加重风控。
+
+判据：60s 滑窗内**不同账号**命中 WAF 403 达到 2 个即判定 IP 级拦截，激活一个窗口。
+激活期内新命中不续期（保守，不做主动探测）。**单号反复 403 永不触发** —— 只数不同账号。
+
+### 10.6 轮转退避：指数 + 抖动
+
+`base 500ms × 2^n`，封顶 8s，再施加 **±25%** 抖动。抖动不是装饰：WAF 频控按密度判罚，
+齐步走的退避会以固定周期**再次聚团**。
+
+### 10.7 超时：最要紧的一处修复
+
+先纠正一个常见误解：`httpx.AsyncClient(timeout=300)` **不是**总时长 5 分钟，
+它把 connect/read/write/pool **各**设为 300s。所以原代码并不会在流式响应中途
+掐断活跃的流（read 是「两次读到数据之间」的间隔上限，有数据就重置）。
+
+但它有两个真实缺陷，都在**该快的时候不快**：
+
+1. **connect=300**：一个 TCP 连不上的账号要让我们干等最多 5 分钟才轮到换号逻辑。
+   号池里恰恰总有若干连不上的号（被墙/限速/节点故障），**这才是「卡住不动」的主因**；
+2. **pool=300**：连接池打满时新请求排队最多 5 分钟。池满本身就是过载信号，
+   应当快速失败并把压力交回上层（退避/换号），而不是无限排队把延迟一层层叠起来。
+
+现在拆成四项（`admin/config.py`）：
+
+| 项 | 默认 | 作用 |
+|----|------|------|
+| connect | 15s | 连不上就快速换号 |
+| read | 180s | **静默**上限：有数据就续期，长时间推理只要还在吐字就永不被自己掐断 |
+| write | 60s | 上传大 prompt |
+| pool | 20s | 池满快速失败，交给上层退避 |
+
+> **必须避免的坑**：绝不给流式响应设**总时长**上限。依据是官方客户端自己的源码 ——
+> Node 18+ 默认的 `http.Server.requestTimeout = 300000` 是总时长，会在流**仍然活跃**时
+> 到点强行掐断长连接 SSE，客户端只看到 undici `TypeError: terminated` /
+> "SSE stream disconnected"。官方把它当必须修的 bug，修法是三重防御把总时长锁到 0。
+>
+> 这里的 `read` 实际就等价于参考实现的 SSE 空闲监控（有数据续期、静默即取消），
+> 且不需要额外起监控任务。因此**非流式端点也用这一套**：上游一律以 `stream: true`
+> 返回 SSE，我们在内部聚合，用静默上限而非总时长。
+
+顺带修掉两处 `timeout=None`（完全不设限，连接静默死掉就永久挂住，既不报错也不归还资源）。
+
+### 10.8 token 保活
+
+`keepalive_tokens` 定时任务（默认每晚 22:00，`ADMIN_KEEPALIVE_HOURS` 可配，
+`ADMIN_KEEPALIVE_ENABLED=0` 可关）。
+
+为什么需要：上游登录态有绝对有效期。长期没有请求的账号，其 refresh token 会在某天
+静默失效 —— 等到真有人来用，才在第一次请求时发现要重登。用户感知就是
+「号池里明明有余额的号，用的时候报错」。
+
+要点：**只刷新不调用**（不消耗积分、不产生对话记录）；账号之间按
+`ADMIN_KEEPALIVE_ACCOUNT_GAP`（默认 0.8s）**串行节流** —— 批量并发刷新 token 是
+很明显的机器特征；`12153` 连续计数达到 3 次才禁用（与 11.4 同源口径）。
+
+### 10.9 拟人化请求头
+
+出站请求补齐官方客户端形状的头，缺哪个就少一个「这是真人客户端」的证据：
+
+| 头 | 值 / 来源 | 作用 |
+|----|-----------|------|
+| `User-Agent` | `WorkBuddy/<桌面端版本> WorkBuddy/<同版本> CLI/<CLI版本>`，**版本号来自客户端参数档案** | **原先自报 `codebuddy2openai/2.0`，等于对风控举手**；官方三段式形状取自实测分发包 |
+| `X-CodeBuddy-Request` | `1` | 官方客户端所有 API 请求必带的闸门头 |
+| `X-IDE-Version` | 同桌面端版本（来自档案） | 用量归属，报旧版本是明显特征 |
+| `X-Machine-ID` / `X-Session-ID` | `md5("machine:{uid}")` 稳定派生 | 「每个账号一台固定虚拟设备」：每次随机 = 频繁换设备（异常）；全池共用常量 = 多号同设备（最易被识别）。两者都错 |
+| `X-Conversation-*` / `X-Request-ID` / `X-B3-*` | 会话键派生，**轮转循环外只算一次** | 一次 user send 内所有尝试复用同一份 —— 换号重试若换了会话 ID，上游看到的是 N 个并发会话而非一次对话的一次重试 |
+| `Accept-Language` | `zh-CN` | 缺失会被上游按语言异常误判 |
+
+以上头与桌面指纹**统一由「客户端参数档案」提供**，可在后台查看/修改/同步（见 §10.10.1）。
+
+### 10.10 客户端版本与逆向产物：自动发现 / 自动产出
+
+版本号曾经是写死的常量（`DESKTOP_VERSION = "5.5.6"`、`CLI_VERSION = "2.137.1"`）。
+这有两个**用户侧必然踩到**的问题：
+
+1. **安装盘符不固定** —— 写死 `D:\WorkBuddy`，用户装在 C 盘/绿色版就直接失效；
+2. **版本会变** —— 官方一发版，我们的 UA 立刻变成「自报旧版本」，
+   既是明显特征，也容易被上游版本闸门拦下。
+
+因此 `wb_install.py`（项目根）统一负责自动发现，Python 与 Node 两侧共用：
+
+**安装目录**（命中即用，判据是存在 `resources/app.asar`，比「目录名像」可靠）：
+
+```text
+1. WORKBUDDY_INSTALL_DIR                 显式指定（可指向安装目录 / resources / app.asar）
+2. 常见基目录下的 WorkBuddy / workbuddy
+   %LOCALAPPDATA% %APPDATA% %ProgramFiles% %ProgramFiles(x86)%
+   %ProgramW6432% %USERPROFILE% %HOME%
+3. 各盘根目录下的 workbuddy / WorkBuddy   默认盘符 C,D,E,F,G（WORKBUDDY_DRIVES 可改）
+```
+
+**版本与配置**（逐项独立回退，缺一项不影响其它项）：
+
+| 取值 | 优先级 |
+|------|--------|
+| 桌面端版本 | `WORKBUDDY_DESKTOP_VERSION` > `resources/install-manifest.json` 的 `appVersion` > `cli/package.json` 的 `version` > `cli/product.json` 的 `genieVersion` > **`app.asar` 内 `/package.json` 的 `version`** > `WorkBuddy.exe` 版本资源 > 兜底 `5.5.6` |
+| CLI 版本 | `WORKBUDDY_CLI_VERSION` > `cli/package.json` 的 `publishConfig.customPackage.version` > `cli/dist/codebuddy.js` 内嵌版本 > 兜底 `2.137.1` |
+| 风控 channelId | `WORKBUDDY_TURING_CHANNEL_ID` > `cli/product.json` 的 `config.turingSdk.channelId` > 兜底 `109144` |
+| commit / 发布日期 | `WORKBUDDY_COMMIT` / `WORKBUDDY_RELEASE_DATE_MS` > `cli/product.json` 的 `commit` / `date` > 兜底 |
+
+几个实现要点：
+
+- **CLI 版本走官方同款判据**：先看 `cli/package.json` 的 `version`，
+  非 `0.0.0`（monorepo 占位）才用；否则看 `publishConfig.customPackage.version`。
+  这比读 22MB 的 `dist/codebuddy.js` 快几百倍，两者同源。
+- **有 TTL 缓存**（5 分钟）＋进程内单例（首次约 18ms，缓存命中约 0.01ms）。
+  **运行期装了新客户端不用重启进程**也会跟上。
+- **绝不抛异常**：任何一步失败都退化成兜底值。服务器上通常没装桌面端，
+  这时服务必须照常启动，只是版本号不如实测准确。
+- **Node 侧同源**：`turing_helper.js` 也读同一份安装包元数据，不再用自己写死的
+  `2.0.0`；Python 侧发现后会通过环境变量把安装目录/channelId/版本下发过去。
+
+#### 逆向产物不存在怎么办：自动从原安装位置产出
+
+用户的解包产物**不一定还在**（可能被删、可能从没做过、也可能换了机器）。
+更麻烦的是官方包里这些文件是 **unpacked** 的：
+
+| 内部路径 | 数据在哪 |
+|----------|----------|
+| `/package.json` | **在 asar 数据区**（可纯 Python 读） |
+| `/main/index.js` | 在 asar 数据区 |
+| `/cli/product.json` | **unpacked**（在旁边的 `app.asar.unpacked/`） |
+| `/cli/dist/codebuddy.js` | **unpacked** |
+| `/native/turing-sdk/*` | **unpacked** |
+
+所以 `unpacked` 目录一缺，`cli/product.json` 这些就全断了。为此做了两层保障：
+
+**1）版本号不依赖 unpacked。** `wb_install` 会回退到 **`app.asar` 内部的
+`/package.json`**（数据区，offset=0），用纯标准库定位读出。实测在「只有
+`app.asar`、没有 `unpacked`、也没有 `install-manifest.json`」的目录里，
+仍能拿到真实版本号：
+
+```text
+安装目录=... | 桌面端=5.5.6(app.asar!/package.json) | CLI=2.137.1(兜底)
+```
+
+**2）需要源码时现场产出。** `wb_asar.py` 是**纯标准库**的 Electron asar
+读取器/抽取器（asar 是未压缩的拼接文件：JSON 头 + 原始字节，标准库 40 行就能读）：
+
+```bash
+python wb_asar.py extract            # 抽到用户缓存目录（默认不在项目里）
+python wb_asar.py extract --dest D:/wb_source
+python wb_asar.py read /package.json # 读单个文件（unpacked 自动分流到磁盘）
+python wb_asar.py list --grep canvas # 列出内部文件
+python wb_asar.py search "wbx_design" # 字节检索
+```
+
+**这条彻底去掉了对 Node/npm 的依赖**。以前要解包得先装 Node + npm +
+`npm i asar`，服务器上经常装不动；现在一个 Python 命令就够。
+`Asar.read_file()` 会自动分流：数据在 asar 里就定位读，标记 `unpacked`
+就去 `<asar 同级>/app.asar.unpacked/<路径>` 读，调用方不用关心区别。
+
+实测抽取全量源码：**2242 个文件 / 225MB / 14 秒**（含 unpacked，0 缺失）。
+
+产物默认写到用户缓存目录（`%LOCALAPPDATA%\workbuddy2api\app_source` 或
+`~/.cache/...`）而**不是项目里** —— 200MB+ 放进仓库会被 git 追着跑。
+需要固定位置时用 `WORKBUDDY_SOURCE_DIR` 指定。
+
+`scripts/asar_grep.py` / `asar_slice.py` 也已改为委托 `wb_asar`，
+不再需要 Node。
+
+#### 后台一键拆包：不用记命令，也不用装 Node
+
+命令行能做，但对「只想看看源码」的人来说门槛仍在（要记住 `wb_asar.py` 的
+子命令、要找对输出目录）。而这件事本质上就是点一下，于是收进了后台：
+
+**位置：`/admin` → 设置 → 逆向产物**
+
+| 能力 | 说明 |
+|------|------|
+| **一键拆包** | 点按钮即从 `app.asar` 解出源码。**纯标准库，不需要 Node/npm** |
+| **手动指定安装目录** | 客户端装在非默认盘符/位置时，直接填路径即可 |
+| **自动补齐层级** | 填 `D:\WorkBuddy`、`…\resources`、`…\resources\app.asar` **都行** |
+| **预检** | 拆包前先告诉你「将写入 2242 个文件 / 225MB」，而不是让你盲点 |
+| **实时进度** | 显示 `1234/2242 个文件` + 当前路径（实测约 15 秒） |
+| **源码检索** | 在产物里搜关键字（等价于对 `app_source` 做 grep） |
+| **删除产物** | 只删本工具产出的目录，防误删 |
+
+**为什么走异步任务**：全量拆包 2242 个文件 / 225MB / 约 15 秒，同步跑会顶到
+nginx 的 `proxy_read_timeout`（默认 60s）边缘，界面也是「点了没反应」。
+所以 POST 立即返回 `job_id`，前端轮询进度。同一个 job key 只允许一个在跑，
+**重复点击不会叠起多个并发拆包**。
+
+**安装目录的手工指定**：填进去的路径不要求「正好是安装根目录」，
+`normalize_install_dir()` 会依次试「原样 / 父 / 祖父」找 `resources/app.asar`：
+
+```text
+D:\WorkBuddy                          -> D:\WorkBuddy
+D:\WorkBuddy\resources                -> D:\WorkBuddy
+D:\WorkBuddy\resources\app.asar       -> D:\WorkBuddy
+D:\WorkBuddy\resources\随便不存在的名字 -> 报错「路径不存在」（不会瞎猜）
+```
+
+最后一条是刻意加的：**输入本身必须存在**才继续判断。否则
+`…/resources/随便一个不存在的名字` 会因为父目录恰好含 `app.asar` 而被
+「补齐」成一个有效安装目录，让用户以为自己填对了（实测踩过这个坑）。
+
+**路径优先级**（环境变量仍然最高，后台设置次之）：
+
+```text
+WORKBUDDY_INSTALL_DIR > 后台「安装目录」设置 > 自动扫描
+```
+
+这个顺序是刻意的：环境变量是运维逃生门，容器 / systemd 注入的值不该被后台
+操作悄悄盖掉；反过来，后台改完能立即压住自动扫描的结果。后台设置存在
+`system_settings` 表里，**保存即生效，无需重启进程**。
+
+**生产环境不需要这个功能**，用 `ADMIN_DEV_TOOLS=0` 可整体关闭：
+
+```bash
+ADMIN_DEV_TOOLS=0     # /api/app-source/* 全部 404，后台也不显示该区域
+```
+
+服务器上既没有客户端安装包，也不该放 225MB 的源码，关掉最干净。
+
+#### 环境自检：一次性看清缺什么
+
+用户环境差异很大，而失败方式往往很难看懂：没装 Node → 取不到设备 token →
+日志只有一句「token 为空」，看不出是缺 Node。所以提供一条命令集中检查：
+
+```bash
+python wb_envcheck.py          # 人类可读（按必需/可选/开发分组）
+python wb_envcheck.py --json   # 机器可读，便于安装脚本/CI 消费
+python wb_envcheck.py --fast   # 跳过取 token 这类慢检查
+```
+
+覆盖：Python 版本、8 个必需依赖、5 个可选依赖、Node/npm、桌面端安装、
+`app.asar`、`unpacked`、Turing SDK、**实际能否取到设备 token**、
+MySQL/Redis 连通性。
+
+设计取向是**只读**（不装包、不改配置、不改代码里的任何路径）＋
+**分级**（`required` 缺了起不来 / `optional` 缺了功能降级 / `dev` 只影响逆向取证）。
+每项都给出「缺了怎么办」。实测输出：
+
+```text
+===== 必需 =====
+  [ok]   Python 版本：3.13.14
+  [ok]   依赖 fastapi：已安装
+  ...
+  [ok]   MySQL (127.0.0.1:3306)：可连接
+
+===== 可选（缺失则功能降级） =====
+  [ok]   Node.js：v24.21.0
+  [ok]   WorkBuddy 桌面端：D:\WorkBuddy｜桌面端=5.5.6(install-manifest.json) | ...
+  [ok]   设备风控 token：已获取（1154 字符）
+  [ok]   Redis (127.0.0.1:6379)：可连接
+
+===== 开发/逆向取证 =====
+  [warn] 逆向产物：未产出（...\app_source）
+         -> 需要时可用 WB.ensure_source() 从 app.asar 自动抽取，无需 Node/npm
+
+结论：可以运行（25 项检查，0 失败 / 2 警告）
+```
+
+注意它**不检查 passlib/bcrypt**：本项目密码哈希用标准库
+`hashlib.pbkdf2_hmac`（见 `admin/security.py`），列进来只会误导用户去装没用的包。
+
+#### 所有路径都走 env，代码里不写死
+
+| 环境变量 | 作用 | 默认 |
+|----------|------|------|
+| `WORKBUDDY_INSTALL_DIR` | 安装基目录（也接受 `resources/` 或 `app.asar`） | 自动扫描 |
+| `WORKBUDDY_ASAR_PATH` | 直接指定 `app.asar`（跳过扫描） | 自动扫描 |
+| `WORKBUDDY_DRIVES` | 参与扫描的盘符 | `C,D,E,F,G` |
+| `WORKBUDDY_SOURCE_DIR` | 逆向产物输出/查找目录 | 用户缓存目录 |
+| `ADMIN_DEV_TOOLS` | 后台「逆向产物」工具开关（生产设 0） | `1` |
+| `WORKBUDDY_DESKTOP_VERSION` / `WORKBUDDY_CLI_VERSION` | 强制覆盖版本 | 读安装包 |
+| `WORKBUDDY_USER_AGENT` | 强制覆盖整条 UA | 由版本号拼 |
+| `WORKBUDDY_IDE_NAME` / `_EXT_NAME` / `_OS` / `_ARCH` / `_OS_VERSION` / `_CPU_CORES` / `_MEMORY_SIZE` | 桌面指纹字段 | 官方默认 |
+| `WORKBUDDY_COMMIT` / `WORKBUDDY_RELEASE_DATE_MS` | 安装包 commit / 构建时间 | 读安装包 |
+| `WORKBUDDY_TURING_SDK_DIR` | 风控 SDK 目录 | 自动发现 |
+| `WORKBUDDY_TURING_CHANNEL_ID` / `_PRODUCT_NAME` / `_DEBUG` | 风控 SDK 配置 | 读安装包 |
+
+自检：
+
+```bash
+python -c "from wb_install import WB; print(WB.describe())"
+# 安装目录=D:\WorkBuddy | 桌面端=5.5.6(install-manifest.json) | CLI=2.137.1(cli/package.json) | turingChannel=109144(cli/product.json)
+#
+# 括号里是**取值来源**：显示「兜底」就说明没找到安装包，需要设 WORKBUDDY_INSTALL_DIR
+# 或把安装盘符加进 WORKBUDDY_DRIVES。
+```
+
+### 10.10.1 客户端参数档案：后台可改、可同步到线上
+
+上面这些参数（UA / 版本号 / 风控头 / 桌面指纹）原先只能「启动时探测一次」，
+带来一个**线上实例必然踩到**的问题：
+
+> 线上服务器**没装 WorkBuddy 桌面端**，探测不到任何东西，于是 UA 退化成内置
+> 兜底版本号 —— 那是一个「谁也不认识的版本」，等于自报家门。而本地机器明明装得好好的。
+
+现在把它们收敛成一份**档案**（`admin/client_profile.py`），走这条链路：
+
+```text
+探测(snapshot) ──→ 保存(saved) ──→ 生效(effective) ──→ 同步到线上(sync)
+   本机安装包        system_settings    每个请求实时读      随 /api/sync/push 推送
+```
+
+**取值优先级**（`effective()`）：
+
+```text
+1. 环境变量            显式运维覆盖，永远最高（WORKBUDDY_*）
+2. 现场探测 / 已保存    取决于 source 策略
+3. 内置兜底            保证任何情况下都有值，绝不抛异常
+```
+
+`source` 有两种模式，因为「本地」与「线上」的最优选择正好相反：
+
+| 模式 | 含义 | 适用 |
+|------|------|------|
+| `auto`（默认） | 现场探测 > 已保存 > 兜底 | **本地**：装了客户端就用真实值，官方升级后自动跟上 |
+| `saved` | 已保存 > 现场探测 > 兜底 | **线上**：探测不到客户端，必须钉住同步过来的值 |
+
+**后台「客户端参数」面板**（`/admin` → 客户端参数）：
+
+- **探测本机客户端** —— 扫描安装包，读出真实版本号 / channelId / commit；
+- **直接改任意字段并保存** —— 改完**立即生效，无需重启进程**（缓存 30 秒 TTL，保存时立即失效）；
+- **切换取值策略** —— auto ↔ saved；
+- **来源排障视图** —— 每项当前取自哪一层（环境变量 / 现场探测 / 已保存 / 内置兜底）；
+- **重置** —— 清空保存值，回到纯探测 + 兜底。
+
+**同步到线上**：`/api/sync/push` 会带上 `client_profile`（推送的是 `effective`，
+即当下真实生效的完整参数，而不是本地那点增量配置）。
+
+线上 `/api/sync/receive` 收到后**自动把 source 钉成 `saved`**，原因很实在：
+线上探测不到客户端，如果还用 `auto`，一旦探测为空就会退化成兜底值，
+把刚同步过来的真实参数又盖掉。同步是 `merge=False`（整体替换），
+避免与线上旧值混在一起。
+
+> **不传 `machineId` / `sessionId`**：这两个是**账号级**的，必须由各端按自己库里的
+> uid 稳定派生。跟着传会让所有账号共用同一台「设备」—— 而那正是最容易被批量识别的特征。
+
+**一个刻意留下的坑（已加测试钉住）**：`user_agent` **不可保存**。
+它 100% 由 `desktop_version` + `cli_version` 派生；若允许独立保存，就会出现
+「同步过一次 UA 之后，版本号再变而 UA 不变」的陈旧陷阱 —— 实测踩过：
+env 覆盖了版本号，UA 却还在报旧版本。要整体自定义 UA，用环境变量
+`WORKBUDDY_USER_AGENT`。
+
+**性能**：`effective()` 在每个请求上被调用（拼上游头、拼桌面指纹）。
+档案缓存三层（DB 值 / 探测值 / 合成结果），保存时立即失效：
+
+```text
+ua()           1.3 us      原先每请求重扫探测：约 39 us
+risk_headers() 2.6 us
+fingerprint()  4.3 us
+cache miss     5.2 ms      每 30 秒最多一次
+```
+
+> **导入期不查库**：模块级常量（`converter.DESKTOP_VERSION` 等）走
+> `effective_local()`（兜底 + 探测 + 环境变量），它**刻意不读数据库**。
+> 因为 standalone `converter.py` 可能根本没配 MySQL —— 为了算一个 UA 去连库，
+> 连不上会白等几秒（实测 4.6s → 1.4s）。运行期发请求才读后台保存值。
+
+**接口**：
+
+| 方法 | 路径 | 作用 |
+|------|------|------|
+| `GET` | `/api/client-profile` | 生效值 + 已保存值 + 探测值 + 每项来源 |
+| `POST` | `/api/client-profile/detect` | 现场探测（只读，不写库） |
+| `PUT` | `/api/client-profile` | 保存（merge 语义，可只改一个字段；也可只切 `source`） |
+| `POST` | `/api/client-profile/reset` | 清空保存值 |
+
+全部需要管理员鉴权。验证脚本：
+
+```bash
+.venv\Scripts\python.exe scripts\verify_client_profile_sync.py
+# 覆盖：探测 → 保存即生效 → 来源 → push 载荷 → 线上无客户端仍报真实版本 → env 优先级
+```
+
+### 10.11 非流式：一个必须修的协议违约
+
+上游 `/v2/chat/completions` **只支持流式**。为了兼顾 `stream: false` 的调用方，
+网关必须自己把上游 SSE 聚合成一个 `chat.completion` 对象。
+
+原先 `admin/routers/proxy.py` 的 `/v1/chat/completions` **没有非流式分支** ——
+它无条件 `body["stream"] = True` 并返回 `StreamingResponse`。后果是
+**OpenAI SDK 的默认调用（`stream` 缺省即 `false`）100% 失败**：
+
+```text
+客户端发 stream:false
+  -> 网关返回 Content-Type: text/event-stream + "data: {...}" 行
+  -> SDK 拿这个 body 去 json.loads()
+  -> JSONDecodeError: Expecting value: line 1 column 1
+```
+
+`converter.py` 早已修过同类问题（源码里就有注释说明），但 admin 这条路径漏了。
+现在改成：
+
+- `_aggregate_chat_sse()` 把 `delta.content` / `delta.reasoning_content` /
+  分片 `tool_calls` / `usage` 合并成标准非流式响应；
+- 两条路径**共用同一个号池状态机**（`_stream(aggregate=...)`）——
+  租约、粘性、退避、错误分类、记账一份实现，不会随时间漂移；
+- 聚合模式的错误也返回 JSON 并**保留上游状态码**（把上游 400 报成 503
+  会让调用方去重试一个永远不会成功的请求）；
+- 中途断流在两种模式下的语义不同：流式已经吐过字节只能截断，聚合模式
+  还没产出任何东西，所以**如实报错**而不是返回空响应。
+
+> 顺带修掉的 `NameError`：`_upstream_extra_headers` / `chat_completions`
+> 用到了未定义的变量与未更新的签名。这两个 bug 都是**只在真实请求路径上才触发**
+> 的 —— 静态检查与单测都发现不了，是被 §10.10 提到的真机冒烟测试
+> （`tests/test_gateway_smoke.py`）抓出来的。这也是为什么必须跑真实 end-to-end。
+
+### 10.12 这批改动的验证
+
+```bash
+.venv\Scripts\python.exe tests\test_pool.py            # 341 项，不依赖库/网络
+.venv\Scripts\python.exe test_upstream_compat.py       # 74 项，上游协议兼容/思考开关（本地文件，不入仓库）
+.venv\Scripts\python.exe tests\test_e2e_db.py          #  48 项，连真实 MySQL（只读 + 幂等迁移）
+.venv\Scripts\python.exe tests\test_gateway_smoke.py   #   9 项，真实上游端到端（会消耗少量积分）
+.venv\Scripts\python.exe scripts\verify_client_profile_sync.py  # 客户端参数同步链路（DB 只改后还原）
+```
+
+> `tests/` 与 `scripts/*.py` 已在 `.gitignore` 中（见 §10.13），
+> 属于本地回归工具，不进仓库；上面的命令在本地检出里照常可跑。
+
+**三层验证缺一不可**，因为每层能抓到的问题不同：
+
+| 层 | 抓到什么 | 抓不到什么 |
+|----|----------|------------|
+| `test_pool.py` | 纯逻辑：权重/退避/会话键/错误分类/id 提取/SSE 聚合/安装发现/客户端参数优先级与缓存 | 变量作用域、签名不匹配、真实响应形态 |
+| `test_e2e_db.py` | 迁移、真实数据下的选号、调度注册 | 请求路径上的 `NameError`、协议违约 |
+| `test_gateway_smoke.py` | **只有真跑才暴露的问题** | 长尾上游错误 |
+
+客户端参数这批改动另外做了两组实测：
+
+- **HTTP 层**：四个接口的鉴权 / 400 校验 / 保存即生效 / 策略切换全部走 ASGI 实测；
+- **同步闭环**：本地 push 载荷 → 线上 `receive` → **用新会话**读回线上落库值，
+  确认线上在「无客户端」环境下报出与本地完全一致的 UA 与版本号。
+
+> 读数时必须**换一个新的 DB 会话**：MySQL 默认 REPEATABLE READ，
+> 同一个会话看不到接收端刚提交的行 —— 这不是产品 bug，但会让验证脚本假失败
+> （实测踩过一次）。
+
+### 10.13 什么不进仓库
+
+`.gitignore` 把「本地工具」与「产品代码」分开：
+
+| 忽略项 | 原因 |
+|--------|------|
+| `test_*.py` / `tests/` / `*_test.py` | 回归测试属本地工具，含真实账号 id 与内部排查口径 |
+| `scripts/*.py` | 逆向取证与一次性诊断脚本，依赖本机安装包与真实账号；有的还记录了**已被证伪**的假设，放在仓库里会误导 |
+| `.env` / `backup_*.sql` | 含真实凭据与账号 token |
+| `ssh_*.py` / `sync_auth.*` / `start_*.bat` | 含服务器 IP 与密码 |
+| `*.zip` / `*.log` / `.venv/` | 构建产物与运行时产物 |
+
+`scripts/daemon.ps1` 是部署脚本，保留在仓库内。
+`wb_install.py`、`turing_helper.js` 是产品代码（自动发现逻辑），也保留。
+
+`test_e2e_db.py` 在真实数据上验证：迁移幂等、保活任务注册在配置整点、
+选号链路可用、**模型级冷却不影响同账号的其它模型**、在途占满的号被排除、
+以及 `remain` 策略选中余额最大者（这条是回归测试 —— 改成 Python 侧排序时
+曾把 `reverse` 配错，变成选余额**最少**的号，这类错误不报错、只静默劣化）。
+
+> 实战教训：`_upstream_extra_headers` 的 `NameError`、`chat_completions` 的
+> 未定义变量、以及 §10.10 的非流式协议违约，**全部是冒烟测试抓出来的**，
+> 前面两层全绿。任何「只在真实请求路径上触发」的改动都不要只靠单测收工。
+
+---
+
+## 十一、免责声明与协议
 
 本项目仅用于个人学习与研究。与腾讯、WorkBuddy、CodeBuddy、OpenAI、Anthropic 无官方关联。请仅在你合法拥有订阅的前提下使用，并自行承担风险。
 

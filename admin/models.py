@@ -28,8 +28,48 @@ class Account(Base):
     cool_kind = Column(String(16), default="")       # hard_credit | soft_rate | error_threshold | not_found
     last_err_at = Column(DateTime, nullable=True)
     last_err_msg = Column(String(255), default="")
-    last_picked_at = Column(DateTime, nullable=True)  # 最近一次被选中，用于 100ms 防撞号窗口
+    last_picked_at = Column(DateTime, nullable=True)  # 最近一次被选中（仅观测；防撞号窗口已移入进程内存）
+    # 熔断：连续失败达阈值后指数退避，封顶 breaker_cooldown_max。
+    # 与 cool_until 是**或门**关系（任一未到期即不可选），生效的是更晚的那个。
+    breaker_until = Column(DateTime, nullable=True)
+    breaker_fails = Column(Integer, default=0)
+    # 连续 12153「session dead」计数：达到阈值才禁用。
+    # 一次就禁用等于误杀 —— 该错误在真实环境会被临时性触发（上游抖动/并发刷新）。
+    session_dead_fails = Column(Integer, default=0)
+    # 连败降权（「不知道原因的失败」兜底：未知 4xx 与传输层抖动）：
+    # 带权威分类的错误各有自己的惩罚，不喂这个计数器，避免重复计罚。
+    consecutive_fails = Column(Integer, default=0)
+    degrade_until = Column(DateTime, nullable=True)
+    #: 快过期积分（供三因子权重的「快过期先用」项）。
+    credits_expiring = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AccountModelCooldown(Base):
+    """账号×模型级的冷却（与账号级冷却**互相独立**）。
+
+    为什么必须独立（上游 code 6004「该模型使用量超限」）：
+      * 账号级冷却会让「换个模型就能用」的号被整体摘出池子 —— 明明切模型立即可用，
+        却白扔一个账号直到冷却结束；
+      * 反过来，若把模型级限流当成账号级，用户会遇到「限额后换不动号」。
+
+    所以 6004 只冷却**触发调用的那个模型**：该账号对其他模型照常可选，
+    而对同一模型则被 `_select_account` 跳过。
+
+    code 11102「该后端无此模型」复用同一张表：它不是限流而是确定性答复
+    （重试无意义），所以 TTL 更长（默认 6h）且按指数退避。
+    """
+
+    __tablename__ = "account_model_cool"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    model = Column(String(120), nullable=False, default="")
+    until = Column(DateTime, nullable=True)          # 冷却截止
+    kind = Column(String(24), default="")            # model_rate | model_block
+    reason = Column(String(255), default="")
+    hits = Column(Integer, default=0)                # 命中次数（model_block 指数退避用）
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

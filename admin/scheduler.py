@@ -14,6 +14,10 @@ from datetime import datetime, timedelta
 
 from admin.db import SessionLocal
 from admin.models import Schedule
+from admin.config import settings
+
+#: 账号间保活节流间隔（秒），从配置读取，缺省 0.8。
+_KEEPALIVE_ACCOUNT_GAP = settings.KEEPALIVE_ACCOUNT_GAP
 
 
 def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
@@ -38,7 +42,104 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         return run_refresh_growth_tasks()
     if task == "run_growth_tasks":
         return run_growth_tasks()
+    if task == "keepalive_tokens":
+        return run_keepalive_tokens(db)
     return {"task": task, "error": "未知任务类型"}
+
+
+#: token 保活：连续多少次「session 已死」才把账号禁用。
+#: 与 proxy 的 SESSION_DEAD_THRESHOLD 同源 —— 一次 12153 只说明这次刷新失败，
+#: 可能是上游抖动；连续失败才说明这个号的登录态真的废了，需要人工重登。
+_KEEPALIVE_DEAD_THRESHOLD = 3
+
+
+def run_keepalive_tokens(db) -> dict:
+    """定时刷新所有活跃账号的 token，保持登录态存活（「保活」）。
+
+    为什么需要：上游的登录态有绝对有效期。如果一个账号长期没有请求，它的
+    refresh token 会在某天静默失效 —— 等到真有人来用，才在第一次请求时
+    发现要重登。用户感知就是「号池里明明有余额的号，用的时候报错」。
+
+    这也正是参考实现 internal/scheduler/scheduler.go 的 KeepaliveHours
+    （默认 [22]，即每晚 22 点）在做的事：主动 refresh 一遍所有 token。
+
+    实现要点（对齐参考实现，也贴合上游真实行为）：
+      * **串行 + 节流**：账号之间有 KEEPALIVE_ACCOUNT_GAP 秒间隔。批量并发地
+        刷新 token 是一个很明显的机器特征，节流后与真人逐个使用的节奏接近。
+      * **只刷新不调用**：仅走 token 刷新路径（`get_headers()`），不发起对话。
+        这样不消耗积分、不产生对话记录，纯保活。
+      * **12153 连续计数**：刷新抛「session 已死」时累加 `session_dead_fails`；
+        达到阈值才禁用账号。一次就禁用会造成误杀（上游抖动/并发刷新都会临时触发）。
+      * **成功清零**：刷新成功即把 `session_dead_fails` 归零。
+
+    返回结果摘要，写入 schedules.last_result 供后台查看。
+    """
+    from admin.backend import AccountSession
+    from admin.models import Account
+
+    accounts = (db.query(Account).filter(Account.status == "active")
+                .order_by(Account.id.asc()).all())
+    if not accounts:
+        return {"task": "keepalive_tokens", "ok": True, "total": 0, "msg": "没有活跃账号"}
+
+    total = len(accounts)
+    ok = 0
+    refreshed = 0
+    dead_disabled = 0
+    failed = 0
+    errors: list[str] = []
+
+    for idx, a in enumerate(accounts):
+        # 账号间节流：批量并发刷新 token 是明显的机器特征
+        if idx and _KEEPALIVE_ACCOUNT_GAP > 0:
+            time.sleep(_KEEPALIVE_ACCOUNT_GAP)
+        sess = None
+        try:
+            sess = AccountSession(a.auth_json)
+            before = getattr(sess, "token", None)
+            headers = sess.get_headers()  # 内部按需触发 token 刷新
+            after = getattr(sess, "token", None)
+            if after and after != before:
+                refreshed += 1
+            del headers
+            ok += 1
+            # 刷新成功 → 清零 session-dead 连续计数
+            if a.session_dead_fails:
+                a.session_dead_fails = 0
+            a.last_err_at = None
+            db.commit()
+        except Exception as e:
+            msg = str(e)
+            from admin.routers.proxy import _classify_error
+            kind = _classify_error(0, msg)
+            if kind in ("session_dead", "transport"):
+                # 「刷新失败」基本等价于登录态可能已失效，但必须连续计数后才禁用
+                a.session_dead_fails = (a.session_dead_fails or 0) + 1
+                a.cool_kind = "session_dead"
+                a.last_err_at = datetime.utcnow()
+                a.last_err_msg = (msg or "keepalive failed")[:255]
+                if a.session_dead_fails >= _KEEPALIVE_DEAD_THRESHOLD:
+                    a.status = "disabled"
+                    dead_disabled += 1
+                db.commit()
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f"#{a.id}: {msg[:120]}")
+            else:
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f"#{a.id}: {msg[:120]}")
+        finally:
+            if sess is not None:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+
+    return {"task": "keepalive_tokens", "ok": True, "total": total,
+            "alive": ok, "refreshed": refreshed, "failed": failed,
+            "disabled": dead_disabled, "errors": errors}
+
 
 
 #: 执行成长任务前，若列表刚刷新过不足这个秒数，则等待补足。
@@ -195,30 +296,46 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
 
 
 def _run_one(s: Schedule, db, now: datetime):
+    # 保活是「指定整点执行」而非「每 N 分钟执行」：若本轮不是保活整点，
+    # 只顺延到下一个整点、不执行。这样避免每天多刷几次 token（无谓的请求
+    # 本身就是可被观测的机器行为）。
+    if s.task == "keepalive_tokens" and not _is_keepalive_hour(now):
+        s.next_run_at = _next_keepalive_at(now)
+        db.commit()
+        return
     try:
         result = run_task(s.task, db, s)
         s.last_result = json.dumps(result, ensure_ascii=False)[:500]
     except Exception as e:  # 单个任务失败不影响调度循环
         s.last_result = f"执行失败: {e}"[:500]
     s.last_run_at = now
-    s.next_run_at = now + timedelta(minutes=s.interval_minutes or 60)
+    if s.task == "keepalive_tokens":
+        s.next_run_at = _next_keepalive_at(now)
+    else:
+        s.next_run_at = now + timedelta(minutes=s.interval_minutes or 60)
     db.commit()
 
 
 def _loop():
     while True:
+        db = None
         try:
             db = SessionLocal()
             now = datetime.utcnow()
             for s in db.query(Schedule).filter(Schedule.enabled == 1).all():
                 if s.next_run_at is None or s.next_run_at <= now:
                     _run_one(s, db, now)
-            db.close()
         except Exception:
-            try:
-                db.close()
-            except Exception:
-                pass
+            # 数据库短暂不可用（如 MySQL 重启）时静默跳过本轮，下一轮再试。
+            # 原先的写法在 `SessionLocal()` 本身抛异常时会引用未赋值的 db，
+            # 让异常从 except 块里再次抛出并终止调度线程。
+            pass
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
         time.sleep(15)
 
 
@@ -295,13 +412,79 @@ def ensure_growth_schedules(db):
         db.commit()
 
 
+def ensure_keepalive_schedule(db):
+    """补齐 token 保活定时任务（幂等）。
+
+    为什么用「每天的整点」而不是固定 interval：上游登录态的失效是按自然时间
+    推进的，保活要在**没人用号的时候**做（夜里），这样既不影响白天请求，
+    又保证第二天早上所有号都是热的。
+
+    参考实现（internal/scheduler/scheduler.go）默认 KeepaliveHours=[22]，
+    即每晚 22 点。我们沿用这个思路：默认 22 点，可用
+    ADMIN_KEEPALIVE_HOURS 配置多个小时（逗号分隔），或设
+    ADMIN_KEEPALIVE_ENABLED=0 关闭。
+
+    这里把 interval_minutes 设为 1440（每天一次），并且只在当前小时命中
+    列表时才真正执行 —— 见 _is_keepalive_hour。
+    """
+    if not settings.KEEPALIVE_ENABLED:
+        # 显式关闭：若存在则禁用（不删除，保留后台可见与手动触发能力）
+        row = db.query(Schedule).filter(Schedule.task == "keepalive_tokens").first()
+        if row is not None and row.enabled:
+            row.enabled = 0
+            db.commit()
+        return
+
+    row = db.query(Schedule).filter(Schedule.task == "keepalive_tokens").first()
+    if row is None:
+        now = datetime.utcnow()
+        target = _next_keepalive_at(now)
+        db.add(Schedule(name="每日 token 保活刷新", task="keepalive_tokens",
+                        interval_minutes=1440, enabled=1, next_run_at=target))
+        db.commit()
+
+
+def _next_keepalive_at(now: datetime) -> datetime:
+    """返回下一个保活整点时刻。"""
+    from datetime import time as _time
+    hours = sorted(set(h for h in settings.KEEPALIVE_HOURS if 0 <= h <= 23)) or [22]
+    for h in hours:
+        cand = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        if cand > now:
+            return cand
+    # 今天的都过了 → 明天第一个整点
+    return (now + timedelta(days=1)).replace(
+        hour=hours[0], minute=0, second=0, microsecond=0)
+
+
+def _is_keepalive_hour(now: datetime) -> bool:
+    """当前小时是否属于保活整点（容差 1 小时：调度器每 15s 轮询，
+    若上一轮因数据库短暂不可用被跳过，下一轮仍应补上）。"""
+    hours = set(settings.KEEPALIVE_HOURS)
+    return now.hour in hours or (now.hour - 1) in hours
+
+
+_scheduler_lock = threading.Lock()
+_scheduler_started = False
+
+
 def start_scheduler():
-    """在 FastAPI 启动时调用：播种默认任务并拉起守护线程。"""
+    """在 FastAPI 启动时调用：播种默认任务并拉起守护线程。
+
+    幂等：重复调用只会有一个调度线程。uvicorn --reload 或多 worker 场景下
+    会多次触发 startup，没有这个守卫就会起多个线程、把定时任务重复执行。
+    """
+    global _scheduler_started
+    with _scheduler_lock:
+        if _scheduler_started:
+            return
+        _scheduler_started = True
     try:
         db = SessionLocal()
         seed_defaults(db)
         ensure_daily_checkin(db)
         ensure_growth_schedules(db)
+        ensure_keepalive_schedule(db)
         db.close()
     except Exception:
         pass

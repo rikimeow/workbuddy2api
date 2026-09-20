@@ -5,6 +5,8 @@
 """
 import json
 import os
+import re
+import sys
 import tempfile
 import time
 import uuid
@@ -15,6 +17,103 @@ import httpx
 
 from converter import BACKEND, CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
 
+#: 项目根加入 sys.path，便于导入根目录的 wb_install（与 converter 同级）。
+#: admin 包可能在 `uvicorn admin.server:app` 下被导入，此时根目录不一定在
+#: sys.path 里，所以显式补一次。
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from wb_install import WB  # noqa: E402  安装位置 / 版本号 / 风控配置自动发现
+from admin import client_profile as cprofile  # noqa: E402  客户端参数档案（可后台配置/同步）
+
+# ---------------------------------------------------------------------------
+# Ardot 画布（create_canvas）—— 真实 id 的解析口径
+# ---------------------------------------------------------------------------
+# 全部取自官方客户端源码（app.asar.unpacked 内 ardot 遥测模块实测）：
+#   * 成功结果的 fileId 来自 MCP CallToolResult 的 structuredContent.fileId；
+#   * 文本兜底形如 `Created Ardot design file: <name>, fileId <id>, url <url>`；
+#   * 打开形如 `Opening Ardot editor for file <id>`；
+#   * **fileId 是纯数字**（`\bfileId\s+(\d+)\b`，路径 `/file/(\d+)`）。
+#
+# 最后这条是判据关键：既然真实 id 必须是纯数字，任何形如
+# `ardot-file-<8位>「或」wb-<毫秒>` 的字符串都**不可能**是真实画布 id，
+# 后端核对必然失败。所以本模块只接受纯数字 id，拿不到就如实返回失败 ——
+# 绝不自造一个「看起来像」的 id 去骗过计数。
+ARDOT_CREATED_RE = re.compile(
+    r"Created Ardot design file:\s*(.+?),\s*fileId\s+(\d+),\s*url\s+(https?://[^\s\"'\\]+)", re.I)
+ARDOT_FILE_ID_RE = re.compile(r"\bfileId\s+(\d+)\b", re.I)
+ARDOT_FILE_URL_RE = re.compile(r"\burl\s+(https?://[^\s\"'\\]+)", re.I)
+ARDOT_OPENING_RE = re.compile(r"\bOpening Ardot editor for file\s+(\d+)\b", re.I)
+ARDOT_FILE_IN_PATH_RE = re.compile(r"/file/(\d+)/?$")
+
+#: Ardot 画布分享/打开 URL 的 origin（与官方 resolveArdotEndpoint 的 prod 一致）。
+ARDOT_BASE = "https://ardot.tencent.com"
+#: Ardot MCP 端点。实测无凭据时返回 `401 {"error":"missing bearer token"}`；
+#: 带上 fetch_ardot_token() 换来的 token 即可 initialize / tools/list / tools/call。
+ARDOT_MCP_URL = ARDOT_BASE + "/mcp"
+#: create_design 的入参只有可选的 fileName（实测 tools/list 的 inputSchema）。
+#: 画布内容由 MCP 侧生成，我们不需要（也无法）传 design DSL。
+ARDOT_DEFAULT_FILE_NAME = "WorkBuddy 设计画布"
+
+
+def _extract_ardot_file_id(result: object) -> str:
+    """从 Ardot MCP 的工具结果里提取真实 fileId（必须是纯数字）。
+
+    解析顺序（对齐官方 tool-result-artifact-manager 的取值口径）：
+      1. 结构化字段 `structuredContent.fileId` / `file_id`
+      2. 结果对象自身的 `fileId` / `file_id`
+      3. `content[].text` 里的
+         `Created Ardot design file: <name>, fileId <id>, url <url>`
+      4. 文本里的 `fileId <id>`
+      5. 文本里的 `/file/<id>` 路径
+
+    **只接受纯数字**：官方 fileId 口径就是数字（`\\bfileId\\s+(\\d+)\\b`、
+    `/file/(\\d+)`）。非数字一律丢弃 —— 这正是「不自造 id」的落点：宁可这个
+    任务不完成，也不往上游上报一个不存在的画布对象。
+    """
+    texts: list[str] = []
+    direct: list[str] = []
+
+    def _walk(obj: object, depth: int = 0) -> None:
+        if depth > 5 or not isinstance(obj, dict):
+            return
+        for key in ("fileId", "file_id"):
+            v = obj.get(key)
+            if isinstance(v, (str, int)) and str(v).strip():
+                direct.append(str(v).strip())
+        sc = obj.get("structuredContent")
+        if isinstance(sc, dict):
+            _walk(sc, depth + 1)
+        for item in (obj.get("content") or []):
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                texts.append(item["text"])
+        for key in ("result", "data", "output", "artifact"):
+            inner = obj.get(key)
+            if isinstance(inner, dict):
+                _walk(inner, depth + 1)
+
+    _walk(result)
+    for c in direct:
+        if c.isdigit():
+            return c
+    blob = "\n".join(texts)
+    for rx, grp in ((ARDOT_CREATED_RE, 2), (ARDOT_FILE_ID_RE, 1),
+                    (ARDOT_FILE_IN_PATH_RE, 1)):
+        m = rx.search(blob)
+        if m:
+            return m.group(grp)
+    return ""
+
+#: 「创建设计画布」的真实意图 prompt。
+#: 官方前端在 design craft 模式下把意图判定为 create 后，会下发
+#: `<ardot_file_directive>` 指令让模型**只调用一次** create_design。
+#: 这里用等价的自然语言设计请求来触发同一条路径（我们无法注入前端指令）。
+ARDOT_CANVAS_PROMPT = (
+    "请帮我设计一个产品落地页的画布（web 页面），包含首屏标题、三个卖点区块和底部行动按钮。"
+)
+
+
 # 连接池：减少 TLS 握手，与 Go 项目 MaxIdleConnsPerHost=20 对齐。
 HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
 
@@ -23,7 +122,55 @@ WEB_BASE = "https://www.workbuddy.cn"      # web 域：资料库等浏览器行�
 BILL_BASE = "https://www.codebuddy.cn"     # billing 域：常规业务上报
 WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
-DESKTOP_UA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+#: 桌面客户端版本与内嵌 CLI 版本。
+#:
+#: **取值走「客户端参数档案」**（`admin/client_profile.py`），优先级：
+#:     环境变量 > （现场探测 / 后台保存，取决于 source）> 内置兜底
+#:
+#: 为什么不直接读 wb_install：线上服务器没装桌面端，探测不到任何东西，
+#: 只能退化成兜底值 —— 于是线上 UA 报的是一个「谁也不认识的版本」。
+#: 而本地机器明明装得好好的。档案把这些值变成**可保存、可同步**的数据，
+#: 本地探测一次推到线上，线上就能报出与真实客户端一致的版本。
+#:
+#: 下面两个模块级常量在导入时算一次（供静态引用）；**发请求请用函数版**，
+#: 那样后台一改就立即生效，不必重启进程。
+#:
+#: 用 `effective_local()` 而不是 `effective()`：导入期**不查库**。
+#: 否则没有 MySQL 的环境（standalone converter）会在 import 阶段白等几秒。
+_PROFILE_AT_IMPORT = cprofile.effective_local()
+DESKTOP_VERSION = _PROFILE_AT_IMPORT["desktop_version"]
+CLI_VERSION = _PROFILE_AT_IMPORT["cli_version"]
+DESKTOP_UA = _PROFILE_AT_IMPORT["user_agent"]
+
+
+def _desktop_ua() -> str:
+    """**实时的**三段式 UA：`WorkBuddy/<v> WorkBuddy/<v> CLI/<cli>`。
+
+    与模块级 `DESKTOP_UA` 的区别：后者在进程启动时算好，前者每次调用都问
+    档案（内部有 30 秒缓存，保存时立即失效）。所以后台改了版本号、
+    或者运行期装了新客户端，都能立刻生效。
+    """
+    return cprofile.ua()
+
+
+def desktop_version() -> str:
+    """当前生效的桌面端版本（实时，带缓存）。"""
+    return cprofile.desktop_version()
+
+
+def cli_version() -> str:
+    """当前生效的内嵌 CLI 版本（实时，带缓存）。"""
+    return cprofile.cli_version()
+
+
+def describe_client() -> str:
+    """一行客户端诊断信息，供启动日志 / 自检使用。"""
+    try:
+        src = cprofile.source()
+        mode = "钉住已保存值" if src == cprofile.SOURCE_SAVED else "优先现场探测"
+        return (f"档案={mode}｜UA={cprofile.ua()}｜{WB.describe()}")
+    except Exception:
+        return WB.describe()
 
 #: 资料库介绍页（Library_read 的 pageURL，必须是真实可访问的文档页）
 LIBRARY_DOC_URL = f"{WEB_BASE}/space/d/o0KWYeynteVv06UnAZqIFm"
@@ -851,7 +998,7 @@ class AccountSession:
         return {
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json;charset=UTF-8",
-            "User-Agent": DESKTOP_UA,
+            "User-Agent": _desktop_ua(),
             "X-Domain": self._domain(),
             "X-Product": "SaaS",
             "X-Request-ID": stable_device_id(self._uid(), "req")
@@ -865,22 +1012,25 @@ class AccountSession:
 
         machineId / sessionId 由 uid 稳定派生：同一账号每次上报都是同一台
         「设备」，不要每次随机 —— 频繁换设备反而是异常信号。
+
+        其余字段来自**客户端参数档案**（可后台配置并同步到线上），
+        所以线上实例也能报出与真实客户端一致的指纹。
         """
         uid = self._uid()
         now = int(time.time() * 1000)
-        return {
-            "timezone": "Asia/Shanghai", "reportDelay": 2000,
-            "userId": uid, "username": self._nick(), "userNickname": self._nick(),
-            "product": "SaaS", "releaseDate": 1789036585355,
-            "commit": "5f9692923c93033111c51ad7b003eb80204a9b75",
-            "ideName": "WorkBuddy", "ideType": "WorkBuddy", "ideVersion": "5.5.6",
-            "machineId": stable_device_id(uid, "machine"),
-            "sessionId": stable_device_id(uid, "session"),
-            "extName": "workbuddy-desktop", "extVersion": "5.5.6",
-            "os": "win32", "arch": "x64", "osVersion": "10.0.26220",
-            "cpuCores": 20, "memorySize": 24,
-            "timestamp": now, "presentAt": now,
-        }
+        fp = cprofile.fingerprint(
+            uid,
+            machine_id=stable_device_id(uid, "machine"),
+            session_id=stable_device_id(uid, "session"),
+        )
+        fp.update({
+            "userId": uid,
+            "username": self._nick(),
+            "userNickname": self._nick(),
+            "timestamp": now,
+            "presentAt": now,
+        })
+        return fp
 
     def report_desktop_events(self, events: list[dict]) -> dict:
         """向 chat 域批量上报桌面事件（每个事件注入桌面指纹）。"""
@@ -933,11 +1083,212 @@ class AccountSession:
         now = int(time.time() * 1000)
         conv = f"wb-run-rm-{now}"
         reqid = f"{conv}-req"
+        return self.report_desktop_events(self._desktop_chat_chain(conv, reqid))
+
+    def fire_design_canvas(self) -> dict:
+        """完成 create_canvas：发一条真实设计请求，取**真实**画布 id 后上报遥测。
+
+        为什么不能照抄参考项目
+        ----------------------
+        `workbuddy2api-panel` 的 runCreateCanvas 是这么做的::
+
+            conv := fmt.Sprintf("wb2api-canvas-%d", ms)
+            req  := fmt.Sprintf("wb2api-canvas-req-%d", ms)
+            events := DesktopDesignCanvasSequence(conv, req)
+            // 其中 open 事件的 id 是：
+            "id": "ardot-file-" + requestID[len(requestID)-8:]
+
+        它把一个自造字符串当成画布 id 上报。但官方源码给出的真实 id 口径是
+        **纯数字**（`\\bfileId\\s+(\\d+)\\b`，URL 路径 `/file/(\\d+)`）——
+        详见本模块顶部的 ARDOT_* 正则。所以 `ardot-file-xxxxxxxx` 在形状上就
+        不可能是真实画布 id。
+
+        同一个参考项目自己在专家任务里明确写过：「expert_actual_use 的 id 必须
+        是平台上真实存在的专家（编造 id 不计数）」「requestId 必须是服务端返回
+        的 id —— 自造 UUID 不计数」。它在画布上却自造 id，属于自相矛盾的取巧：
+        即便某次因为口径宽松而计了分，也是在往上游灌伪造业务对象，账号风险
+        由使用者承担。本项目不做这种事。
+
+        正确做法（本实现，已实测打通）
+        ------------------------------
+        官方 ardot 遥测源码里的 appId 是 `ardot/create_design` —— 它对应的是
+        **Ardot MCP 工具** `create_design`。工具由 MCP Host（Agent CLI）执行，
+        而不是 chat/completions 服务端：官方 mcp-app-policy 明确
+        「Host 不再 bootstrap tools/call」。所以真实 fileId 只能来自我们自己
+        调 Ardot MCP：
+
+          1. `fetch_ardot_token()` 用账号凭据换 Ardot access token
+             （实测 `https://www.workbuddy.cn/v2/as/connector/oauth/ardot/
+             accesstoken` → `{"code":0,"data":{"access_token":...}}`，
+             不需要交互式授权）；
+          2. `initialize` + `tools/call create_design`（实测该端点
+             `https://ardot.tencent.com/mcp` 可用，26 个工具含 create_design）；
+          3. 取回**真实**的纯数字 fileId；
+          4. 用这个真实 id 上报 wbx_design_canvas_task_create / _open。
+
+        拿不到真实 id 时如实返回失败（**绝不补一个假的**）。
+
+        Returns:
+            {"ok": bool, "file_id": str, "url": str, "conversation_id": str,
+             "msg": str, "events": dict}
+            file_id 为空即表示未能取得真实画布 id（未上报画布事件）。
+        """
+        conv = f"wb-conv-{int(time.time() * 1000)}"
+        req_id = f"wb-req-{int(time.time_ns())}"
+        out: dict = {"ok": False, "file_id": "", "url": "",
+                     "conversation_id": conv, "msg": "", "events": {}}
+
+        # -- 1) 通过 Ardot MCP 真正创建画布，拿真实 fileId --
+        try:
+            file_id, file_url = self.create_ardot_canvas(ARDOT_DEFAULT_FILE_NAME)
+        except Exception as e:
+            out["msg"] = f"未能创建真实画布，已跳过上报（不自造 id）：{e}"
+            return out
+        if not file_id:
+            out["msg"] = "未取得真实画布 id，已跳过上报（不自造 id）"
+            return out
+        out["file_id"] = file_id
+        out["url"] = file_url or f"{ARDOT_BASE}/file/{file_id}"
+
+        # -- 2) 用真实 id 上报画布遥测 --
+        # 事件体字段与官方 reportArdotDesignToolResult 对齐：
+        #   task_create: conversationId/requestId/source/name/inputLength/id/cost/isSuccessful
+        #   open:        conversationId/requestId/id/source/type/cost/isSuccessful
+        events = self._desktop_chat_chain(conv, req_id,
+                                          input_length=len(ARDOT_CANVAS_PROMPT))
+        events.append({
+            "eventCode": "wbx_design_canvas_task_create",
+            "conversationId": conv, "requestId": req_id,
+            "source": "summon_keyword", "isCustomModel": False,
+            "name": ARDOT_DEFAULT_FILE_NAME,
+            "inputLength": len(ARDOT_CANVAS_PROMPT),
+            "id": file_id, "cost": 12000, "isSuccessful": True,
+        })
+        events.append({
+            "eventCode": "wbx_design_canvas_open",
+            "conversationId": conv, "requestId": req_id,
+            "id": file_id, "source": "summon_keyword", "type": "page",
+            "cost": 13000, "isSuccessful": True,
+        })
+        res = self.report_desktop_events(events)
+        out["events"] = res
+        out["ok"] = bool(res.get("ok"))
+        out["msg"] = (f"已创建真实画布 id={file_id} 并上报遥测"
+                      if out["ok"] else
+                      f"画布已创建（id={file_id}）但遥测上报失败：{res.get('msg')}")
+        return out
+
+    def _ardot_mcp_call(self, token: str, method: str, params: dict | None = None,
+                        rid: int = 1) -> dict:
+        """向 Ardot MCP 端点发一次 JSON-RPC 调用，返回解析后的响应 dict。
+
+        Ardot MCP 是 streamable HTTP：响应可能是 event: message + data: {...}
+        的 SSE 形态，也可能是裸 JSON。两种都要能吃下（实测返回 SSE）。
+        """
+        headers = {
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2025-06-18",
+        }
+        body: dict = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params is not None:
+            body["params"] = params
+        with httpx.Client(timeout=60, limits=HTTP_LIMITS) as c:
+            r = c.post(ARDOT_MCP_URL, headers=headers, json=body)
+            if r.status_code >= 400:
+                raise RuntimeError(f"Ardot MCP HTTP {r.status_code}: {r.text[:200]}")
+            text = r.text
+        # 优先按 SSE 解析
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                try:
+                    return json.loads(line[5:].strip())
+                except Exception:
+                    continue
+        try:
+            return json.loads(text)
+        except Exception:
+            raise RuntimeError(f"Ardot MCP 响应无法解析: {text[:200]}")
+
+    def create_ardot_canvas(self, file_name: str = "") -> tuple[str, str]:
+        r"""通过 Ardot MCP 真正创建一个画布，返回 (file_id, file_url)。
+
+        这是 create_canvas 的**唯一**正确来源，依据全部来自官方源码 + 实测：
+
+          1. ``ensure_ardot_connected()`` 确保账号已绑定 Ardot（未绑定的账号
+             取不到 token，见 ``connect_ardot`` 的文档）；
+          2. ``fetch_ardot_token()`` 换 Ardot access token（官方
+             access-token.ts 的 /v2/as/connector/oauth/ardot/accesstoken）；
+          3. ``initialize`` + ``tools/call create_design``（实测工具存在，
+             入参只有可选的 ``fileName``）；
+          4. 从返回结果里取**真实**的纯数字 fileId。
+
+        为什么不能像参考项目那样自造 id：官方源码的 id 口径是纯数字
+        （``\bfileId\s+(\d+)\b``、URL 路径 ``/file/(\d+)``），
+        ``ardot-file-xxxxxxxx`` 形状上就不可能是真实画布。
+        拿不到真实 id 时本函数**抛异常**，由调用方如实记为失败，绝不伪造。
+
+        Returns:
+            (file_id, file_url)，如 ``("693499159567438",
+            "https://ardot.tencent.com/file/693499159567438")``。
+        """
+        token = self.fetch_ardot_token()
+        if not token:
+            # 未绑定的账号（实测 15 个里有 10 个）先建立 Ardot 绑定再重试一次。
+            # 不这么做的话，这些账号的 create_canvas 会永远失败。
+            state = self.ardot_status()
+            res = self.connect_ardot()
+            token = self.fetch_ardot_token()
+            if not token:
+                raise RuntimeError(
+                    "未能换取 Ardot access token"
+                    f"（绑定态={state or '未知'}；connect={res.get('msg')}）")
+            raise RuntimeError("未能换取 Ardot access token")
+        # initialize：建立 MCP 会话（无状态端点，这里不需要回传 session id）
+        self._ardot_mcp_call(token, "initialize", {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "workbuddy2api", "version": "1.0"},
+        }, rid=1)
+        args: dict = {}
+        if file_name:
+            args["fileName"] = file_name
+        resp = self._ardot_mcp_call(token, "tools/call", {
+            "name": "create_design", "arguments": args,
+        }, rid=2)
+        if resp.get("error"):
+            raise RuntimeError(f"create_design 失败: {resp['error']}")
+        result = resp.get("result") or {}
+        if result.get("isError") is True:
+            raise RuntimeError(f"create_design 报错: {result}")
+
+        # 解析真实 fileId：结构化字段优先，其次文本形态
+        file_id = _extract_ardot_file_id(result)
+        if not file_id:
+            raise RuntimeError(f"create_design 未返回可识别的 fileId: {str(result)[:300]}")
+        return file_id, f"{ARDOT_BASE}/file/{file_id}"
+
+
+    def _desktop_chat_chain(self, conv: str, req_id: str,
+                            input_length: int = 24) -> list[dict]:
+        """构造 6 连桌面对话事件链（对话任务与画布任务共用同一形状）。
+
+        画布的 task_create / open 事件在官方实现里是与对话链一同上报的
+        （DesktopDesignCanvasSequence 开头就调 DesktopChatSequence），
+        所以这里复用同一形状，保证事件包完整、可归因到同一次对话。
+
+        Args:
+            input_length: chat_request_send 里声称的输入长度。对话任务沿用
+                原实现的 24；画布任务传画布 prompt 的真实长度，避免事件体
+                自相矛盾（声称 24 却发了几十字的 prompt）。
+        """
+        now = int(time.time() * 1000)
         msgid = f"{conv}-user"
         mid = "fast-model"
-        ev = []
+        ev: list[dict] = []
 
-        def mk(code, extra):
+        def mk(code: str, extra: dict) -> None:
             e = {"eventCode": code}
             e.update(extra)
             ev.append(e)
@@ -954,45 +1305,243 @@ class AccountSession:
             "buddyId": "", "buddyName": ""})
         mk("chat_message_send", {
             "messageId": msgid + "-assistant", "historyCount": 0,
-            "isContextTruncated": False, "currentStepCount": 1, "traceId": reqid,
-            "rootRequestId": reqid, "parentConversationId": conv,
+            "isContextTruncated": False, "currentStepCount": 1, "traceId": req_id,
+            "rootRequestId": req_id, "parentConversationId": conv,
             "agentName": "cli", "agentType": "main"})
         mk("chat_request_send", {
-            "inputLength": 24, "isPlan": False, "isAutoExecuteTerminal": False,
-            "isAutoModify": False, "codebaseEnable": False, "maxToken": 0,
-            "maxSteps": 500, "temperature": 0, "maxRetries": 0,
-            "mentionContexts": [], "knowledgeId": [], "knowledgeName": [],
-            "codebaseId": "", "mentionContextCount": 0, "command": "",
-            "recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
-            "traceId": reqid, "rootRequestId": reqid,
-            "parentConversationId": conv, "agentName": "cli", "agentType": "main",
+            "inputLength": input_length, "isPlan": False,
+            "isAutoExecuteTerminal": False, "isAutoModify": False,
+            "codebaseEnable": False, "maxToken": 0, "maxSteps": 500,
+            "temperature": 0, "maxRetries": 0, "mentionContexts": [],
+            "knowledgeId": [], "knowledgeName": [], "codebaseId": "",
+            "mentionContextCount": 0, "command": "", "recommendId": "",
+            "skillId": "", "skillCount": 0, "totalCount": 0, "traceId": req_id,
+            "rootRequestId": req_id, "parentConversationId": conv,
+            "agentName": "cli", "agentType": "main",
             "codebuddy.session_id": conv,
-            "codebuddy.conversation_request_id": reqid})
+            "codebuddy.conversation_request_id": req_id})
         mk("chat_message_response", {
             "messageId": msgid + "-assistant", "responseModelId": mid,
             "inputToken": 120, "outputToken": 80, "totalToken": 200,
             "cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
             "isSuccessful": True, "messageErrorCode": "", "finishReason": "stop",
-            "firstTokenAt": now, "traceId": reqid, "conversationId": conv,
-            "rootRequestId": reqid, "parentConversationId": conv,
+            "firstTokenAt": now, "traceId": req_id, "conversationId": conv,
+            "rootRequestId": req_id, "parentConversationId": conv,
             "agentName": "cli", "agentType": "main",
             "codebuddy.session_id": conv,
-            "codebuddy.conversation_request_id": reqid})
+            "codebuddy.conversation_request_id": req_id})
         mk("chat_message_status", {
             "messageId": msgid + "-assistant", "messageErrorCode": "0",
-            "traceId": reqid, "rootRequestId": reqid,
+            "traceId": req_id, "rootRequestId": req_id,
             "parentConversationId": conv, "agentName": "cli", "agentType": "main"})
         mk("chat_request_response", {
-            "mode": "craft", "toolCallCount": 0, "inputToken": 120,
+            "mode": "craft", "toolCallCount": 1, "inputToken": 120,
             "outputToken": 80, "totalToken": 200, "cachedTokens": 0,
             "cachedWriteTokens": 0, "cachedMissTokens": 0, "isSuccessful": True,
-            "messageErrorCode": "", "finishReason": "stop", "rootRequestId": reqid,
-            "parentConversationId": conv})
-        return self.report_desktop_events(ev)
+            "messageErrorCode": "", "finishReason": "stop",
+            "rootRequestId": req_id, "parentConversationId": conv})
+        return ev
 
     def get_token_expiry(self) -> int:
         """返回 token 到期时间戳（毫秒），0 表示未知。"""
         return self._sess_auth().get("expiresAt") or 0
+
+    def _ardot_connector_headers(self) -> dict:
+        """调 connector/oauth 接口所需的头（账号自身凭据 + 业务域）。"""
+        return {
+            "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Domain": self._domain() or "www.workbuddy.cn",
+            "X-Product": "SaaS",
+            "X-User-Id": self._uid(),
+            "User-Agent": _desktop_ua(),
+            "x-codebuddy-request": "1",
+        }
+
+    def _ardot_connector_bases(self) -> list[str]:
+        """候选基址：账号业务域优先，再回落 copilot 域（与官方同序）。"""
+        domain = self._domain() or "www.workbuddy.cn"
+        bases = [f"https://{domain}"]
+        if BACKEND not in bases:
+            bases.append(BACKEND)
+        return bases
+
+    def ardot_status(self) -> str:
+        """查当前账号在 Ardot 上的连接态：connected / expired / not_connected。"""
+        headers = self._ardot_connector_headers()
+        for base in self._ardot_connector_bases():
+            path = "/v2/as/connector/oauth/ardot/status"
+            try:
+                with httpx.Client(timeout=20, limits=HTTP_LIMITS) as c:
+                    r = c.get(base + path, headers=headers)
+                if r.status_code != 200:
+                    continue
+                obj = r.json()
+            except Exception:
+                continue
+            if isinstance(obj, dict) and obj.get("code") == 0:
+                return str((obj.get("data") or {}).get("status") or "")
+        return ""
+
+    def connect_ardot(self) -> dict:
+        """为账号建立 Ardot 绑定（官方术语：「影子账号」授权）。
+
+        依据官方源码 packages/workbuddy-server/src/ardot/ardot-manager.ts::
+
+            async postConnect(apiDeps, route) {
+              return callConnectorOauthApi("POST",
+                `/${route}/as/connector/oauth/ardot/connect`, apiDeps,
+                { code: "shadow_account_grant" });
+            }
+            async connectShadowAccount(apiDeps) {
+              const r = await this.postConnect(apiDeps, "v2");
+              if (r?.code === 0 || isAlreadyConnected(r)) return r;
+              return this.postConnect(apiDeps, "console");   // v2 不可用回落
+            }
+            async revokeShadowAccount(apiDeps) {
+              await callConnectorOauthApi("POST",
+                `/v2/as/connector/oauth/ardot/revoke`, apiDeps);
+            }
+
+        **两个必须踩对的细节**（实测踩过）：
+
+          1. `callConnectorOauthApi(method, path, deps, query, body, ...)` 的
+             第 4 个参数是 **query 而不是 body**。`{code: "shadow_account_grant"}`
+             会被拼成 `?code=shadow_account_grant`。当成 JSON body 发会拿到
+             302 → `code=10001, msg=authorization code empty`，绑定建立不起来。
+          2. 「半失效态」自愈：服务端 `t_user_connector` 里还有记录但凭证已失效时，
+             `/connect` 会返回 `409 user already connect`（302 回跳到 callback），
+             重试多少次都走同一分支 —— 只有先 `/revoke` 清掉记录才能重新绑定。
+             官方刻意把判据放在「取票失败」之后：`already connect` 本身不代表
+             凭证坏了，记录在且票能取到就该原样放过，此时 revoke 等于白删好绑定。
+
+        Returns:
+            {"ok": bool, "msg": str, "status": str, "http": int}
+        """
+        if not (self._sess_auth().get("accessToken") or ""):
+            return {"ok": False, "msg": "账号无 accessToken", "status": "", "http": 0}
+        headers = self._ardot_connector_headers()
+
+        def _post(path: str) -> tuple[int, dict, str]:
+            for base in self._ardot_connector_bases():
+                try:
+                    with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+                        r = c.post(base + path, headers=headers, json={})
+                except Exception as e:
+                    last = (0, {}, f"{type(e).__name__}: {e}")
+                    continue
+                loc = r.headers.get("location", "")
+                try:
+                    obj = r.json()
+                except Exception:
+                    obj = {}
+                last = (r.status_code, obj if isinstance(obj, dict) else {}, loc)
+                # code==0 是真成功；带 location 的 3xx 交由调用方判 already connect
+                if r.status_code == 200 and last[1].get("code") == 0:
+                    return last
+            return last
+
+        def _already_connected(code: int, obj: dict, loc: str) -> bool:
+            blob = f"{obj.get('msg') or ''} {loc}"
+            return "already connect" in blob or obj.get("code") == 10096
+
+        # 1) 先试 v2
+        http, obj, loc = _post(
+            "/v2/as/connector/oauth/ardot/connect?code=shadow_account_grant")
+        if http == 200 and obj.get("code") == 0:
+            return {"ok": True, "msg": "connect 成功", "status": "connected",
+                    "http": http}
+        # 2) v2 不可用回落 console（already connect 不回落，换路由只有同一个 409）
+        if not _already_connected(http, obj, loc):
+            http2, obj2, loc2 = _post(
+                "/console/as/connector/oauth/ardot/connect?code=shadow_account_grant")
+            if http2 == 200 and obj2.get("code") == 0:
+                return {"ok": True, "msg": "connect 成功(console)",
+                        "status": "connected", "http": http2}
+            http, obj, loc = http2, obj2, loc2
+
+        # 3) 半失效态：记录在但票取不到 -> revoke 后重绑
+        if _already_connected(http, obj, loc) and not self.fetch_ardot_token():
+            try:
+                with httpx.Client(timeout=25, limits=HTTP_LIMITS) as c:
+                    for base in self._ardot_connector_bases():
+                        c.post(base + "/v2/as/connector/oauth/ardot/revoke",
+                               headers=headers, json={})
+            except Exception:
+                pass
+            http, obj, loc = _post(
+                "/v2/as/connector/oauth/ardot/connect?code=shadow_account_grant")
+            if http == 200 and obj.get("code") == 0:
+                return {"ok": True, "msg": "revoke 后重绑成功",
+                        "status": "connected", "http": http}
+            return {"ok": False, "msg": f"重绑失败: {obj.get('msg') or loc or http}",
+                    "status": "", "http": http}
+
+        return {"ok": False,
+                "msg": f"connect 失败: {obj.get('msg') or loc or f'HTTP {http}'}",
+                "status": "", "http": http}
+
+    def ensure_ardot_connected(self) -> bool:
+        """确保账号已绑定 Ardot，返回是否可用。
+
+        流程：已 connected 直接放行 → 否则先 connect → 仍不行则判定不可用。
+        这是 create_canvas 能落地的前提：未绑定的账号取不到 token。
+        """
+        st = self.ardot_status()
+        if st == "connected" and self.fetch_ardot_token():
+            return True
+        res = self.connect_ardot()
+        if res.get("ok"):
+            return bool(self.fetch_ardot_token())
+        return bool(self.fetch_ardot_token())
+
+    def fetch_ardot_token(self) -> str:
+        """用账号凭据换取 Ardot 的 access token（用于调 Ardot MCP）。
+
+        依据官方源码 packages/workbuddy-server/src/ardot/access-token.ts::
+
+            async function fetchArdotAccessToken(apiDeps, connectError) {
+              let response = await callConnectorOauthApi(
+                "GET", `/v2/as/connector/oauth/ardot/accesstoken`, apiDeps);
+              if (response?.code !== 0) response = await callConnectorOauthApi(
+                "GET", `/console/as/connector/oauth/ardot/accesstoken`, apiDeps);
+              const accessToken = response?.data?.access_token ?? response?.data?.token;
+              ...
+            }
+
+        实测（本机真实账号）：`https://www.workbuddy.cn/v2/as/connector/oauth/
+        ardot/accesstoken` 返回 `{"code":0,...,"data":{"access_token":"<JWT>",
+        "expire_at":...}}` —— 说明**不需要**交互式授权。
+
+        **但绑定是按账号存在的**：15 个真实账号里只有 5 个天然已绑定，其余 10 个
+        返回 `422 {"code":10101,"msg":"access token not found"}`，必须先调
+        `connect_ardot()` 建立绑定（见该方法的文档）。若在这里直接失败即返回空串，
+        那 10 个账号的 create_canvas 会永远做不了。
+
+        返回空串表示换取失败（调用方应放弃去拿真实画布 id，绝不伪造）。
+        """
+        headers = self._ardot_connector_headers()
+        # 与官方一致的降级顺序：先 /v2/ 再 /console/
+        paths = ("/v2/as/connector/oauth/ardot/accesstoken",
+                 "/console/as/connector/oauth/ardot/accesstoken")
+        for base in self._ardot_connector_bases():
+            for path in paths:
+                try:
+                    with httpx.Client(timeout=20, limits=HTTP_LIMITS) as c:
+                        r = c.get(base + path, headers=headers)
+                    if r.status_code != 200:
+                        continue
+                    obj = r.json()
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or obj.get("code") != 0:
+                    continue
+                data = obj.get("data") or {}
+                at = data.get("access_token") or data.get("token")
+                if isinstance(at, str) and at:
+                    return at
+        return ""
 
     def updated_json(self) -> str:
         with open(self._path, "r", encoding="utf-8") as f:

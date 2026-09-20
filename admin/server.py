@@ -9,10 +9,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from admin.config import settings
-from admin.db import ensure_database, init_db, SessionLocal
+from admin.db import SessionLocal, init_db, wait_database_ready
 from admin.models import SystemSetting
-from admin.routers import (accounts, groups, growth, keys, logs, models, proxy,
-                           schedules, stats, sync)
+from admin.routers import (accounts, app_source, client_profile, groups, growth,
+                           keys, logs, models, proxy, schedules, stats, sync)
 from admin.ratelimit import clear_failures, get_client_ip, is_locked, record_failure
 from admin.security import (
     create_admin_token,
@@ -70,6 +70,8 @@ app.include_router(logs.router)
 app.include_router(groups.router)
 app.include_router(stats.router)
 app.include_router(growth.router)
+app.include_router(client_profile.router)
+app.include_router(app_source.router)
 
 
 @app.on_event("startup")
@@ -83,10 +85,81 @@ def _startup():
     else:
         if settings.ADMIN_USERNAME == "admin" and settings.ADMIN_PASSWORD == "admin123":
             logger.warning("仍在使用 admin/admin123 弱口令，且服务可能监听 0.0.0.0，请尽快更换")
-    ensure_database()
-    init_db()
-    from admin.scheduler import start_scheduler
-    start_scheduler()
+
+    # 数据库不可用（例如 MySQL 被 OOM 杀掉正在重启）时**不能**让启动失败：
+    # 这里抛异常会让 uvicorn 直接退出进程，nginx 侧变成 502，且需要人工重启。
+    # 改为重试 + 降级启动，进程保持存活，数据库恢复后自动可用。
+    db_ok = wait_database_ready()
+    if db_ok:
+        try:
+            init_db()
+        except Exception:
+            logger.exception("建表/迁移失败，服务继续启动（数据库可用后重启即可）")
+    else:
+        logger.error("数据库当前不可用，服务以降级模式启动：请求将返回 503，恢复后自动自愈")
+
+    # 装配流量治理运行态：在途租约上限、会话粘性路由（含后台 GC 线程）。
+    # 这些是纯进程内存状态，**不需要数据库**，所以放在 db_ok 判定之外 ——
+    # 数据库降级期间号池选号仍要能在内存里正常工作。
+    try:
+        from admin.pool import POOL
+        POOL.configure(
+            max_in_flight=settings.MAX_IN_FLIGHT,
+            sticky_enabled=settings.STICKY_ENABLED,
+            sticky_ttl_s=settings.STICKY_TTL_SECONDS,
+            sticky_gc_s=settings.STICKY_GC_SECONDS,
+        )
+        logger.info(
+            "号池运行态已装配：单号在途上限=%s 会话粘性=%s(ttl=%ss) 轮转上限=%s",
+            settings.MAX_IN_FLIGHT or "不限", "开" if settings.STICKY_ENABLED else "关",
+            settings.STICKY_TTL_SECONDS, settings.MAX_ROTATE,
+        )
+    except Exception:
+        logger.exception("号池运行态装配失败，将退化为无粘性/无在途限制")
+
+    # 把后台保存的路径覆盖注入 wb_install（安装目录 / 逆向产物目录）。
+    # 必须在下面「客户端版本发现」之前：否则首个请求拿到的还是扫描结果，
+    # 后台改过的安装目录要等一次 refresh 才生效。
+    # 环境变量优先级仍高于这里的覆盖值（见 wb_install._ov）。
+    if db_ok:
+        try:
+            from admin import wb_paths
+            ov = wb_paths.load_into_wb()
+            if any(ov.values()):
+                logger.info("已应用后台路径设置：%s", ov)
+        except Exception:
+            logger.exception("应用后台路径设置失败（继续用自动扫描）")
+
+    # 打印客户端版本发现结果：出站 UA 与桌面事件指纹都靠它。
+    # 显示「兜底」就说明没找到本机安装包 —— 服务能跑，但 UA 报的版本
+    # 不一定与真实客户端一致，属于需要关注的状态，所以要在启动日志里可见。
+    try:
+        from wb_install import WB
+        logger.info("客户端版本：%s", WB.describe())
+        if not WB.is_version_dynamic():
+            logger.warning(
+                "未找到本机 WorkBuddy 安装目录，客户端版本退化为兜底值；"
+                "如需与真实客户端一致，请设置 WORKBUDDY_INSTALL_DIR "
+                "或把安装盘符加进 WORKBUDDY_DRIVES"
+            )
+        if getattr(settings, "DEV_TOOLS", True):
+            logger.info("逆向产物目录：%s（开发工具已开启，可在后台一键拆包）",
+                        WB.source_dir())
+    except Exception:
+        logger.exception("客户端版本发现失败（不影响启动）")
+
+    # 调度器只在数据库可用时启动（否则它每 15s 都会失败一次，纯属噪音）
+    if db_ok:
+        from admin.scheduler import start_scheduler
+        start_scheduler()
+
+    # 预热设备风控 token：桌面端不存在时也会填上负缓存，
+    # 避免每个请求都在事件循环里同步 fork 一次 node 造成阻塞。
+    try:
+        from admin.turing_token import warmup
+        warmup()
+    except Exception:
+        pass
 
 
 def _get_stored_hash() -> str:

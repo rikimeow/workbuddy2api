@@ -11,15 +11,22 @@
  * 以下顺序查找含 `index.cjs` / `package.json` / `turing_sdk.node` / `TuringShieldSDK.dll`
  * 的 turing-sdk 目录：
  *   1. 环境变量 WORKBUDDY_TURING_SDK_DIR（可指向 turing-sdk 目录，或指向桌面端安装基目录）
+ *   1b. 环境变量 WORKBUDDY_INSTALL_DIR（桌面端安装基目录，Python 侧发现后下发）
  *   2. %LOCALAPPDATA% / %APPDATA% / %ProgramFiles% / %ProgramFiles(x86)% / %USERPROFILE% 下的
  *      WorkBuddy 或 workbuddy 目录
  *   3. 各盘根目录（WORKBUDDY_TURING_DRIVES，默认 C,D,E,F）下的 workbuddy / WorkBuddy
  *
+ * **配置自动读取（不写死）**：channelId / 产品名 / 版本号优先读安装包里的
+ * `resources/app.asar.unpacked/cli/product.json`（`config.turingSdk.channelId`、
+ * `genieVersion`），其次读 `resources/install-manifest.json` 的 `appVersion`。
+ * 这样官方发版后本脚本自动跟上，不必改代码。
+ *
  * 其余可覆盖的环境变量：
- *   WORKBUDDY_TURING_CHANNEL_ID  channelId（桌面端 product.json 中 turingSdk.channelId，默认 109144）
+ *   WORKBUDDY_TURING_CHANNEL_ID  channelId（默认读 product.json，最后兜底 109144）
  *   WORKBUDDY_TURING_PRODUCT_NAME 产品名（默认 WorkBuddy）
- *   WORKBUDDY_TURING_VERSION      产品版本（默认 2.0.0）
+ *   WORKBUDDY_TURING_VERSION      产品版本（默认读安装包，最后兜底 2.0.0）
  *   WORKBUDDY_TURING_DRIVES       参与扫描的盘符列表，逗号分隔（默认 C,D,E,F）
+ *   WORKBUDDY_TURING_DEBUG        置 1 时向 stderr 打印取值来源，便于排障
  */
 "use strict";
 const path = require("node:path");
@@ -30,6 +37,10 @@ const REL_SDK_PATHS = [
   "resources/app.asar.unpacked/native/turing-sdk",
   "resources/native/turing-sdk",
 ];
+
+// 兜底默认值：只在读不到安装包时使用，不代表真实版本
+const FALLBACK_DESKTOP_VERSION = "5.5.6";
+const FALLBACK_TURING_CHANNEL_ID = 109144;
 
 // SDK 目录应具备的特征文件（命中其一即视为有效 SDK 目录）
 function looksLikeSdk(dir) {
@@ -46,13 +57,65 @@ function looksLikeSdk(dir) {
   }
 }
 
+// 目录是否是桌面端安装基目录（以存在 resources/app.asar 为准）
+function looksLikeInstall(dir) {
+  try {
+    return fs.statSync(path.join(dir, "resources", "app.asar")).isFile();
+  } catch (_) {
+    return false;
+  }
+}
+
+function readJson(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (_) {
+    return null;
+  }
+}
+
+// 从已定位的安装基目录读出版本号与 turing 配置；读不到返回空对象。
+function readInstallMeta(base) {
+  const out = { version: "", channelId: 0, productName: "", source: {} };
+  if (!base) return out;
+  const unpacked = path.join(base, "resources", "app.asar.unpacked");
+
+  const productJson = readJson(path.join(unpacked, "cli", "product.json"));
+  if (productJson) {
+    const turing = (productJson.config || {}).turingSdk;
+    if (turing && Number.isInteger(turing.channelId) && turing.channelId > 0) {
+      out.channelId = turing.channelId;
+      out.source.channelId = "cli/product.json";
+    }
+    if (typeof productJson.genieVersion === "string" && productJson.genieVersion) {
+      out.version = productJson.genieVersion;
+      out.source.version = "cli/product.json";
+    }
+    if (typeof productJson.applicationName === "string" && productJson.applicationName) {
+      out.productName = productJson.applicationName;
+      out.source.productName = "cli/product.json";
+    }
+  }
+
+  const manifest = readJson(path.join(base, "resources", "install-manifest.json"));
+  if (manifest && !out.version &&
+      typeof manifest.appVersion === "string" && manifest.appVersion) {
+    out.version = manifest.appVersion;
+    out.source.version = "install-manifest.json";
+  }
+  return out;
+}
+
 function collectCandidateDirs() {
   const out = [];
   const add = (d) => { if (d && !out.includes(d)) out.push(d); };
 
   // 1) 显式覆盖（最高优先级）
-  const explicit = process.env.WORKBUDDY_TURING_SDK_DIR;
-  if (explicit) {
+  //    WORKBUDDY_TURING_SDK_DIR 是历史变量名，继续支持；
+  //    WORKBUDDY_INSTALL_DIR 由 Python 侧发现后下发，优先级相同。
+  for (const ev of ["WORKBUDDY_TURING_SDK_DIR", "WORKBUDDY_INSTALL_DIR"]) {
+    const explicit = process.env[ev];
+    if (!explicit) continue;
     const e = path.resolve(explicit);
     if (looksLikeSdk(e)) {
       add(e);
@@ -64,7 +127,7 @@ function collectCandidateDirs() {
 
   // 2) 常见安装基目录
   const bases = [];
-  for (const ev of ["LOCALAPPDATA", "APPDATA", "ProgramFiles", "ProgramFiles(x86)", "USERPROFILE", "HOME"]) {
+  for (const ev of ["LOCALAPPDATA", "APPDATA", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "USERPROFILE", "HOME"]) {
     const v = process.env[ev];
     if (v) {
       bases.push(path.join(v, "WorkBuddy"));
@@ -73,7 +136,7 @@ function collectCandidateDirs() {
   }
 
   // 3) 各盘根目录（支持纯盘符 C / 带冒号 C: / 完整根路径 C:\ 三种写法）
-  const drives = (process.env.WORKBUDDY_TURING_DRIVES || "C,D,E,F")
+  const drives = (process.env.WORKBUDDY_TURING_DRIVES || process.env.WORKBUDDY_DRIVES || "C,D,E,F")
     .split(",").map((s) => s.trim()).filter(Boolean);
   for (const d of drives) {
     let root;
@@ -101,6 +164,17 @@ function findSdkDir() {
     if (looksLikeSdk(dir)) return dir;
   }
   return null;
+}
+
+// 反推 SDK 目录所属的安装基目录（…/resources/app.asar.unpacked/native/turing-sdk）
+function installBaseOf(sdkDir) {
+  let p = sdkDir;
+  for (let i = 0; i < 6; i++) {
+    p = path.dirname(p);
+    if (looksLikeInstall(p)) return p;
+  }
+  return process.env.WORKBUDDY_INSTALL_DIR
+    ? path.resolve(process.env.WORKBUDDY_INSTALL_DIR) : null;
 }
 
 const sdkDir = findSdkDir();
@@ -132,9 +206,37 @@ try {
   process.exit(1);
 }
 
-const channelId = parseInt(process.env.WORKBUDDY_TURING_CHANNEL_ID || "109144", 10);
-const productName = process.env.WORKBUDDY_TURING_PRODUCT_NAME || "WorkBuddy";
-const productVersion = process.env.WORKBUDDY_TURING_VERSION || "2.0.0";
+// 配置：env 覆盖 > 安装包元数据 > 兜底默认
+const installBase = installBaseOf(sdkDir);
+const meta = readInstallMeta(installBase);
+
+function pickEnv(name, metaVal, fallback) {
+  const v = process.env[name];
+  if (v !== undefined && String(v).trim() !== "") return String(v).trim();
+  if (metaVal !== undefined && metaVal !== null && String(metaVal).trim() !== "") {
+    return String(metaVal).trim();
+  }
+  return String(fallback);
+}
+
+const channelId = parseInt(
+  pickEnv("WORKBUDDY_TURING_CHANNEL_ID", meta.channelId, FALLBACK_TURING_CHANNEL_ID), 10);
+const productName = pickEnv("WORKBUDDY_TURING_PRODUCT_NAME", meta.productName, "WorkBuddy");
+const productVersion = pickEnv("WORKBUDDY_TURING_VERSION", meta.version, FALLBACK_DESKTOP_VERSION);
+
+if (process.env.WORKBUDDY_TURING_DEBUG === "1") {
+  process.stderr.write(
+    "[turing_helper] sdkDir=" + sdkDir + "\n" +
+    "[turing_helper] installBase=" + installBase + "\n" +
+    "[turing_helper] channelId=" + channelId +
+      " (" + (process.env.WORKBUDDY_TURING_CHANNEL_ID ? "env"
+              : (meta.source.channelId || "fallback")) + ")\n" +
+    "[turing_helper] version=" + productVersion +
+      " (" + (process.env.WORKBUDDY_TURING_VERSION ? "env"
+              : (meta.source.version || "fallback")) + ")\n" +
+    "[turing_helper] productName=" + productName + "\n"
+  );
+}
 
 function isSupported() {
   try {

@@ -1,4 +1,4 @@
-"""成长任务的「难度分级 + 完成策略」。
+r"""成长任务的「难度分级 + 完成策略」。
 
 这里沉淀的是实测结论，不是猜测：
 
@@ -11,15 +11,23 @@
   已实测可自动完成的（走 POST /v2/report 上报真实业务事件）：
     Library_read         <- web 域 web_element_click（+100 已实测到账）
     playbook_prompt      <- billing 域 playbook_prompt_send（+100 已实测到账）
+    create_canvas        <- chat 域 wbx_design_canvas_task_create/open
     —— 这两个不吃 growthEvent，必须带完整业务字段与对应域的指纹头，
        走 chat 事件包无论发多少次都不计数。
 
+  create_canvas 的特别说明：
+    最早的结论是「事件里要自造 wb-<ms> 画布 id，属伪造业务对象，不做」。
+    但官方源码给出了真实 id 的口径 —— **fileId 是纯数字**
+    （正则 ``\bfileId\s+(\d+)\b``，URL 路径 ``/file/(\d+)``），由 MCP
+    create_design 工具返回。所以正确做法不是编一个 id，而是**真的发一次
+    设计请求**（调 Ardot MCP），让上游创建画布并回传 fileId，再用这个真实
+    id 上报遥测。见 AccountSession.fire_design_canvas。
+
   已实测「发事件包无效」的（枚举 1131 个候选事件均未命中）：
     expert_5 / Hp_Appearance / template_5 / Buddy_App / Expert_lighthouse
-    Expert_team_use_3 / create_canvas / RichMeow_Chat
-    —— 归为 MANUAL。部分任务参考资料显示需上报真实业务事件，但事件体里
-       要填真实对象 id（专家 id / 模板 id / 画布 id），自造 id 属于伪造
-       业务对象，后端核对即露，故暂不纳入自动执行。
+    Expert_team_use_3 / RichMeow_Chat
+    —— 归为 MANUAL。这些任务需要真实对象 id（专家 id / 模板 id），
+       自造 id 属于伪造业务对象，后端核对即露，故暂不纳入自动执行。
 
   奖励为 0 或依赖支付/登录/三方的：直接跳过。
     Expert_Philanthropy 需真实捐款；black_cat 奖励为 0。
@@ -173,8 +181,11 @@ TASK_PLANS: dict[str, TaskPlan] = {
         "公益专家：需真实捐款动作，无法代做",
     ),
     "create_canvas": TaskPlan(
-        "create_canvas", MANUAL, [],
-        "设计创意模式：事件里要自造 wb-<ms> 画布 id，属伪造业务对象，不做",
+        "create_canvas", AUTO, [],
+        "设计创意画布：调 Ardot MCP create_design 真实创建画布，用返回的真实纯数字"
+        " fileId 上报 wbx_design_canvas_task_create/open；拿不到真实 id 就如实跳过"
+        "（绝不伪造）。实测已点亮：1/1、+300 分。",
+        firer="fire_design_canvas",
     ),
 
     # ---------------- 明确跳过 ----------------

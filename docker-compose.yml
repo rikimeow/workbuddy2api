@@ -14,6 +14,10 @@ services:
       - CODEBUDDY2OPENAI_KEY=
       # 指定 auth 文件挂载路径（转换器会自动读取）
       - CODEBUDDY_AUTH_DIR=/data/auth
+      # 出站 UA 报的客户端版本。容器里没有桌面端安装包可读，所以会自动退化到
+      # 内置兜底值；想让 UA 与实际客户端一致，就显式指定（见 .env.example）。
+      # - WORKBUDDY_DESKTOP_VERSION=5.5.6
+      # - WORKBUDDY_CLI_VERSION=2.137.1
     command: >
       python3 converter.py
       --host 0.0.0.0
@@ -34,8 +38,12 @@ services:
       - ADMIN_PORT=8790
       - ADMIN_DATABASE_URL=mysql+pymysql://root:root@127.0.0.1:3306/workbuddy_admin?charset=utf8mb4
       - ADMIN_REDIS_URL=redis://127.0.0.1:6379/0
-      - ADMIN_USERNAME=admin
-      - ADMIN_PASSWORD=admin123
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-123456}
+      # 出站 UA / 桌面事件指纹报的客户端版本。容器里读不到宿主机的安装包，
+      # 会自动退化到兜底值；要准确就显式指定（见 .env.example）。
+      # - WORKBUDDY_DESKTOP_VERSION=5.5.6
+      # - WORKBUDDY_CLI_VERSION=2.137.1
     command: >
       python3 -m uvicorn admin.server:app
       --host 0.0.0.0

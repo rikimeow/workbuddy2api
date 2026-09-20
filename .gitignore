@@ -50,9 +50,19 @@ backup_*.sql
 *.sql.gz
 
 # ===== 测试文件（不提交到仓库；本地可保留用于回归测试） =====
-test_anthropic_adapter.py
-test_responses_adapter.py
-scripts/test_daily_checkin.py
+# 全仓忽略测试代码：回归测试是本地自用工具，含真实账号 id / 内部排查口径，
+# 不适合公开。需要时在本地保留即可（git 不会动已忽略的文件）。
+# 若将来要收录某个测试，用下面的 ! 白名单显式放行。
+test_*.py
+tests/
+*_test.py
+test/
+
+# ===== 逆向取证 / 本地诊断脚本（不提交） =====
+# 这些脚本依赖本机安装包、真实账号、一次性排查结论（有的还含已被证伪的假设），
+# 属于本地工具而非产品代码，一律不上传。
+# scripts/daemon.ps1 是部署脚本，保留。
+scripts/*.py
 
 # ===== 强制保留（即便以点开头也要提交） =====
 !.gitignore

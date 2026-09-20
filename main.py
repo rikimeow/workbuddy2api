@@ -40,6 +40,41 @@ PY = sys.executable  # 用运行本脚本的同一个解释器（venv / 系统�
 LOGS = ROOT / "logs"
 LOGS.mkdir(exist_ok=True)
 
+
+def _load_dotenv() -> None:
+    """尽早把项目根目录的 .env 注入到 os.environ。
+
+    必须在下面的部署安全检查之前执行：此前这些检查读的是「尚未加载 .env」的
+    环境，于是即使 .env 里已经配好了 ADMIN_JWT_SECRET / ADMIN_USERNAME /
+    ADMIN_PASSWORD，启动时依然会打印「未设置强 ADMIN_JWT_SECRET」「未配置
+    ADMIN_USERNAME / ADMIN_PASSWORD」这类**误导性告警**，让人误以为配置丢了。
+    （子系统自身会加载 .env，所以这只是虚惊一场，但足够让人排查半天。）
+    """
+    env_file = ROOT / ".env"
+    if not env_file.is_file():
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(env_file)
+        return
+    except Exception:
+        pass
+    # 没装 python-dotenv 时退化为一个极简解析器（够用：KEY=VALUE，忽略注释）
+    try:
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
 _PRINT_LOCK = threading.Lock()
 
 
@@ -109,6 +144,165 @@ def _build_admin_cmd(args) -> tuple[list[str], int, str]:
     return cmd, port, host
 
 
+#: 宝塔面板的 pid 文件路径。写在这里，面板「停止」按钮才杀得对进程。
+_PIDFILE = Path("/www/server/python_project/vhost/pids/workbuddy2api.pid")
+
+
+def _write_pidfile() -> None:
+    """把本进程真实 pid 写入 pid 文件（宝塔「停止」按钮据此结束服务）。"""
+    try:
+        _PIDFILE.parent.mkdir(parents=True, exist_ok=True)
+        _PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
+        _log(f"[main] pid {os.getpid()} 已写入 {_PIDFILE}")
+    except Exception:
+        pass
+
+
+def _remove_pidfile() -> None:
+    """退出时清理 pid 文件；仅当文件里确实是本进程时才删，避免误删新实例的。"""
+    try:
+        if _PIDFILE.is_file() and _PIDFILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            _PIDFILE.unlink()
+    except Exception:
+        pass
+
+
+def _kill_children(procs: list) -> None:
+    """结束所有子进程（含其进程组），确保不留孤儿占着端口。"""
+    for _tag, p in procs:
+        try:
+            if p.poll() is not None:
+                continue
+            # 子进程以 start_new_session=True 启动，自成进程组 → 整组结束
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except Exception:
+                p.terminate()
+        except Exception:
+            pass
+    # 给一点时间优雅退出，仍存活则强杀
+    deadline = time.time() + 12
+    for _tag, p in procs:
+        try:
+            remain = max(0.5, deadline - time.time())
+            p.wait(timeout=remain)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+
+def _port_in_use(host: str, port: int) -> bool:
+    """探测端口是否已被监听（用于启动前自检，避免撞端口后疯狂重启）。"""
+    import socket
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        return s.connect_ex((probe_host, port)) == 0
+
+
+def _pid_listening_on(port: int) -> list[int]:
+    """返回正在监听指定端口的 pid 列表（仅 Linux；失败返回空列表）。"""
+    pids: list[int] = []
+    try:
+        import subprocess as _sp
+        # -lntp: 只列 LISTEN、不做域名解析、显示进程
+        out = _sp.run(["ss", "-lntpH", f"sport = :{port}"],
+                      capture_output=True, text=True, timeout=5).stdout
+        import re as _re
+        for m in _re.finditer(r"pid=(\d+)", out):
+            pid = int(m.group(1))
+            if pid not in pids:
+                pids.append(pid)
+    except Exception:
+        pass
+    return pids
+
+
+def _is_our_instance(pid: int) -> bool:
+    """该 pid 是否就是本项目的服务进程（工作目录 == 本项目根目录）。"""
+    try:
+        return os.path.realpath(f"/proc/{pid}/cwd") == os.path.realpath(str(ROOT))
+    except Exception:
+        return False
+
+
+#: 重启场景下，等待旧实例释放端口的最长时间（秒）。
+#: 宝塔面板的「重启」是 stop → sleep(1) → start：只要旧进程优雅退出略慢于 1 秒，
+#: 新进程启动时端口就仍被占用。给一段等待窗口，重启才不会误判失败。
+_RESTART_WAIT = 25.0
+
+
+def _ensure_port_free(host: str, port: int) -> None:
+    """启动前检查端口，避免「撞端口 → 无限重启」的重启风暴。
+
+    线上症状：systemd 与宝塔面板同时在拉起本服务，后启动的因
+    `address already in use` 立刻退出，而 `Restart=always` 让它每 5 秒重试，
+    累计重启 12603 次，日志被刷爆。这里在 bind 之前就明确判断：
+
+      * 端口空闲              → 正常启动；
+      * 被**本项目的旧实例**占用 → 说明是「重启」：结束旧实例、等端口释放后接管；
+      * 被**其它进程**占用      → 明确报错并退出，绝不盲目重启、更不误杀别人。
+
+    为什么要主动接管而不是直接退出：实测发现，宝塔停止项目时若只 kill 了
+    `main.py` 而没能带走它派生的 uvicorn 子进程，端口就会被这个孤儿一直占着。
+    此时新实例若只是「退出报错」，面板会显示启动失败，且 pid 文件记录的是
+    已死的进程 —— 之后每次「停止」都杀不掉真正在跑的 uvicorn，形成死结。
+    主动接管可以自愈这种情况。
+    """
+    if not _port_in_use(host, port):
+        return
+
+    pids = _pid_listening_on(port)
+    ours = [p for p in pids if _is_our_instance(p)]
+
+    # 情况一：被本项目的旧实例占用 —— 这是一次重启，接管它
+    if ours and len(ours) == len(pids):
+        _log(f"[main] 端口 {port} 被本项目的旧实例占用（pid {', '.join(map(str, ours))}），"
+             f"按「重启」处理：先结束旧实例…")
+        for pid in ours:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    break
+                except Exception:
+                    break
+                time.sleep(1.0 if sig == signal.SIGTERM else 0.2)
+                if not _port_in_use(host, port):
+                    break
+        deadline = time.time() + _RESTART_WAIT
+        while time.time() < deadline and _port_in_use(host, port):
+            time.sleep(0.5)
+        if _port_in_use(host, port):
+            _log(f"❌ 旧实例在 {_RESTART_WAIT:.0f}s 内仍未释放端口 {port}，本次不启动。")
+            _log("    → 请手动检查后重试。")
+            sys.exit(3)
+        _log("[main] 旧实例已结束，端口已释放，继续启动。")
+        return
+
+    # 情况二：被其它进程占用 —— 绝不动它，直接失败
+    _log(f"❌ 端口 {port} 已被占用，无法启动（当前已有实例在运行）。")
+    if pids:
+        _log(f"    占用进程 pid: {', '.join(str(p) for p in pids)}")
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read().replace(b"\0", b" ").decode(errors="ignore").strip()
+                if cmdline:
+                    _log(f"    pid {pid}: {cmdline}")
+            except Exception:
+                pass
+        _log(f"    → 若确认要重启，请先停掉旧进程： kill {' '.join(str(p) for p in pids)}")
+    _log(f"    → 或改用其他端口： python main.py --port {port + 1}")
+    _log("    提示：同一端口只应由一个管理器负责（systemd 或宝塔面板，二选一）。")
+    sys.exit(3)
+
+
 def main() -> None:
     # 依赖自检：当前解释器缺包则自动切换到带依赖的虚拟环境（修复系统 Python 缺 pymysql 导致启动即崩退出）
     py = _interpreter_with_deps()
@@ -124,6 +318,11 @@ def main() -> None:
     ap.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
     ap.add_argument("--port", type=int, default=8790, help="服务端口（默认 8790）")
     args = ap.parse_args()
+
+    # 端口自检：已有实例在跑就明确退出，绝不反复撞端口（线上重启风暴的根因）。
+    _check_port = int(os.getenv("ADMIN_PORT", str(args.port)))
+    _check_host = os.getenv("ADMIN_HOST", args.host)
+    _ensure_port_free(_check_host, _check_port)
 
     # 部署安全检查
     secret = os.getenv("ADMIN_JWT_SECRET", "")
@@ -141,6 +340,8 @@ def main() -> None:
         p = subprocess.Popen(
             cmd, cwd=str(ROOT),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            # 独立进程组：停止时能连同子进程一起收掉，不会留下占着端口的孤儿。
+            start_new_session=True,
             text=True, bufsize=1, env=os.environ.copy(),
         )
         procs.append((tag, p))
@@ -148,14 +349,17 @@ def main() -> None:
 
     _launch("admin", *_build_admin_cmd(args), LOGS / "admin.log")
 
+    # 自己写 pid 文件：外部启动器（宝塔 cmd.sh / runuser 包装 / systemd）拿到的
+    # `$!` 未必是本进程的真实 pid（例如经 runuser 包装时记录的是包装进程）。
+    # 「停止」按钮按这份 pid 去杀，就会杀错对象、留下仍占着 8790 的 uvicorn 孤儿，
+    # 之后每次启动都撞端口。由进程自己写，才与「真正在跑的服务」一一对应。
+    _write_pidfile()
+
     def _shutdown(signum, _frame) -> None:
         _log(f"\n[main] 收到信号 {signum}，正在关闭…")
         stop.set()
-        for _tag, p in procs:
-            try:
-                p.terminate()
-            except Exception:
-                pass
+        _kill_children(procs)
+        _remove_pidfile()
 
     signal.signal(signal.SIGINT, _shutdown)
     try:
@@ -178,31 +382,13 @@ def main() -> None:
             if rc is not None and not stop.is_set():
                 _log(f"[main] ❌ {tag} 已退出 (code={rc})，关闭服务…")
                 stop.set()
-                for _t2, p2 in procs:
-                    if p2 is not p:
-                        try:
-                            p2.terminate()
-                        except Exception:
-                            pass
-                for _t2, p2 in procs:
-                    try:
-                        p2.wait(timeout=10)
-                    except Exception:
-                        try:
-                            p2.kill()
-                        except Exception:
-                            pass
+                _kill_children(procs)
+                _remove_pidfile()
                 sys.exit(rc if rc != 0 else 1)
         time.sleep(0.5)
 
-    for _tag, p in procs:
-        try:
-            p.wait(timeout=10)
-        except Exception:
-            try:
-                p.kill()
-            except Exception:
-                pass
+    _kill_children(procs)
+    _remove_pidfile()
     _log("[main] 已停止。")
 
 

@@ -91,8 +91,67 @@ class Settings:
     # 腾讯 CodeBuddy/WorkBuddy 后端通过 X-IDE-Name 头识别客户端，默认 "WorkBuddy"。
     UPSTREAM_CLIENT_NAME = os.getenv("ADMIN_UPSTREAM_CLIENT_NAME", "WorkBuddy")
 
-    # 账号选择策略：remain（剩余最多优先）/ lru（最久未用优先）
+    # 账号选择策略：remain（剩余最多优先）/ lru（最久未用优先）/ weighted（三因子加权随机）
     ACCOUNT_SELECT = os.getenv("ADMIN_ACCOUNT_SELECT", "remain")
+
+    # ---------- 开发 / 测试辅助工具 ----------
+    #: 逆向产物（客户端源码）管理：后台一键拆包 app.asar、手动指定安装目录。
+    #:
+    #: **只对开发/测试环境有意义**：生产服务器既没有客户端安装包，也不该在上面
+    #: 放 225MB 的源码。默认开启（本地开发方便），生产部署设为 0 即可整体关闭
+    #: —— 关闭后 /api/app-source/* 全部返回 404，后台也不显示该区域。
+    DEV_TOOLS = os.getenv("ADMIN_DEV_TOOLS", "1") != "0"
+
+    # ---------- 流量治理（限流 / 并发 / 保活） ----------
+    #: 单账号最大在途请求数（0 = 不限）。
+    #: 粘性路由与加权选号都会倾向少数账号，叠加长连接后单号容易过载，
+    #: 上游按账号限速时会成片 429/5xx；在途上限把并发摊平到整个池子。
+    MAX_IN_FLIGHT = int(os.getenv("ADMIN_POOL_MAX_IN_FLIGHT", "3"))
+    #: 会话粘性路由开关。开启后同一会话固定同一账号：
+    #: 上游前缀缓存不碎、多轮更快更省，且一次会话不在号池里逐轮跳号（拟人）。
+    STICKY_ENABLED = os.getenv("ADMIN_SESSION_STICKY", "1") != "0"
+    #: 会话绑定的空闲 TTL（秒），滚动续期，空闲即过期释放。
+    STICKY_TTL_SECONDS = int(os.getenv("ADMIN_SESSION_STICKY_TTL", "1800"))
+    #: 会话绑定 GC 周期（秒）。
+    STICKY_GC_SECONDS = int(os.getenv("ADMIN_SESSION_STICKY_GC", "300"))
+    #: 单请求最多换号次数（原实现硬编码 3，这里可配）。
+    MAX_ROTATE = int(os.getenv("ADMIN_POOL_MAX_ROTATE", "3"))
+    #: 软限流（429）冷却基数（秒）；连续触发按 2 倍指数退避，封顶 SOFT_RATE_MAX。
+    SOFT_RATE_SECONDS = int(os.getenv("ADMIN_POOL_SOFT_RATE", "600"))
+    #: 软冷却指数退避封顶（秒）。默认 2h，与参考实现一致。
+    SOFT_RATE_MAX_SECONDS = int(os.getenv("ADMIN_POOL_SOFT_RATE_MAX", "7200"))
+    #: 连续失败熔断阈值与退避（次 / 秒 / 封顶秒）。
+    BREAKER_THRESHOLD = int(os.getenv("ADMIN_POOL_BREAKER_THRESHOLD", "5"))
+    BREAKER_COOLDOWN_SECONDS = int(os.getenv("ADMIN_POOL_BREAKER_COOLDOWN", "600"))
+    BREAKER_COOLDOWN_MAX_SECONDS = int(os.getenv("ADMIN_POOL_BREAKER_COOLDOWN_MAX", "21600"))
+    #: 连续 12153「session dead」达到该次数才永久禁用。
+    #: 12153 在真实环境会被临时性触发（上游抖动/并发刷新），一次就禁用等于误杀。
+    SESSION_DEAD_THRESHOLD = int(os.getenv("ADMIN_POOL_SESSION_DEAD_THRESHOLD", "3"))
+    #: 模型级限流（code 6004）时的兜底退避（秒），无上游重置时间时使用。
+    MODEL_SOFT_RATE_SECONDS = int(os.getenv("ADMIN_POOL_MODEL_SOFT_RATE", "600"))
+    #: 该后端无此模型（code 11102）的负缓存 TTL（秒）。重试无意义，只能换模型/换号。
+    MODEL_BLOCK_SECONDS = int(os.getenv("ADMIN_POOL_MODEL_BLOCK", "21600"))
+    #: token 保活定时任务的整点（本地时区）。留空则用默认 [22]。
+    _raw_keepalive = os.getenv("ADMIN_KEEPALIVE_HOURS", "22")
+    KEEPALIVE_HOURS = [int(x) for x in _raw_keepalive.replace("，", ",").split(",")
+                       if x.strip().isdigit()] or [22]
+    #: token 保活是否启用。
+    KEEPALIVE_ENABLED = os.getenv("ADMIN_KEEPALIVE_ENABLED", "1") != "0"
+    #: 保活/批量任务里账号之间的最小间隔（秒），避免批量请求被识别为机器行为。
+    KEEPALIVE_ACCOUNT_GAP = float(os.getenv("ADMIN_KEEPALIVE_ACCOUNT_GAP", "0.8"))
+
+    # ---------- 超时（关键：流式绝不设总时长） ----------
+    #: 连接超时（秒）：连不上就快速换号，不让用户干等。
+    STREAM_CONNECT_TIMEOUT = float(os.getenv("ADMIN_STREAM_CONNECT_TIMEOUT", "15"))
+    #: 流式**静默**超时（秒）：两次数据之间的最大间隔。
+    #: 这是「只要上游在持续吐字，流就永不被我们自己掐断」的关键 ——
+    #: 它约束的是空闲，不是总时长。官方客户端源码里 Node 默认的 300s
+    #: 总时长 requestTimeout 会在流仍活跃时掐断 SSE，是必须避免的坑。
+    STREAM_IDLE_TIMEOUT = float(os.getenv("ADMIN_STREAM_IDLE_TIMEOUT", "180"))
+    #: 写入（上传 prompt）超时（秒）。
+    STREAM_WRITE_TIMEOUT = float(os.getenv("ADMIN_STREAM_WRITE_TIMEOUT", "60"))
+    #: 连接池等待超时（秒）：池子饱和就快速失败，交给上层退避，而不是无限排队。
+    STREAM_POOL_TIMEOUT = float(os.getenv("ADMIN_STREAM_POOL_TIMEOUT", "20"))
 
     # 登录防爆破：同一 IP 在窗口内失败超过阈值即锁定一段时间
     LOGIN_MAX_ATTEMPTS = int(os.getenv("ADMIN_LOGIN_MAX_ATTEMPTS", "5"))

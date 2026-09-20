@@ -184,6 +184,7 @@
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="usage"><i class="fa-solid fa-chart-pie mr-1"></i> 使用记录</button>
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="schedules"><i class="fa-solid fa-clock-rotate-left mr-1"></i> 定时任务</button>
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="logs"><i class="fa-solid fa-list mr-1"></i> 日志</button>
+      <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="client"><i class="fa-solid fa-fingerprint mr-1"></i> 客户端参数</button>
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="sync"><i class="fa-solid fa-cloud-arrow-up mr-1"></i> 同步设置</button>
       <button class="tab-btn px-4 py-2 text-sm font-medium text-slate-500 rounded-full whitespace-nowrap" data-tab="settings"><i class="fa-solid fa-gear mr-1"></i> 设置</button>
     </div>
@@ -443,11 +444,59 @@
       <div id="logPager" class="flex justify-between items-center mt-3 text-sm text-slate-500"></div>
     </section>
 
+    <!-- 客户端参数面板：UA / 版本号 / 风控头 / 桌面指纹 -->
+    <section id="panel-client" class="hidden">
+      <div class="flex flex-wrap justify-between items-center mb-3 gap-2">
+        <h2 class="font-semibold">客户端参数（UA / 版本号 / 风控头）</h2>
+        <div class="flex flex-wrap gap-2">
+          <button onclick="detectClient()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="扫描本机安装的 WorkBuddy，读取真实的版本号与风控配置"><i class="fa-solid fa-magnifying-glass mr-1"></i> 探测本机客户端</button>
+          <button onclick="toggleClientSource()" id="clientSourceBtn" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="切换取值策略"><i class="fa-solid fa-arrows-rotate mr-1"></i> 取值策略</button>
+          <button onclick="saveClientProfile()" class="text-sm px-3 py-1.5 rounded-lg btn-primary"><i class="fa-solid fa-floppy-disk mr-1"></i> 保存</button>
+          <button onclick="resetClientProfile()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="清空已保存值，回到「优先现场探测」"><i class="fa-solid fa-eraser mr-1"></i> 重置</button>
+        </div>
+      </div>
+
+      <div id="clientHint" class="card p-4 mb-3 text-xs text-slate-500"></div>
+
+      <div class="card p-5 mb-3">
+        <h3 class="font-semibold text-sm mb-2">生效中的 User-Agent</h3>
+        <div class="flex gap-2 items-start">
+          <code id="clientUa" class="flex-1 bg-slate-50 border rounded-lg px-3 py-2 text-xs break-all font-mono"></code>
+          <button onclick="copyText('#clientUa')" class="px-3 py-1.5 rounded-lg border text-sm" title="复制"><i class="fa-solid fa-copy"></i></button>
+        </div>
+        <p class="text-[11px] text-slate-400 mt-2">UA 由 <code>桌面端版本</code> 与 <code>CLI 版本</code> 自动拼成三段式，两者一致才能避免「UA 报旧版本、X-IDE-Version 报新版本」的错位。要整体自定义请用环境变量 <code>WORKBUDDY_USER_AGENT</code>。</p>
+      </div>
+
+      <div class="grid md:grid-cols-2 gap-3">
+        <div class="card p-5">
+          <h3 class="font-semibold text-sm mb-3">版本与归属</h3>
+          <div id="clientFields"></div>
+        </div>
+        <div class="card p-5">
+          <h3 class="font-semibold text-sm mb-3">桌面事件指纹</h3>
+          <div id="clientFpFields"></div>
+        </div>
+      </div>
+
+      <div class="card p-5 mt-3">
+        <h3 class="font-semibold text-sm mb-2">风控 / 审计请求头</h3>
+        <p class="text-[11px] text-slate-400 mb-3">官方客户端所有 API 请求必带的闸门头。多个默认头会与保存值合并，不会互相覆盖。</p>
+        <div id="clientHeaders"></div>
+      </div>
+
+      <div class="card p-5 mt-3">
+        <h3 class="font-semibold text-sm mb-2">取值来源（排障用）</h3>
+        <div id="clientSources" class="text-xs font-mono text-slate-500 max-h-64 overflow-auto"></div>
+      </div>
+
+      <div id="clientStatus" class="text-sm text-slate-500 mt-4"></div>
+    </section>
+
     <!-- 同步设置面板 -->
     <section id="panel-sync" class="hidden">
       <h2 class="font-semibold mb-3">线上同步设置</h2>
       <div class="card p-5 max-w-2xl">
-        <p class="text-xs text-slate-400 mb-4">本地数据视为最新。配置线上实例的 URL 与密钥（HMAC 签名），点击「同步到线上」把本地账号与模型配置推送过去。线上实例需配置相同密钥并通过 <code class="text-[11px]">/api/sync/receive</code> 接收。</p>
+        <p class="text-xs text-slate-400 mb-4">本地数据视为最新。配置线上实例的 URL 与密钥（HMAC 签名），点击「同步到线上」把本地账号、模型配置<b>与客户端参数（UA / 版本号 / 风控头）</b>推送过去。线上实例需配置相同密钥并通过 <code class="text-[11px]">/api/sync/receive</code> 接收，收到后会自动把客户端参数钉为「已保存」，因此线上无需安装桌面端也能报出与本地一致的真实版本号。</p>
         <label class="block text-sm mb-1">远程 URL</label>
         <input id="syncUrl" class="w-full border rounded-lg px-3 py-2 mb-3 text-sm" placeholder="https://online.example.com" />
         <label class="block text-sm mb-1">同步密钥（HMAC 签名用）</label>
@@ -475,6 +524,65 @@
         <input id="newPwd" type="password" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="新密码（≥6 位）" />
         <input id="newPwd2" type="password" class="w-full border rounded-lg px-3 py-2 mb-3 text-sm" placeholder="确认新密码" />
         <button onclick="changePassword()" class="px-3 py-1.5 rounded-lg btn-primary text-sm">保存新密码</button>
+      </div>
+
+      <!-- 逆向产物（开发/测试环境工具） -->
+      <div id="appSourceBlock" class="card p-5 mt-4">
+        <div class="flex flex-wrap justify-between items-center gap-2 mb-1">
+          <h3 class="text-sm font-medium">逆向产物（客户端源码）</h3>
+          <div class="flex flex-wrap gap-2">
+            <button onclick="detectInstall()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="重新扫描本机安装目录"><i class="fa-solid fa-magnifying-glass mr-1"></i>重新扫描</button>
+            <button onclick="unpackPlan()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50" title="预检：这次要写多少文件"><i class="fa-solid fa-calculator mr-1"></i>预检</button>
+            <button onclick="doUnpack()" id="unpackBtn" class="text-sm px-3 py-1.5 rounded-lg btn-primary"><i class="fa-solid fa-box-open mr-1"></i>一键拆包</button>
+            <button onclick="removeSource()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50 text-red-600" title="删除已产出的源码目录"><i class="fa-solid fa-trash mr-1"></i>删除产物</button>
+          </div>
+        </div>
+        <p class="text-xs text-slate-400 mb-4">
+          从本机安装的客户端 <code>app.asar</code> 里解出源码，便于检索/排障。
+          <b>纯标准库解包，不需要 Node/npm</b>；生产环境不需要此功能（可用
+          <code>ADMIN_DEV_TOOLS=0</code> 关闭）。
+        </p>
+
+        <div id="appSourceStatus" class="text-xs mb-4"></div>
+
+        <label class="block text-sm mb-1">客户端安装目录</label>
+        <div class="flex gap-2 mb-1">
+          <input id="installDirInput" class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" placeholder="例如 D:\WorkBuddy（也可填 resources 或 app.asar，会自动补齐）" />
+          <button onclick="locateInstall()" class="px-3 py-1.5 rounded-lg border text-sm whitespace-nowrap">校验并保存</button>
+        </div>
+        <p class="text-[11px] text-slate-400 mb-3">
+          填 <code>D:\WorkBuddy</code>、<code>D:\WorkBuddy\resources</code> 或
+          <code>…\resources\app.asar</code> 都可以，会自动向上补齐到安装根目录。
+          环境变量 <code>WORKBUDDY_INSTALL_DIR</code> 优先级更高。
+        </p>
+
+        <label class="block text-sm mb-1">逆向产物输出目录</label>
+        <div class="flex gap-2 mb-1">
+          <input id="sourceDirInput" class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" placeholder="留空 = 用户缓存目录（不放进 git 仓库）" />
+          <button onclick="locateSourceDir()" class="px-3 py-1.5 rounded-lg border text-sm whitespace-nowrap">设为输出目录</button>
+        </div>
+        <p class="text-[11px] text-slate-400 mb-3">默认放在用户缓存目录，<b>不会</b>写进项目目录（避免被 git 跟踪）。</p>
+
+        <div id="unpackProgress" class="hidden mb-3">
+          <div class="flex justify-between text-xs text-slate-500 mb-1">
+            <span id="unpackPhase">准备中</span><span id="unpackPct">0%</span>
+          </div>
+          <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
+            <div id="unpackBar" class="h-2 rounded-full transition-all" style="width:0%;background:var(--wb-grad)"></div>
+          </div>
+          <div id="unpackDetail" class="text-[11px] text-slate-400 mt-1 font-mono truncate"></div>
+        </div>
+
+        <div class="border-t pt-3 mt-1">
+          <label class="block text-sm mb-1">在产物里检索关键字</label>
+          <div class="flex gap-2">
+            <input id="srcSearchInput" class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" placeholder="例如 create_canvas / turingSdk" onkeydown="if(event.key==='Enter')searchSource()" />
+            <button onclick="searchSource()" class="px-3 py-1.5 rounded-lg border text-sm whitespace-nowrap">检索</button>
+          </div>
+          <div id="srcSearchResult" class="text-xs mt-2 max-h-72 overflow-auto font-mono"></div>
+        </div>
+
+        <div id="appSourceMsg" class="text-sm text-slate-500 mt-3"></div>
       </div>
     </section>
   </main>
@@ -679,7 +787,11 @@ function openModal(html, widthClass) {
   $("#modal").classList.add("flex");
 }
 function closeModal() { $("#modal").classList.add("hidden"); $("#modal").classList.remove("flex"); }
-function copyText(sel){ const i = $(sel); if(!i) return; i.select(); navigator.clipboard?.writeText(i.value) || document.execCommand("copy"); toast("已复制"); }
+function copyText(sel){ const i = $(sel); if(!i) return;
+  // <input>/<textarea> 走 value，普通元素（如 <code>）走 textContent
+  const s = ("value" in i && i.value !== undefined && i.tagName !== "CODE") ? i.value : (i.textContent||"");
+  if(navigator.clipboard) navigator.clipboard.writeText(s); else { i.select?.(); document.execCommand("copy"); }
+  toast("已复制"); }
 
 document.addEventListener("DOMContentLoaded", () => {
   $("#modal")?.addEventListener("click", (e) => { if (e.target === $("#modal")) closeModal(); });
@@ -738,12 +850,14 @@ function enterApp() {
 document.querySelectorAll(".tab-btn").forEach(b => b.onclick = () => {
   document.querySelectorAll(".tab-btn").forEach(x => x.classList.remove("active", "text-wb"));
   b.classList.add("active");
-  ["accounts","keys","models","groups","usage","schedules","logs","sync","settings"].forEach(t => {
+  ["accounts","keys","models","groups","usage","schedules","logs","client","sync","settings"].forEach(t => {
     $(`#panel-${t}`).classList.toggle("hidden", b.dataset.tab !== t);
   });
-  // 切到这两个面板时按需拉数据（图表/分组列表不必在首屏就请求）
+  // 切到这几个面板时按需拉数据（图表/分组列表/客户端参数不必在首屏就请求）
   if (b.dataset.tab === "groups") loadGroups();
   if (b.dataset.tab === "usage") loadUsageStats();
+  if (b.dataset.tab === "client") loadClientProfile();
+  if (b.dataset.tab === "settings") loadAppSource();
 });
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -2106,12 +2220,448 @@ async function pushToOnline(){
     if(!r.ok){ $("#syncStatus").innerHTML = `<span class="text-red-500">推送失败: ${esc(d.detail||"")}</span>`; toast("推送失败","err"); return; }
     const rr = d.remote_result || {};
     const acc = (rr.accounts||{}); const md = (rr.models||{});
-    $("#syncStatus").innerHTML = `<span class="text-emerald-600">推送成功</span> · 账号 +${acc.added||0}/~${acc.updated||0} · 模型 +${md.added||0}/~${md.updated||0}`;
+    const cp = rr.client_profile;
+    // 客户端参数的应用结果（线上是否成功钉住同步过去的 UA/版本号）
+    let cpTxt = "";
+    if(cp && typeof cp === "object"){
+      cpTxt = cp.applied
+        ? ` · 客户端参数 <span class="text-emerald-600">已同步 ${(cp.fields||[]).length} 项</span>`
+        : `<span class="text-amber-600"> · 客户端参数未同步${cp.errors?.length?"（"+esc(cp.errors.join("；"))+"）":""}</span>`;
+    } else if(d.client_profile === false){
+      cpTxt = ` · <span class="text-amber-600">客户端参数为空</span>`;
+    }
+    $("#syncStatus").innerHTML = `<span class="text-emerald-600">推送成功</span> · 账号 +${acc.added||0}/~${acc.updated||0} · 模型 +${md.added||0}/~${md.updated||0}${cpTxt}`;
     toast("已推送到线上");
     // 推送成功后清理脏标记，并刷新显示（DB 现在已与当前值一致）
     _syncMarkClean();
     loadSyncConfig();
   }catch(e){ toast("推送异常: "+e.message,"err"); }
+}
+
+/* ==================== 客户端参数（UA / 版本号 / 风控头） ====================
+   这些值决定我们的出站请求「像不像官方客户端」。它们可以：
+     1. 现场探测（本机装了 WorkBuddy 就能读到真实版本号/风控配置）
+     2. 在后台手动改（改完立即生效，不必重启进程）
+     3. 随「同步到线上」一起推给线上实例
+   线上服务器没装客户端、探测不到东西，所以它必须用 saved 策略钉住同步过去的值。
+*/
+let _clientProfile = null;
+
+// 输入框分组定义：键 -> [标签, 类型, 说明]
+const _CP_FIELDS = [
+  ["desktop_version", "桌面端版本", "text", "X-IDE-Version 与 UA 都用它"],
+  ["cli_version",     "内嵌 CLI 版本", "text", "UA 第三段"],
+  ["ide_name",        "IDE 名称", "text", "X-IDE-Name"],
+  ["ide_type",        "IDE 类型", "text", "X-IDE-Type"],
+  ["product",         "产品头", "text", "X-Product"],
+  ["turing_channel_id", "风控 channelId", "int", "天御 SDK 渠道号"],
+  ["turing_product_name", "风控产品名", "text", "天御 SDK productName"],
+  ["commit",          "commit", "text", "安装包提交号"],
+  ["release_date_ms", "发布日期(ms)", "int", "安装包构建时间戳"],
+];
+const _CP_FP_FIELDS = [
+  ["fp_product",   "指纹 product", "text", "遥测里的产品形态（官方为 SaaS），与请求头 X-Product 不同"],
+  ["ext_name",     "扩展名", "text", "extName"],
+  ["os",           "操作系统", "text", "官方 Windows 端为 win32"],
+  ["arch",         "架构", "text", "x64 / arm64"],
+  ["os_version",   "系统版本", "text", "osVersion"],
+  ["cpu_cores",    "CPU 核数", "int", ""],
+  ["memory_size",  "内存(GB)", "int", ""],
+  ["timezone",     "时区", "text", ""],
+  ["report_delay", "上报延迟(ms)", "int", ""],
+];
+
+function _cpInput(id, label, type, hint, val){
+  const it = type === "int" ? "number" : "text";
+  return `<label class="block mb-2">
+      <span class="block text-xs text-slate-500 mb-1">${esc(label)}${hint?` <span class="text-slate-300">· ${esc(hint)}</span>`:""}</span>
+      <input id="${id}" type="${it}" value="${val===undefined||val===null?"":esc(String(val))}"
+             class="w-full border rounded-lg px-3 py-1.5 text-sm font-mono" />
+    </label>`;
+}
+
+async function loadClientProfile(){
+  const r = await api("/api/client-profile");
+  if(!r.ok){
+    // 404 = 运行中的后端还是旧代码（新增接口需重启服务）。
+    // 静态页是即改即生效的，所以很容易出现「页面有新面板、接口还没有」的组合，
+    // 这里明确提示，否则用户只会看到一个空白面板。
+    if($("#clientHint")) $("#clientHint").innerHTML = r.status === 404
+      ? `<span class="text-amber-600"><i class="fa-solid fa-triangle-exclamation mr-1"></i>后端尚未加载客户端参数接口（HTTP 404）。请重启服务后刷新本页。</span>`
+      : `<span class="text-red-500">加载失败（HTTP ${r.status}）</span>`;
+    return;
+  }
+  const d = await r.json(); _clientProfile = d;
+  const eff = d.effective || {}, sav = d.saved || {}, det = d.detected || {};
+  const src = d.sources || {};
+
+  // 生效中的 UA
+  if($("#clientUa")) $("#clientUa").textContent = eff.user_agent || "（未知）";
+
+  // 提示条：说明当前策略与「本机是否装了客户端」
+  const hasClient = !!d.has_client;
+  const mode = d.source === "saved" ? "钉住已保存值" : "优先现场探测";
+  if($("#clientHint")) $("#clientHint").innerHTML = `
+    <div class="flex flex-wrap gap-x-6 gap-y-1">
+      <span>取值策略：<b class="${d.source==="saved"?"text-amber-600":"text-emerald-600"}">${esc(mode)}</b></span>
+      <span>本机客户端：${hasClient
+        ? `<b class="text-emerald-600">已探测到</b>（${Object.keys(det).length} 项）`
+        : `<b class="text-slate-400">未探测到</b>`}</span>
+      <span>已保存字段：<b>${Object.keys(sav).length}</b></span>
+    </div>
+    <div class="mt-2 text-slate-400">${
+      hasClient
+        ? "本机装了客户端，现场探测会优先给出真实版本号；改动版本后无需重启进程即刻生效。"
+        : "本机未探测到客户端（线上服务器属正常）。线上实例请用「钉住已保存值」，否则会退化成内置兜底版本号。"
+    }</div>
+    ${d.source!=="saved" && !hasClient
+      ? `<div class="mt-1 text-amber-600"><i class="fa-solid fa-triangle-exclamation mr-1"></i>建议切换到「钉住已保存值」，否则本机探测不到时会用兜底值。</div>`
+      : ""}`;
+
+  // 字段：显示生效值，并在悬浮提示里标出来源
+  const render = (defs, mount) => {
+    const el = $(mount); if(!el) return;
+    el.innerHTML = defs.map(([k,label,type,hint]) => {
+      const v = eff[k] !== undefined ? eff[k] : "";
+      const s = src[k] || "";
+      const cls = s.startsWith("环境变量") ? "text-amber-600"
+                : (s === "内置兜底" ? "text-slate-400"
+                : (s === "已保存" ? "text-sky-600" : "text-emerald-600"));
+      return `<div title="来源：${esc(s)}">${_cpInput("cp_"+k, label, type,
+        (hint?hint+" · ":"") + s, v)}</div>`;
+    }).join("");
+  };
+  render(_CP_FIELDS, "#clientFields");
+  render(_CP_FP_FIELDS, "#clientFpFields");
+
+  // 风控头：默认头 + 保存头 合并后的结果，可直接编辑
+  const hs = eff.headers || {};
+  const hEl = $("#clientHeaders");
+  if(hEl){
+    hEl.innerHTML = Object.keys(hs).sort().map((k,i) => `
+      <div class="flex gap-2 mb-2 items-center cp-hrow">
+        <input class="cp-hk w-1/3 border rounded-lg px-2 py-1 text-xs font-mono" value="${esc(k)}" />
+        <input class="cp-hv flex-1 border rounded-lg px-2 py-1 text-xs font-mono" value="${esc(String(hs[k]))}" />
+        <button onclick="this.parentNode.remove()" class="px-2 py-1 rounded border text-xs text-red-500" title="删除"><i class="fa-solid fa-xmark"></i></button>
+      </div>`).join("") +
+      `<button onclick="_cpAddHeader()" class="text-xs px-2 py-1 rounded border hover:bg-slate-50 mt-1"><i class="fa-solid fa-plus mr-1"></i>添加请求头</button>`;
+  }
+
+  // 来源表（排障）
+  const sEl = $("#clientSources");
+  if(sEl){
+    sEl.innerHTML = Object.keys(src).sort()
+      .map(k => `<div><span class="text-slate-400">${esc(k)}</span> <span class="${String(src[k]).startsWith("环境变量")?"text-amber-600":"text-slate-600"}">${esc(src[k])}</span></div>`)
+      .join("");
+  }
+}
+
+function _cpAddHeader(){
+  const el = $("#clientHeaders"); if(!el) return;
+  const row = document.createElement("div");
+  row.className = "flex gap-2 mb-2 items-center cp-hrow";
+  row.innerHTML = `<input class="cp-hk w-1/3 border rounded-lg px-2 py-1 text-xs font-mono" placeholder="Header-Name" />
+    <input class="cp-hv flex-1 border rounded-lg px-2 py-1 text-xs font-mono" placeholder="值" />
+    <button onclick="this.parentNode.remove()" class="px-2 py-1 rounded border text-xs text-red-500"><i class="fa-solid fa-xmark"></i></button>`;
+  el.insertBefore(row, el.lastElementChild);
+  row.querySelector(".cp-hk").focus();
+}
+
+function _cpCollect(){
+  const p = {};
+  _CP_FIELDS.concat(_CP_FP_FIELDS).forEach(([k,,type]) => {
+    const el = $("#cp_"+k); if(!el) return;
+    const raw = (el.value||"").trim();
+    if(raw === "") return;                 // 留空 = 不改这一项
+    p[k] = type === "int" ? (parseInt(raw,10) || 0) : raw;
+  });
+  const hs = {};
+  document.querySelectorAll("#clientHeaders .cp-hrow").forEach(row => {
+    const k = row.querySelector(".cp-hk").value.trim();
+    const v = row.querySelector(".cp-hv").value.trim();
+    if(k) hs[k] = v;
+  });
+  if(Object.keys(hs).length) p.headers = hs;
+  return p;
+}
+
+async function saveClientProfile(){
+  const profile = _cpCollect();
+  if(!Object.keys(profile).length){ toast("没有要保存的改动","err"); return; }
+  const r = await api("/api/client-profile",{method:"PUT",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({profile, merge:true})});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ toast("保存失败: "+(d.detail||""),"err"); return; }
+  toast("已保存，新值立即生效");
+  if(d.errors?.length) console.warn("客户端参数提示:", d.errors);
+  loadClientProfile();
+}
+
+async function resetClientProfile(){
+  if(!await uiConfirm({kind:"warn", danger:true, title:"重置客户端参数",
+      message:"清空后台保存的值，回到「优先现场探测 + 内置兜底」。确认重置？", okText:"重置"})) return;
+  const r = await api("/api/client-profile/reset",{method:"POST"});
+  if(r.ok){ toast("已重置"); loadClientProfile(); } else toast("重置失败","err");
+}
+
+async function detectClient(){
+  toast("正在探测本机客户端...","ok");
+  const r = await api("/api/client-profile/detect",{method:"POST"});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ toast("探测失败","err"); return; }
+  const det = d.detected || {};
+  const n = Object.keys(det).length;
+  const el = $("#clientStatus");
+  if(el){
+    el.innerHTML = n
+      ? `<span class="text-emerald-600">探测到 ${n} 项</span>：<code class="text-xs">${esc(JSON.stringify(det))}</code>
+         <div class="text-xs text-slate-400 mt-1">点「保存」可把探测结果钉住（线上同步时会带过去）。</div>`
+      : `<span class="text-amber-600">未探测到本机客户端</span>：${esc(d.message||"")}`;
+  }
+  // 探测到就把值填进表单，方便一键保存
+  if(n){
+    _CP_FIELDS.forEach(([k]) => {
+      const inp = $("#cp_"+k);
+      if(inp && det[k] !== undefined) inp.value = det[k];
+    });
+  }
+  toast(n ? `探测到 ${n} 项` : "未探测到本机客户端", n ? "ok" : "err");
+}
+
+async function toggleClientSource(){
+  const cur = _clientProfile?.source || "auto";
+  const next = cur === "saved" ? "auto" : "saved";
+  const isSaved = next === "saved";
+  if(!await uiConfirm({kind:"warn", danger:false,
+      title:isSaved?"切换为「钉住已保存值」":"切换为「优先现场探测」",
+      message:isSaved
+        ? "保存的值将优先于现场探测。线上实例应选这个（它探测不到客户端）。"
+        : "现场探测的值将优先于保存值。本机装了客户端时用它，版本升级后会自动跟上。",
+      okText:"切换"})) return;
+  const r = await api("/api/client-profile",{method:"PUT",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({profile:{}, source:next, merge:true})});
+  if(r.ok){ toast("已切换为 "+(isSaved?"钉住已保存值":"优先现场探测")); loadClientProfile(); }
+  else toast("切换失败","err");
+}
+
+/* ==================== 逆向产物（开发/测试工具） ====================
+   从本机客户端 app.asar 解出源码。全量实测 2242 个文件 / 225MB / 约 14 秒，
+   所以走后台任务 + 轮询进度，避免请求挂死、界面「点了没反应」。
+   生产环境用 ADMIN_DEV_TOOLS=0 整体关闭（接口 404，本区域自动隐藏）。
+*/
+let _unpackTimer = null;
+let _appSource = null;
+
+function _fmtBytes(n){
+  n = Number(n)||0;
+  if(n < 1024) return n + " B";
+  if(n < 1024*1024) return (n/1024).toFixed(1) + " KB";
+  if(n < 1024*1024*1024) return (n/1024/1024).toFixed(1) + " MB";
+  return (n/1024/1024/1024).toFixed(2) + " GB";
+}
+function _fmtTime(ts){
+  if(!ts) return "—";
+  try { return new Date(ts*1000).toLocaleString(); } catch(e){ return "—"; }
+}
+
+async function loadAppSource(){
+  const r = await api("/api/app-source/status");
+  if(!r.ok){
+    // 404 = 该功能被 ADMIN_DEV_TOOLS=0 关闭；整块隐藏，不给用户看死按钮
+    if(r.status === 404){ $("#appSourceBlock")?.classList.add("hidden"); return; }
+    if($("#appSourceStatus")) $("#appSourceStatus").innerHTML =
+      `<span class="text-red-500">加载失败（HTTP ${r.status}）</span>`;
+    return;
+  }
+  const d = await r.json();
+  if(!d.dev_tools){ $("#appSourceBlock")?.classList.add("hidden"); return; }
+  $("#appSourceBlock")?.classList.remove("hidden");
+  _appSource = d;
+
+  const st = d.source_stat || {};
+  if($("#installDirInput")) $("#installDirInput").value = d.install_dir || "";
+  if($("#sourceDirInput")) $("#sourceDirInput").value = d.source_dir || "";
+
+  const ok = !!d.install_dir;
+  $("#appSourceStatus").innerHTML = `
+    <div class="grid md:grid-cols-2 gap-x-6 gap-y-1">
+      <div>安装目录：${ok
+        ? `<b class="text-emerald-600">${esc(d.install_dir)}</b>`
+        : `<b class="text-amber-600">未找到</b>`}</div>
+      <div>app.asar：${d.asar
+        ? `<span class="text-slate-600">${_fmtBytes(d.asar_size)}</span>`
+        : `<span class="text-slate-400">无</span>`}</div>
+      <div>产物目录：<span class="text-slate-600">${esc(d.source_dir||"")}</span></div>
+      <div>产物状态：${st.files
+        ? `<b class="text-emerald-600">已产出</b> · ${st.files} 个文件 · ${_fmtBytes(st.bytes)}
+           ${st.extracted_at?` · ${_fmtTime(st.extracted_at)}`:""}`
+        : `<span class="text-slate-400">尚未产出</span>`}</div>
+    </div>
+    <div class="mt-1 text-slate-400">
+      路径来源 — 安装目录：${esc(d.paths_config?.sources?.install_dir||"—")}
+      · 产物目录：${esc(d.paths_config?.sources?.source_dir||"—")}
+      · 解包环境：Python ${esc(d.python||"")}${d.node?` / Node ${esc(d.node)}（非必需）`:""}
+    </div>
+    ${!ok ? `<div class="mt-1 text-amber-600"><i class="fa-solid fa-triangle-exclamation mr-1"></i>
+      未找到客户端安装目录。请在下方手动填入安装路径（例如 D:\\WorkBuddy），
+      或把安装盘符加进 <code>WORKBUDDY_DRIVES</code>。</div>` : ""}`;
+
+  if(st.files) $("#unpackBtn").innerHTML = '<i class="fa-solid fa-rotate mr-1"></i>补齐产物';
+  else $("#unpackBtn").innerHTML = '<i class="fa-solid fa-box-open mr-1"></i>一键拆包';
+}
+
+async function detectInstall(){
+  toast("正在扫描本机安装目录...","ok");
+  const r = await api("/api/app-source/detect",{method:"POST"});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ toast("扫描失败","err"); return; }
+  await loadAppSource();
+  toast(d.install_dir ? "已找到安装目录" : "未找到安装目录，请手动指定",
+        d.install_dir ? "ok" : "err");
+}
+
+async function locateInstall(){
+  const v = ($("#installDirInput")?.value || "").trim();
+  if(!v){ toast("请先填写安装目录","err"); return; }
+  const r = await api("/api/app-source/locate",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({install_dir:v, save:true})});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ toast("校验失败: "+(d.detail||""),"err"); $("#appSourceMsg").innerHTML =
+    `<span class="text-red-500">${esc(d.detail||"")}</span>`; return; }
+  // 回填规范化后的路径：用户填的是 resources/ 或 app.asar 时能看到被纠正成什么
+  const v2 = d.validated || {};
+  $("#appSourceMsg").innerHTML = `<span class="text-emerald-600">已保存并立即生效</span>
+    <div class="text-xs text-slate-400 mt-1">安装目录规范化为 <code>${esc(v2.install_dir||"")}</code>
+    （你填的是 <code>${esc(v2.input||"")}</code>）</div>`;
+  toast("安装目录已更新");
+  await loadAppSource();
+}
+
+async function locateSourceDir(){
+  const v = ($("#sourceDirInput")?.value || "").trim();
+  if(!v){ toast("请填写产物输出目录","err"); return; }
+  const r = await api("/api/app-source/locate",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({source_dir:v, save:true})});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ toast("设置失败: "+(d.detail||""),"err"); return; }
+  toast("输出目录已更新");
+  await loadAppSource();
+}
+
+async function unpackPlan(){
+  const r = await api("/api/app-source/unpack/plan",{method:"POST"});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ toast("预检失败: "+(d.detail||""),"err"); return; }
+  const p = d.plan||{}, e = d.existing||{};
+  $("#appSourceMsg").innerHTML = `
+    <div class="card p-3 bg-slate-50">
+      <div class="text-xs">本次将处理 <b>${p.files||0}</b> 个文件、约 <b>${_fmtBytes(p.bytes)}</b>；
+        其中 <b>${p.unpacked||0}</b> 个来自 <code>app.asar.unpacked</code>。</div>
+      <div class="text-xs mt-1">输出到 <code>${esc(d.dest||"")}</code></div>
+      ${e.files ? `<div class="text-xs mt-1 text-slate-400">已存在 ${e.files} 个文件（${_fmtBytes(e.bytes)}），
+        拆包会<b>跳过已存在文件</b>、只补缺失的。</div>` : ""}
+      ${p.missing ? `<div class="text-xs mt-1 text-amber-600">${p.missing} 个 unpacked 文件在磁盘上缺失，无法抽取。</div>` : ""}
+    </div>`;
+  // 顺带把预检结果作为确认框内容，让用户对「写 225MB」有预期
+  if(await uiConfirm({kind:"info", danger:false, title:"确认拆包",
+      message:`将写入约 ${_fmtBytes(p.bytes)}（${p.files} 个文件）到\n${d.dest}\n\n已存在的文件会被跳过。继续？`,
+      okText:"开始拆包"})){
+    doUnpack();
+  }
+}
+
+async function doUnpack(){
+  const btn = $("#unpackBtn");
+  if(btn) btn.disabled = true;
+  const r = await api("/api/app-source/unpack",{method:"POST",
+    headers:{"Content-Type":"application/json"}, body:JSON.stringify({})});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){
+    if(btn) btn.disabled = false;
+    toast("拆包失败: "+(d.detail||""),"err"); return;
+  }
+  if(d.already_running) toast("已有拆包任务在运行");
+  else toast("已开始拆包");
+  $("#unpackProgress")?.classList.remove("hidden");
+  _pollUnpack();
+}
+
+function _pollUnpack(){
+  if(_unpackTimer) clearInterval(_unpackTimer);
+  const tick = async () => {
+    const r = await api("/api/app-source/unpack/progress");
+    if(!r.ok) return;
+    const d = await r.json();
+    if(!d.exists){ _stopUnpackPoll(); return; }
+    const pct = d.total ? Math.floor((d.done||0)/d.total*100) : 0;
+    if($("#unpackBar")) $("#unpackBar").style.width = pct + "%";
+    if($("#unpackPct")) $("#unpackPct").textContent = pct + "%";
+    if($("#unpackPhase")) $("#unpackPhase").textContent =
+      d.status === "running" ? (d.phase||"进行中") : (d.status === "finished" ? "完成" : "失败");
+    if($("#unpackDetail")) $("#unpackDetail").textContent =
+      `${d.done||0}/${d.total||0}  ${d.current||""}`;
+
+    if(d.status !== "running"){
+      _stopUnpackPoll();
+      const btn = $("#unpackBtn"); if(btn) btn.disabled = false;
+      const res = d.result || {};
+      if(d.status === "failed"){
+        toast("拆包失败","err");
+        $("#appSourceMsg").innerHTML = `<span class="text-red-500">失败：${esc(d.error||"")}</span>`;
+      } else {
+        toast("拆包完成");
+        $("#appSourceMsg").innerHTML = `<span class="text-emerald-600">拆包完成</span>
+          <div class="text-xs text-slate-400 mt-1">
+            新增 ${res.written||0} 个文件（${_fmtBytes(res.bytes)}）·
+            跳过已存在 ${res.skipped_exists||0} 个 ·
+            缺失 ${res.skipped_missing||0} 个
+            ${res.dest?`<br>输出目录：<code>${esc(res.dest)}</code>`:""}
+          </div>`;
+      }
+      await loadAppSource();
+    }
+  };
+  tick();
+  _unpackTimer = setInterval(tick, 700);
+}
+function _stopUnpackPoll(){
+  if(_unpackTimer){ clearInterval(_unpackTimer); _unpackTimer = null; }
+}
+
+async function removeSource(){
+  if(!await uiConfirm({kind:"warn", danger:true, title:"删除逆向产物",
+      message:"删除已解出的源码目录？只删本工具产出的那个目录（不含 .extracted 标记或名字不是 app_source 时会拒绝）。",
+      okText:"删除"})) return;
+  const r = await api("/api/app-source/remove",{method:"POST"});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ toast("删除失败: "+(d.detail||""),"err"); return; }
+  toast(d.removed ? "已删除" : "目录不存在");
+  $("#srcSearchResult").innerHTML = "";
+  await loadAppSource();
+}
+
+async function searchSource(){
+  const q = ($("#srcSearchInput")?.value || "").trim();
+  if(!q){ toast("请输入关键字","err"); return; }
+  const el = $("#srcSearchResult");
+  el.innerHTML = '<span class="text-slate-400">检索中...</span>';
+  const r = await api(`/api/app-source/search?q=${encodeURIComponent(q)}&limit=50`);
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ el.innerHTML = `<span class="text-red-500">${esc(d.detail||"检索失败")}</span>`; return; }
+  if(!d.ok){ el.innerHTML = `<span class="text-amber-600">${esc(d.reason||"")}</span>`; return; }
+  if(!d.hits?.length){
+    el.innerHTML = `<span class="text-slate-400">未找到「${esc(q)}」（已扫描 ${d.scanned||0} 个文件）</span>`;
+    return;
+  }
+  el.innerHTML = `<div class="text-slate-400 mb-1">${d.hits.length} 处命中（已扫描 ${d.scanned} 个文件）</div>` +
+    d.hits.map(h => `<div class="mb-1 border-b border-slate-100 pb-1">
+        <span class="text-sky-600">${esc(h.file)}:${h.line}</span>
+        <div class="text-slate-500 break-all">${esc(h.text)}</div>
+      </div>`).join("");
 }
 
 /* ==================== 设置 ==================== */
