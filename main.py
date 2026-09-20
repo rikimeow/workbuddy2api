@@ -143,9 +143,27 @@ def _interpreter_with_deps() -> str | None:
     return None
 
 
+def _resolve_host_port(args) -> tuple[str, int]:
+    """解析监听地址/端口。
+
+    **优先级：显式命令行 > 环境变量(.env) > 默认值。**
+
+    原实现写成 `os.getenv("ADMIN_PORT", str(args.port))` —— 环境变量优先，
+    于是 `.env` 里的 `ADMIN_PORT=8790` 会**吞掉** `--port 58634`，
+    命令行上写的端口被静默忽略、仍然去起 8790：接管逻辑随即杀掉线上实例。
+    实测中这造成过两次线上服务被误停（用 `--port` 起测试实例时）。
+    命令行是操作者的**当次明确意图**，必须压过配置文件里的常驻值。
+    """
+    host = args.host if args.host is not None else os.getenv("ADMIN_HOST", "0.0.0.0")
+    if args.port is not None:
+        port = int(args.port)
+    else:
+        port = int(os.getenv("ADMIN_PORT", "8790"))
+    return host, port
+
+
 def _build_admin_cmd(args) -> tuple[list[str], int, str]:
-    port = int(os.getenv("ADMIN_PORT", str(args.port)))
-    host = os.getenv("ADMIN_HOST", args.host)
+    host, port = _resolve_host_port(args)
     cmd = [PY, "-m", "uvicorn", "admin.server:app",
            "--host", host, "--port", str(port), "--log-level", "info"]
     return cmd, port, host
@@ -645,8 +663,13 @@ def main() -> None:
         os.execv(py, [py, os.path.abspath(__file__)] + sys.argv[1:])
 
     ap = argparse.ArgumentParser(description="workbuddy2api 一键启动（单端口：管理后台 + 内嵌网关）")
-    ap.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
-    ap.add_argument("--port", type=int, default=8790, help="服务端口（默认 8790）")
+    # 默认值设为 None：用来区分「命令行显式指定」与「没写、应回落到 .env」。
+    # 若默认写成 0.0.0.0/8790，就分不清用户是否真的要这个值，也就无法让
+    # 命令行压过 .env（见 `_resolve_host_port`）。
+    ap.add_argument("--host", default=None,
+                    help="监听地址（默认取 ADMIN_HOST，再默认 0.0.0.0）")
+    ap.add_argument("--port", type=int, default=None,
+                    help="服务端口（默认取 ADMIN_PORT，再默认 8790）")
     ap.add_argument("--restart", action="store_true",
                     help="端口被占用时先结束占用者再启动（本项目旧实例默认就会自动接管；"
                          "此开关用于占用者是其它进程、但确认要强制重启的情况）")
@@ -656,8 +679,7 @@ def main() -> None:
 
     # 端口自检：已有实例在跑就明确退出，绝不反复撞端口（线上重启风暴的根因）。
     # 本项目的旧实例会被自动接管（等价于重启）；别人的进程默认不碰，除非 --restart/--force。
-    _check_port = int(os.getenv("ADMIN_PORT", str(args.port)))
-    _check_host = os.getenv("ADMIN_HOST", args.host)
+    _check_host, _check_port = _resolve_host_port(args)
     _ensure_port_free(_check_host, _check_port,
                       force=bool(args.restart or args.force))
 
@@ -704,8 +726,7 @@ def main() -> None:
     except Exception:
         pass
 
-    admin_port = os.getenv("ADMIN_PORT", str(args.port))
-    admin_host = os.getenv("ADMIN_HOST", args.host)
+    admin_host, admin_port = _resolve_host_port(args)
     _log(f"[main] 单端口服务已启动：")
     _log(f"       管理后台   : http://{admin_host}:{admin_port}/admin")
     _log(f"       托管网关   : http://{admin_host}:{admin_port}/v1/chat/completions  (带 Key 配额)")

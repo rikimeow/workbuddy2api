@@ -488,6 +488,18 @@ python main.py --restart
 > `admin.server:app`，要么「命令行由 python 解释器执行 + 含项目根目录 + 含本项目入口脚本」。
 > 调用本服务的**祖先进程**（终端 / 启动器）永不结束。
 
+**监听端口优先级：命令行 `--port` > `.env` 的 `ADMIN_PORT` > 默认 `8790`。**
+
+原实现写成 `os.getenv("ADMIN_PORT", str(args.port))` —— 环境变量优先，
+于是 `.env` 里的 `ADMIN_PORT=8790` 会**静默吞掉** `--port 58634`，
+命令行上指定的端口不生效、仍然去起 8790，接管逻辑随即把**线上实例**杀掉。
+本机实测这误停了线上服务两次（都是想用 `--port` 起一个测试实例时）。
+命令行是操作者的**当次明确意图**，必须压过配置文件里的常驻值。
+
+> 连带教训：任何会「自动接管端口」的脚本都不要拿线上端口做端到端测试。
+> `scripts/verify_port_takeover.py` 现在用临时高位端口自建实例，
+> 并断言线上端口在测试前后占用者一致。
+
 启动后：
 
 - 管理后台：`http://127.0.0.1:8790/admin`
@@ -1082,7 +1094,7 @@ workbuddy2api/
 │   ├── routers/              # accounts / app_source / client_profile / groups / growth / keys / proxy / schedules / logs / stats / sync / models
 │   └── static/index.html     # 纯 HTML + TailwindCSS + FontAwesome 管理大屏
 ├── tests/                    # 本地回归测试（.gitignore 忽略，不进仓库）
-│   ├── test_pool.py          # 号池治理 / 错误分类 / 200 体内错误 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包 / 端口接管（433 项）
+│   ├── test_pool.py          # 号池治理 / 错误分类 / 200 体内错误 / 端口优先级 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包 / 端口接管（438 项）
 │   ├── test_e2e_db.py        # 真实库端到端：迁移 / 保活任务 / 选号链路（48 项）
 │   └── test_gateway_smoke.py # 真实上游端到端冒烟（9 项，会消耗少量积分）
 ├── wb_install.py             # WorkBuddy 安装位置 / 版本号 / 风控配置自动发现（不写死盘符）
@@ -1624,7 +1636,7 @@ cache miss     5.2 ms      每 30 秒最多一次
 ### 10.12 这批改动的验证
 
 ```bash
-.venv\Scripts\python.exe tests\test_pool.py            # 433 项，不依赖库/网络
+.venv\Scripts\python.exe tests\test_pool.py            # 438 项，不依赖库/网络
 .venv\Scripts\python.exe test_upstream_compat.py       #  74 项，上游协议兼容/思考开关（本地文件，不入仓库）
 .venv\Scripts\python.exe tests\test_e2e_db.py          #  48 项，连真实 MySQL（只读 + 幂等迁移）
 .venv\Scripts\python.exe tests\test_gateway_smoke.py   #   9 项，真实上游端到端（会消耗少量积分）
@@ -1703,7 +1715,7 @@ cache miss     5.2 ms      每 30 秒最多一次
 - 客户端参数档案（UA / 版本号 / 风控头 / 桌面指纹）的**探测→保存→生效→同步**闭环；
 - 后台一键拆包与路径自动补齐（`ADMIN_DEV_TOOLS`）；
 - `create_canvas` 的真实 id 口径与两段式状态机（`accept` → 完成 → `claim`）；
-- 全部测试（`test_pool.py` 433 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
+- 全部测试（`test_pool.py` 438 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
 
 ### 如果引用有误
 
