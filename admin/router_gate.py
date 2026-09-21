@@ -371,6 +371,14 @@ def _cache_ttl() -> int:
     return max(0, settings.ROUTER_GATE_CACHE_TTL)
 
 
+def _min_conf() -> float:
+    """置信度下限（0 = 不设阈值）。低于它时不采用 Jev 的档位、退回 auto。"""
+    try:
+        return max(0.0, min(1.0, float(settings.ROUTER_GATE_MIN_CONF)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
 def api_key() -> str:
     """生效的 Jev API Key：后台配置 > `TYPESAFE_API_KEY`。为空时门限整体禁用。"""
     return resolve("api_key")[0]
@@ -646,6 +654,21 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
         return GateResult(ms=ms, shadow=shadow, confidence=conf,
                           picked=str(picked)[:_MAX_PICKED],
                           fallback=f"not_allowed:{str(picked)[:32]}")
+
+    # 置信度下限：低置信度说明 Jev 在档位间摇摆，采用它等于**赌**。
+    # 这里退回 "auto" 交给上游原逻辑 —— `picked` 仍记录（便于事后看它原本想选什么），
+    # 但 `active` 保持 False，所以调用方不会替换模型。
+    # 为什么必须在这一层拦而不是调用方：**缓存**。低置信度的判断若不拦，会被
+    # `_cache_put` 存下来、在 TTL 内被后续每一轮复用（实测 conf=0.25 被路由到最贵档）。
+    min_conf = _min_conf()
+    if min_conf > 0 and conf < min_conf:
+        _logger.info("门限置信度 %.2f < %.2f，退回 auto（Jev 本想选 %s）",
+                     conf, min_conf, picked)
+        # 不写缓存：低置信度往往说明**这次**的 state 不好判断，下一轮值得重新问，
+        # 而不是把这个悬而未决的判断钉住整个会话窗口。
+        return GateResult(ms=ms, shadow=shadow, confidence=conf, picked=picked,
+                          reasoning=reasoning, long_context=long_ctx,
+                          fallback=f"low_confidence:{conf:.2f}<{min_conf:g}")
 
     out = GateResult(
         model=picked if active else "", active=active, shadow=shadow,

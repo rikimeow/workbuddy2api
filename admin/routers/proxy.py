@@ -342,7 +342,13 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                 client_ip=client_ip or "", use_case=use_case or "",
                 seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms, error_kind=error_kind or "",
                 gate_model=(gate.picked if gate else ""),
-                gate_conf=(gate.confidence if gate and not gate.fallback else None),
+                # 置信度尽量落库：**包括低置信度被拦下**的情况（fallback=low_confidence:*）。
+                # 只在「压根没拿到判断」时才为 None（超时/网络失败/形状不对）——
+                # 那些情况 `confidence` 本就是 0，落进去会和「真的判成 0 置信度」混淆。
+                gate_conf=(gate.confidence
+                           if gate and (not gate.fallback
+                                        or gate.fallback.startswith("low_confidence"))
+                           else None),
                 gate_ms=(gate.ms if gate else None),
                 gate_note=(gate.summary() if gate else ""),
                 has_image=1 if has_image else 0,

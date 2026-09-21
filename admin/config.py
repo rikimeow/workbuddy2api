@@ -167,6 +167,17 @@ class Settings:
     #: 默认 900（15 分钟）是刻意压短的：宁可多花一点切换成本，也别让「低开高走」
     #: 的对话被开头钉住太久。调大 = 更稳但更迟钝；调小 = 更跟手但切换更频繁。
     ROUTER_GATE_CACHE_TTL = int(os.getenv("ADMIN_ROUTER_GATE_CACHE_TTL", "900"))
+    #: 置信度下限：Jev 的 Choice 置信度低于此值时**不采用它的档位**，退回 auto
+    #: （交给上游按原逻辑路由）。0 = 不设阈值（任何判断都采用）。
+    #:
+    #: 为什么需要：置信度反映「Jev 在几个档位间有多摇摆」，低置信度意味着它可能
+    #: 判错。而它的错会**被缓存放大**——一次 conf=0.25 的判断会在整个缓存窗口
+    #: （默认 15 分钟）内被后续每一轮复用，且没有任何机制纠正。
+    #: 实测见过 conf=0.25 却被路由到最贵的 deep-model。
+    #:
+    #: 取 0.5 的依据：Choice 的 confidence 由概率分布算得，0.5 大致对应
+    #: 「最高档位概率约一半」——低于此说明 Jev 在赌，而赌错的代价是钱或质量。
+    ROUTER_GATE_MIN_CONF = float(os.getenv("ADMIN_ROUTER_GATE_MIN_CONF", "0.5"))
     #: TypeSafe API Key（https://console.typesafe.ai/keys）。
     #: 为空时门限直接退回 auto 行为，不会报错。
     TYPESAFE_API_KEY = os.getenv("TYPESAFE_API_KEY", "").strip()
