@@ -1,10 +1,15 @@
-"""`auto-with-jev` 路由门限：用 TypeSafe Jev 给请求打结构化特征。
+"""Jev 路由门限：接管 `auto`，用 TypeSafe Jev 给请求打结构化特征。
 
 背景
 ----
 `auto` 的语义是「让上游智能路由挑模型」，本地看不到它会落到哪个厂商模型。
-本模块提供一个**可选**的替代语义 `auto-with-jev`：本地先用 Jev 判断这条请求
-需要什么能力，再由 `_GATE_TIERS` 把判断映射成模型档位。
+本模块**可选地**接管 `auto`：本地先用 Jev 判断这条请求需要什么能力，再由
+`GATE_TIERS` 把判断映射成模型档位。客户端不用记新模型名 —— 用 `auto` 就走路限。
+
+三种模式（`ADMIN_ROUTER_GATE`，或请求头 `X-Route-Mode`）：
+  off    = 完全不调用，auto 走原有逻辑，零延迟（默认，等于没装这个功能）
+  shadow = 只记录不生效：auto 仍按原语义路由，判断写进 UsageLog 供对比
+  on     = 按档位替换模型（越界/失败一律退回 auto）
 
 **延迟要提前想清楚，这是本方案的主要代价**
 ------------------------------------------
@@ -28,9 +33,8 @@
 * **Jev 只做语义判断，档位由代码映射。** 不把「选模型」直接交给模型：
   映射规则是可审查的常量、可单测、改了不用重跑推理，也不必把整份模型目录
   塞进 prompt（省 token、省维护）。
-* **shadow 默认开启。** 门限只在 `X-Route-Mode: shadow` 或 `ADMIN_ROUTER_GATE=shadow`
-  下**只记录不生效**：请求仍按原 `auto` 语义走，但判断结果写进 UsageLog 供对比。
-  这是安全上线的前提 —— 门限的返回值会决定真实路由，必须先拿真实流量验证。
+* **shadow 是上线前的必经阶段。** 门限的返回值会决定真实路由，必须先拿真实
+  流量验证判断质量（尤其置信度低的样本），再切 on。
 * **fail-open 是硬要求。** 超时 / 429 / 5xx / JSON 异常 / 形状不对 —— 一律返回
   `active=False`，请求退回原 `auto` 行为。门限绝不能让一次请求失败。
 * **模型名必须白名单校验。** 即使 prompt 里的候选清单被注入，返回值也只能是
@@ -83,8 +87,7 @@ GATE_TIERS: tuple[Tier, ...] = (
 #: 生效模式下允许透传给上游的模型 id 全集（= 三个档位）。
 #:
 #: 校验时用的是这个集合而不是「全部已启用模型」：门限只允许在这三档之间选，
-#: 也**天然排除 `auto` 本身** —— 否则就等于把路由权又交回上游，
-#: `auto-with-jev` 的语义被悄悄降级成 `auto`。
+#: 也**天然排除 `auto` 本身** —— 否则就等于把路由权又交回上游，门限被悄悄架空。
 _ALLOWED_MODELS = frozenset(t.model for t in GATE_TIERS)
 
 QUESTIONS: dict = {
@@ -217,19 +220,20 @@ def close_client() -> None:
 def gate_mode(header_value: str | None = None) -> str:
     """决定这次请求走哪种门限模式：``off`` / ``shadow`` / ``on``。
 
-    优先级：请求头 > 环境变量。**请求头只放宽不收紧** ——
-    服务端关了（off）就是关了，客户端不能靠一个头把它打开。
+    优先级：请求头 > 环境变量。服务端 ``off`` 是锁死的 —— 客户端不能靠头打开。
+    非 off 时，请求头 ``X-Route-Mode: off`` 可**逐请求关闭**门限（逃生门：
+    环境是 on 时，个别客户端仍可要回纯上游 auto）；``on`` 逐请求强制生效。
     """
     env = settings.ROUTER_GATE
     if env in ("0", "off", "false", "no"):
         return "off"
-    if env in ("on", "1", "true", "yes", "active"):
-        return "on"
-    # env 未识别 → 视为 shadow。请求头允许放宽到 on。
+    env_mode = "on" if env in ("on", "1", "true", "yes", "active") else "shadow"
     hdr = (header_value or "").strip().lower()
+    if hdr in ("off", "0", "false", "no"):
+        return "off"
     if hdr in ("on", "active", "1", "true"):
         return "on"
-    return "shadow"
+    return env_mode
 
 
 def extract_state(body: dict) -> str:

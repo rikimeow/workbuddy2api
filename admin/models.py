@@ -148,7 +148,7 @@ class UsageLog(Base):
     ttfb_ms = Column(Integer, nullable=True, default=None)
     latency_ms = Column(Integer, nullable=True, default=None)
     error_kind = Column(String(32), default="")  # hard_credit | soft_rate | server | not_found | session_dead | transport | client | success
-    # auto-with-jev 门限观测：影子模式下用这几列对比「门限会选什么」与
+    # Jev 门限观测：影子模式下用这几列对比「门限会选什么」与
     # 「上游 auto 实际落到什么」（后者见 model 列，取自上游回传的真实模型名）。
     gate_model = Column(String(64), default="")   # Jev 选出的档位；失败时为空
     gate_conf = Column(Float, nullable=True, default=None)  # 该档位的置信度

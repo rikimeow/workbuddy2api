@@ -1221,23 +1221,26 @@ def _model_out_of_group_error(model: str) -> JSONResponse:
     )
 
 
-#: 本地 Jev 门限路由的模型名。**独立于 `auto`**：`auto` 的行为一个字都不改，
-#: 想用门限必须显式点名这个 id。这样提 PR 时是纯增量，也不影响既有调用方。
-AUTO_WITH_JEV = "auto-with-jev"
+#: Jev 门限接管的模型：所有 auto 语义请求（含空串，`_pick_best_model` 把空串
+#: 同样视为 auto）都先经门限。off / shadow / 判断失败时 `_gate_route` 原样返回
+#: "auto"，行为与未装门限**完全一致**；只有 on 模式且档位通过白名单/分组校验
+#: 才把模型替换成档位。客户端不用记新模型名 —— 用 auto 就走路限。
+_AUTO_MODELS = ("auto", "")
 
-#: 逐请求覆盖门限模式的请求头（只能放宽到 on，不能越过服务端的 off）。
+#: 逐请求覆盖门限模式的请求头。值：on（强制生效）/ off（逐请求关闭，逃生门）/
+#: shadow 或不带（跟随服务端 `ADMIN_ROUTER_GATE`）。服务端 off 时本头无效。
 _ROUTE_MODE_HEADER = "x-route-mode"
 
 
 async def _gate_route(body: dict, mode_header: str | None) -> tuple[str, "router_gate.GateResult | None"]:
-    """解析 `auto-with-jev`：调 Jev 判断档位，返回 (要交给白名单校验的模型名, GateResult)。
+    """门限接管 auto：调 Jev 判断档位，返回 (要交给白名单校验的模型名, GateResult)。
 
     关键安全性：**门限失败时返回 `auto`**，不是返回 None。
     返回值最终都会经过 `_pick_best_model` 校验，所以这里只需要给出「意图」，
     不需要重复实现白名单 / 分组 / 账号池的逻辑。
 
-    影子模式下恒返回 `auto` —— 即行为与原来的 `auto` 完全一致，
-    Jev 的判断只进日志，不参与路由。
+    off 模式与 shadow 模式都恒返回 `auto` —— off 完全不调用 Jev；
+    shadow 调 Jev 但**不参与路由**（判断只进日志），两者行为都与未装门限时一致。
 
     `router_gate.classify` 是同步阻塞的（复用连接后单次约 0.35-1.5s，且首次调用要建
     TLS 连接），**不能直接在事件循环里调**：那会把同一进程内所有其它请求一起冻住
@@ -1631,13 +1634,19 @@ async def chat_completions(
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
 
     model = payload.get("model", "auto")
-    # auto-with-jev：本地 Jev 门限路由（与 auto 完全独立；shadow 模式下等价于 auto）
+
+    # 分组集合提前算：门限校验「选出的档位是否在分组/白名单内」也要用它
+    allowed = _key_group_models(db, key)
+
+    # Jev 门限接管 auto：off/shadow/失败时 _gate_route 原样返回 "auto"，
+    # 与未装门限行为一致；仅 on 且档位通过校验才替换（越界则退回 auto，不报错）。
     gate = None
-    if model == AUTO_WITH_JEV:
-        model, gate = await _gate_route(payload, request.headers.get(_ROUTE_MODE_HEADER))
+    if model in _AUTO_MODELS:
+        routed, gate = await _gate_route(payload, request.headers.get(_ROUTE_MODE_HEADER))
+        if gate is not None and gate.active and _pick_best_model(db, routed, allowed) is not None:
+            model = routed
 
     # 模型白名单检查 + 免费优先选择（绑定了分组的 Key 只在组内选择）
-    allowed = _key_group_models(db, key)
     resolved_model = _pick_best_model(db, model, allowed)
     if resolved_model is None:
         if allowed is not None and model not in ("auto", ""):
@@ -2040,10 +2049,13 @@ async def responses_proxy(
     chat_body["stream_options"] = opts
 
     requested = payload.get("model", "auto")
-    gate = None
-    if requested == AUTO_WITH_JEV:
-        requested, gate = await _gate_route(chat_body, request.headers.get(_ROUTE_MODE_HEADER))
     allowed = _key_group_models(db, key)
+    # Jev 门限接管 auto（同 chat 端点：越界档位退回 auto，不报错）
+    gate = None
+    if requested in _AUTO_MODELS:
+        routed, gate = await _gate_route(chat_body, request.headers.get(_ROUTE_MODE_HEADER))
+        if gate is not None and gate.active and _pick_best_model(db, routed, allowed) is not None:
+            requested = routed
     resolved = _pick_best_model(db, requested, allowed)
     if resolved is None:
         if allowed is not None and requested not in ("auto", ""):
@@ -2456,15 +2468,14 @@ async def anthropic_messages(
         except Exception as e:
             _logger.warning("harness 脱敏失败，按原样发送：%s", e)
 
-    requested = payload.get("model", "auto")
-    gate = None
-    if requested == AUTO_WITH_JEV:
-        # 必须抢在 _map_anthropic_model 之前：它会把这个上游不认识的名字
-        # 当成 claude-* 之类的未知模型而降级成 "auto"，门限就永远不会触发。
-        requested, gate = await _gate_route(chat_body, request.headers.get(_ROUTE_MODE_HEADER))
-    else:
-        requested = _map_anthropic_model(db, requested, key)
+    # 先做 Anthropic 名称映射（claude-* → 白名单模型或 auto），再门限接管映射结果里的 auto
+    requested = _map_anthropic_model(db, payload.get("model", "auto"), key)
     allowed = _key_group_models(db, key)
+    gate = None
+    if requested in _AUTO_MODELS:
+        routed, gate = await _gate_route(chat_body, request.headers.get(_ROUTE_MODE_HEADER))
+        if gate is not None and gate.active and _pick_best_model(db, routed, allowed) is not None:
+            requested = routed
     resolved = _pick_best_model(db, requested, allowed)
     if resolved is None:
         if allowed is not None and requested not in ("auto", ""):
