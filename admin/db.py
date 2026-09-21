@@ -135,6 +135,8 @@ def init_db() -> bool:
         _ensure_column("usage_logs", "gate_conf", "FLOAT", "NULL")
         _ensure_column("usage_logs", "gate_ms", "INT", "NULL")
         _ensure_column("usage_logs", "gate_note", "VARCHAR(255)", "DEFAULT ''")
+        # 迁移：请求是否含图片（多模态占比统计 / 视觉能力排查）
+        _ensure_column("usage_logs", "has_image", "INT", "DEFAULT 0")
 
         # 迁移：给 accounts 表加稳定性状态机字段
         _ensure_column("accounts", "err_count", "INT", "DEFAULT 0")

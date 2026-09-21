@@ -154,6 +154,9 @@ class UsageLog(Base):
     gate_conf = Column(Float, nullable=True, default=None)  # 该档位的置信度
     gate_ms = Column(Integer, nullable=True, default=None)  # 门限自身耗时
     gate_note = Column(String(255), default="")   # 摘要或失败原因（见 router_gate.GateResult）
+    # 请求是否携带图片（多模态）。用于统计视觉请求占比；也让「含图请求被路由到
+    # 不支持视觉的模型」这类问题能被事后查出来（上游元数据 supports_images）。
+    has_image = Column(Integer, default=0)  # 0/1
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

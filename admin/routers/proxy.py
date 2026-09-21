@@ -244,6 +244,43 @@ def _session_headers(body: dict, uid: str) -> dict:
 
 
 
+def _has_image(body: dict) -> bool:
+    """请求体里是否包含图片（多模态）。
+
+    只做结构判定，不解码内容 —— 用于统计视觉请求占比，以及事后排查
+    「含图请求被路由到不支持视觉的模型」（上游元数据 supports_images）。
+
+    兼容两种协议的图片形态：
+      * OpenAI:    content 是 list，元素 {"type": "image_url", "image_url": {...}}
+      * Anthropic: content 是 list，元素 {"type": "image", "source": {...}}
+    另外把 Responses 协议的顶层 "input_image" 也认上。
+    """
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") in ("image_url", "image", "input_image"):
+                    return True
+    # Responses 协议：input 里可能直接嵌 input_image
+    def _scan(node, depth=0) -> bool:
+        if depth > 4:
+            return False
+        if isinstance(node, dict):
+            if node.get("type") in ("image_url", "image", "input_image"):
+                return True
+            return any(_scan(v, depth + 1) for v in node.values())
+        if isinstance(node, list):
+            return any(_scan(v, depth + 1) for v in node)
+        return False
+
+    return _scan(body.get("input"))
+
+
 def _record_usage(key_id: int, account_id: int, model: str, credits: float | None,
                   updated_auth_json: str | None, *,
                   client_ip: str = "", use_case: str = "",
@@ -252,7 +289,8 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                   cached_tokens: int | None = None,
                   seq: int = 0, ttfb_ms: int | None = None,
                   latency_ms: int | None = None, error_kind: str = "",
-                  gate: "router_gate.GateResult | None" = None) -> int | None:
+                  gate: "router_gate.GateResult | None" = None,
+                  has_image: bool = False) -> int | None:
     """流式响应结束后独立开一个 DB 会话写入用量/额度。
 
     关键点：请求作用域的 db 会话在端点返回 StreamingResponse 时已被依赖 teardown 关闭，
@@ -307,6 +345,7 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                 gate_conf=(gate.confidence if gate and not gate.fallback else None),
                 gate_ms=(gate.ms if gate else None),
                 gate_note=(gate.summary() if gate else ""),
+                has_image=1 if has_image else 0,
             )
             db.add(log)
             db.commit()
@@ -1784,6 +1823,7 @@ async def chat_completions(
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
 
     model = payload.get("model", "auto")
+    has_img = _has_image(payload)
 
     # 分组集合提前算：门限校验「选出的档位是否在分组/白名单内」也要用它
     allowed = _key_group_models(db, key)
@@ -2017,7 +2057,7 @@ async def chat_completions(
                                               client_ip=_client_ip(request),
                                               use_case="chat-completion", seq=seq,
                                               latency_ms=latency_ms, error_kind=kind,
-                                              gate=gate)
+                                              gate=gate, has_image=has_img)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -2060,7 +2100,7 @@ async def chat_completions(
                                           total_tokens=usage["total_tokens"],
                                           cached_tokens=usage["cached_tokens"],
                                           seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
-                                          error_kind="success", gate=gate)
+                                          error_kind="success", gate=gate, has_image=has_img)
                             if aggregate:
                                 # 聚合模式下客户端要的是一个 JSON 对象，
                                 # 而不是 text/event-stream。这里 yield **字符串**
@@ -2103,7 +2143,7 @@ async def chat_completions(
             seq = _log_chat_row(None, latency_ms, final_model, mode, "-", status_out, None, error_kind=err_kind)
             _record_usage(key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="chat-completion", seq=seq, latency_ms=latency_ms,
-                          error_kind=err_kind, gate=gate)
+                          error_kind=err_kind, gate=gate, has_image=has_img)
             err_msg = _exhaustion_message(err_kind, last_err_msg, tried_accounts, tried_models_n)
             err_obj = {"error": {"message": err_msg, "type": "no_model_available"}}
             if aggregate:
@@ -2199,6 +2239,7 @@ async def responses_proxy(
     chat_body["stream_options"] = opts
 
     requested = payload.get("model", "auto")
+    has_img = _has_image(payload)
     allowed = _key_group_models(db, key)
     # Jev 门限接管 auto（同 chat 端点：越界档位退回 auto，不报错）
     gate = None
@@ -2327,7 +2368,7 @@ async def responses_proxy(
                                           completion_tokens=cost_info["completion_tokens"],
                                           total_tokens=cost_info["total_tokens"],
                                           cached_tokens=cost_info["cached_tokens"],
-                                          seq=seq, error_kind="success", gate=gate)
+                                          seq=seq, error_kind="success", gate=gate, has_image=has_img)
                             return JSONResponse(content=obj)
                     except Exception as e:
                         kind = _classify_error(0, str(e))
@@ -2342,7 +2383,7 @@ async def responses_proxy(
             seq = _log_chat_row(None, None, resolved, "resp", "-", 503, None, error_kind="no_account")
             _record_usage(key.id, 0, resolved, 0.0, None,
                           client_ip=_client_ip(request), use_case="responses", seq=seq,
-                          error_kind="no_account", gate=gate)
+                          error_kind="no_account", gate=gate, has_image=has_img)
             if POOL.waf.active():
                 return JSONResponse(status_code=503, content={"error": {
                     "message": f"上游 WAF 拦截了网关出口 IP，已暂停轮转，请 {POOL.waf.remaining()}s 后重试",
@@ -2471,7 +2512,7 @@ async def responses_proxy(
                                 _record_usage(key.id, final_acc_id, final_model, 0.0, None,
                                               client_ip=_client_ip(request), use_case="responses",
                                               seq=seq, latency_ms=latency_ms, error_kind=kind,
-                                              gate=gate)
+                                              gate=gate, has_image=has_img)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -2505,7 +2546,7 @@ async def responses_proxy(
                                           total_tokens=usage["total_tokens"],
                                           cached_tokens=usage["cached_tokens"],
                                           seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
-                                          error_kind="success", gate=gate)
+                                          error_kind="success", gate=gate, has_image=has_img)
                             return
                         except Exception as e:
                             if delivered:
@@ -2529,7 +2570,7 @@ async def responses_proxy(
             seq = _log_chat_row(None, latency_ms, final_model, "resp", "-", 503, None, error_kind=err_kind)
             _record_usage(key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="responses", seq=seq, latency_ms=latency_ms,
-                          error_kind=err_kind, gate=gate)
+                          error_kind=err_kind, gate=gate, has_image=has_img)
             if err_kind == "waf":
                 msg = _exhaustion_message("waf", last_err_msg, 0, len(order) if order else 0)
             else:
@@ -2620,6 +2661,9 @@ async def anthropic_messages(
 
     # 先做 Anthropic 名称映射（claude-* → 白名单模型或 auto），再门限接管映射结果里的 auto
     requested = _map_anthropic_model(db, payload.get("model", "auto"), key)
+    # 图片检测看原始 payload（Anthropic 的 content 块），不是转换后的 chat_body：
+    # 转换器可能丢掉非文本块，用它统计会漏掉真实的视觉请求。
+    has_img = _has_image(payload)
     allowed = _key_group_models(db, key)
     gate = None
     if requested in _AUTO_MODELS:
@@ -2758,7 +2802,7 @@ async def anthropic_messages(
                                           completion_tokens=cost_info["completion_tokens"],
                                           total_tokens=cost_info["total_tokens"],
                                           cached_tokens=cost_info["cached_tokens"],
-                                          seq=seq, error_kind="success", gate=gate)
+                                          seq=seq, error_kind="success", gate=gate, has_image=has_img)
                             return JSONResponse(content=msg_obj)
                     except Exception as e:
                         kind = _classify_error(0, str(e))
@@ -2773,7 +2817,7 @@ async def anthropic_messages(
             seq = _log_chat_row(None, None, resolved, "anthropic", "-", 503, None, error_kind="no_account")
             _record_usage(key.id, 0, resolved, 0.0, None,
                           client_ip=_client_ip(request), use_case="anthropic",
-                          seq=seq, error_kind="no_account", gate=gate)
+                          seq=seq, error_kind="no_account", gate=gate, has_image=has_img)
             if POOL.waf.active():
                 return JSONResponse(status_code=503, content={"error": {
                     "message": f"上游 WAF 拦截了网关出口 IP，已暂停轮转，请 {POOL.waf.remaining()}s 后重试",
@@ -2903,7 +2947,7 @@ async def anthropic_messages(
                                 _record_usage(key.id, final_acc_id, final_model, 0.0, None,
                                               client_ip=_client_ip(request), use_case="anthropic",
                                               seq=seq, latency_ms=latency_ms, error_kind=kind,
-                                              gate=gate)
+                                              gate=gate, has_image=has_img)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -2937,7 +2981,7 @@ async def anthropic_messages(
                                           total_tokens=usage["total_tokens"],
                                           cached_tokens=usage["cached_tokens"],
                                           seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
-                                          error_kind="success", gate=gate)
+                                          error_kind="success", gate=gate, has_image=has_img)
                             return
                         except Exception as e:
                             if delivered:
@@ -2961,7 +3005,7 @@ async def anthropic_messages(
             seq = _log_chat_row(None, latency_ms, final_model, "anthropic", "-", 503, None, error_kind=err_kind)
             _record_usage(key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="anthropic",
-                          seq=seq, latency_ms=latency_ms, error_kind=err_kind, gate=gate)
+                          seq=seq, latency_ms=latency_ms, error_kind=err_kind, gate=gate, has_image=has_img)
             if err_kind == "waf":
                 msg = _exhaustion_message("waf", last_err_msg, 0, len(order) if order else 0)
             else:
