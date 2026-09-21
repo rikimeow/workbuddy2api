@@ -157,8 +157,16 @@ class Settings:
     #: 只取开头会系统性丢掉它 —— 这是 Lost in the Middle 直接对应的坑，
     #: 见 admin/router_gate.py 的 `truncate_head_tail()`。
     ROUTER_GATE_MAX_CHARS = int(os.getenv("ADMIN_ROUTER_GATE_MAX_CHARS", "4000"))
-    #: 门限结果的会话级缓存 TTL（秒）。多轮对话只付一次门限延迟；0 = 不缓存。
-    ROUTER_GATE_CACHE_TTL = int(os.getenv("ADMIN_ROUTER_GATE_CACHE_TTL", "1800"))
+    #: 门限结果的会话级缓存 TTL（秒）；0 = 不缓存。
+    #:
+    #: 注意这是**固定 TTL**（从写入算起，不像号池粘性那样滚动续期）——
+    #: 命中时不会回写时间戳，所以到点必失效。见 `_cache_get()`。
+    #:
+    #: 权衡：缓存让会话内档位稳定（避免逐轮跳档导致上游 KV-cache 反复重建），
+    #: 但代价是**窗口内由会话开头的问题「定调」** —— 会话内后面的难问题升不上去。
+    #: 默认 900（15 分钟）是刻意压短的：宁可多花一点切换成本，也别让「低开高走」
+    #: 的对话被开头钉住太久。调大 = 更稳但更迟钝；调小 = 更跟手但切换更频繁。
+    ROUTER_GATE_CACHE_TTL = int(os.getenv("ADMIN_ROUTER_GATE_CACHE_TTL", "900"))
     #: TypeSafe API Key（https://console.typesafe.ai/keys）。
     #: 为空时门限直接退回 auto 行为，不会报错。
     TYPESAFE_API_KEY = os.getenv("TYPESAFE_API_KEY", "").strip()
