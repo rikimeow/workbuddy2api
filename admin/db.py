@@ -130,6 +130,11 @@ def init_db() -> bool:
         _ensure_column("usage_logs", "ttfb_ms", "INT", "NULL")
         _ensure_column("usage_logs", "latency_ms", "INT", "NULL")
         _ensure_column("usage_logs", "error_kind", "VARCHAR(32)", "DEFAULT ''")
+        # 迁移：auto-with-jev 门限的影子观测字段
+        _ensure_column("usage_logs", "gate_model", "VARCHAR(64)", "DEFAULT ''")
+        _ensure_column("usage_logs", "gate_conf", "FLOAT", "NULL")
+        _ensure_column("usage_logs", "gate_ms", "INT", "NULL")
+        _ensure_column("usage_logs", "gate_note", "VARCHAR(255)", "DEFAULT ''")
 
         # 迁移：给 accounts 表加稳定性状态机字段
         _ensure_column("accounts", "err_count", "INT", "DEFAULT 0")

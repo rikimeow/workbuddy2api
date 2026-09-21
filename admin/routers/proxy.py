@@ -17,9 +17,11 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from admin import backend, pool
 from admin import client_profile as cprofile
+from admin import router_gate
 from admin.config import settings
 from admin.db import SessionLocal, get_db
 from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, UsageLog
@@ -228,7 +230,8 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                   completion_tokens: int | None = None, total_tokens: int | None = None,
                   cached_tokens: int | None = None,
                   seq: int = 0, ttfb_ms: int | None = None,
-                  latency_ms: int | None = None, error_kind: str = "") -> int | None:
+                  latency_ms: int | None = None, error_kind: str = "",
+                  gate: "router_gate.GateResult | None" = None) -> int | None:
     """流式响应结束后独立开一个 DB 会话写入用量/额度。
 
     关键点：请求作用域的 db 会话在端点返回 StreamingResponse 时已被依赖 teardown 关闭，
@@ -279,6 +282,10 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                 total_tokens=total_tokens, cached_tokens=cached_tokens,
                 client_ip=client_ip or "", use_case=use_case or "",
                 seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms, error_kind=error_kind or "",
+                gate_model=(gate.picked if gate else ""),
+                gate_conf=(gate.confidence if gate and not gate.fallback else None),
+                gate_ms=(gate.ms if gate else None),
+                gate_note=(gate.summary() if gate else ""),
             )
             db.add(log)
             db.commit()
@@ -1214,6 +1221,59 @@ def _model_out_of_group_error(model: str) -> JSONResponse:
     )
 
 
+#: 本地 Jev 门限路由的模型名。**独立于 `auto`**：`auto` 的行为一个字都不改，
+#: 想用门限必须显式点名这个 id。这样提 PR 时是纯增量，也不影响既有调用方。
+AUTO_WITH_JEV = "auto-with-jev"
+
+#: 逐请求覆盖门限模式的请求头（只能放宽到 on，不能越过服务端的 off）。
+_ROUTE_MODE_HEADER = "x-route-mode"
+
+
+async def _gate_route(body: dict, mode_header: str | None) -> tuple[str, "router_gate.GateResult | None"]:
+    """解析 `auto-with-jev`：调 Jev 判断档位，返回 (要交给白名单校验的模型名, GateResult)。
+
+    关键安全性：**门限失败时返回 `auto`**，不是返回 None。
+    返回值最终都会经过 `_pick_best_model` 校验，所以这里只需要给出「意图」，
+    不需要重复实现白名单 / 分组 / 账号池的逻辑。
+
+    影子模式下恒返回 `auto` —— 即行为与原来的 `auto` 完全一致，
+    Jev 的判断只进日志，不参与路由。
+
+    `router_gate.classify` 是同步阻塞的（复用连接后单次约 0.35-1.5s，且首次调用要建
+    TLS 连接），**不能直接在事件循环里调**：那会把同一进程内所有其它请求一起冻住
+    （实测 5 个并发请求被串行成 3.2s）。这里丢到线程池，本请求付延迟、别人的请求不受影响。
+    """
+    mode = router_gate.gate_mode(mode_header)
+    if mode == "off":
+        return "auto", None
+    res = await run_in_threadpool(router_gate.classify, body, mode=mode)
+    if res.active:
+        return res.model, res
+    return "auto", res
+
+
+def _order_for(db: Session, resolved: str, model: str,
+               allowed: set[str] | None, gate: "router_gate.GateResult | None") -> list:
+    """构造发给上游的候选模型顺序（三个端点共用，避免三份逻辑漂移）。
+
+      * `auto`/空：免费→付费 排列，支持上游 429/5xx 自动切换；
+      * 门限选出的档位：**额外附一个 `auto` 兜底**。原「具体模型」分支是 `[resolved]`，
+        一旦该档位在所有账号上都命中 11102 负缓存就会直接失败，而上游 auto 本来能成功
+        —— 门限不该让请求比 auto 更容易失败。用户**显式点名**的模型仍不静默切换。
+    """
+    if model in ("auto", ""):
+        return ([resolved] + _candidate_models(db, {resolved}, allowed))[:8]
+    if gate is not None and gate.active:
+        if allowed is None:
+            return ([resolved, "auto"]
+                    + _candidate_models(db, {resolved, "auto"}, allowed))[:8]
+        # 绑定了分组的 Key **不能**注入裸 "auto"：它在循环里不经任何 allowed 校验，
+        # 上游智能路由可能挑到分组外的模型，等于绕过分组限制
+        # （与「绑分组的 Key 一律不透传 auto」同一条规则）。改为组内候选兜底。
+        return ([resolved] + _candidate_models(db, {resolved}, allowed))[:8]
+    return [resolved]  # 具体模型：不静默切换，失败即报错
+
+
 def _pick_best_model(db: Session, requested_model: str,
                      allowed: set[str] | None = None) -> str | None:
     """根据请求模型和可用配置，选出最优实际使用的模型 ID。
@@ -1571,6 +1631,10 @@ async def chat_completions(
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
 
     model = payload.get("model", "auto")
+    # auto-with-jev：本地 Jev 门限路由（与 auto 完全独立；shadow 模式下等价于 auto）
+    gate = None
+    if model == AUTO_WITH_JEV:
+        model, gate = await _gate_route(payload, request.headers.get(_ROUTE_MODE_HEADER))
 
     # 模型白名单检查 + 免费优先选择（绑定了分组的 Key 只在组内选择）
     allowed = _key_group_models(db, key)
@@ -1583,12 +1647,8 @@ async def chat_completions(
             content={"error": {"message": f"模型 '{model}' 不存在或已被禁用", "type": "model_not_found"}},
         )
 
-    # 候选模型顺序：auto 模式按 免费→付费 排列，支持上游 429/5xx 自动切换下一个
-    if model in ("auto", ""):
-        order = [resolved_model] + _candidate_models(db, {resolved_model}, allowed)
-        order = order[:8]  # 最多尝试 8 个，避免全局限流时反复重试
-    else:
-        order = [resolved_model]  # 具体模型：不静默切换，失败即报错
+    # 候选模型顺序：auto 走免费→付费轮转；门限档位附带兜底（见 _order_for）
+    order = _order_for(db, resolved_model, model, allowed, gate)
 
     body = dict(payload)
     body["stream"] = True
@@ -1797,7 +1857,8 @@ async def chat_completions(
                                 _record_usage(key.id, final_acc_id, final_model, 0.0, None,
                                               client_ip=_client_ip(request),
                                               use_case="chat-completion", seq=seq,
-                                              latency_ms=latency_ms, error_kind=kind)
+                                              latency_ms=latency_ms, error_kind=kind,
+                                              gate=gate)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -1840,7 +1901,7 @@ async def chat_completions(
                                           total_tokens=usage["total_tokens"],
                                           cached_tokens=usage["cached_tokens"],
                                           seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
-                                          error_kind="success")
+                                          error_kind="success", gate=gate)
                             if aggregate:
                                 # 聚合模式下客户端要的是一个 JSON 对象，
                                 # 而不是 text/event-stream。这里 yield **字符串**
@@ -1883,7 +1944,7 @@ async def chat_completions(
             seq = _log_chat_row(None, latency_ms, final_model, mode, "-", status_out, None, error_kind=err_kind)
             _record_usage(key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="chat-completion", seq=seq, latency_ms=latency_ms,
-                          error_kind=err_kind)
+                          error_kind=err_kind, gate=gate)
             err_msg = _exhaustion_message(err_kind, last_err_msg, tried_accounts, tried_models_n)
             err_obj = {"error": {"message": err_msg, "type": "no_model_available"}}
             if aggregate:
@@ -1979,6 +2040,9 @@ async def responses_proxy(
     chat_body["stream_options"] = opts
 
     requested = payload.get("model", "auto")
+    gate = None
+    if requested == AUTO_WITH_JEV:
+        requested, gate = await _gate_route(chat_body, request.headers.get(_ROUTE_MODE_HEADER))
     allowed = _key_group_models(db, key)
     resolved = _pick_best_model(db, requested, allowed)
     if resolved is None:
@@ -1987,10 +2051,7 @@ async def responses_proxy(
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"模型 '{requested}' 不存在或已被禁用", "type": "model_not_found"}})
 
-    order = [resolved]
-    if requested in ("auto", ""):
-        order = [resolved] + _candidate_models(db, {resolved}, allowed)
-        order = order[:8]
+    order = _order_for(db, resolved, requested, allowed, gate)
 
     client_wants_stream = bool(payload.get("stream", True))
     model_name = payload.get("model", "auto")
@@ -2104,7 +2165,7 @@ async def responses_proxy(
                                           completion_tokens=cost_info["completion_tokens"],
                                           total_tokens=cost_info["total_tokens"],
                                           cached_tokens=cost_info["cached_tokens"],
-                                          seq=seq, error_kind="success")
+                                          seq=seq, error_kind="success", gate=gate)
                             return JSONResponse(content=obj)
                     except Exception as e:
                         kind = _classify_error(0, str(e))
@@ -2118,7 +2179,8 @@ async def responses_proxy(
                         continue
             seq = _log_chat_row(None, None, resolved, "resp", "-", 503, None, error_kind="no_account")
             _record_usage(key.id, 0, resolved, 0.0, None,
-                          client_ip=_client_ip(request), use_case="responses", seq=seq, error_kind="no_account")
+                          client_ip=_client_ip(request), use_case="responses", seq=seq,
+                          error_kind="no_account", gate=gate)
             if POOL.waf.active():
                 return JSONResponse(status_code=503, content={"error": {
                     "message": f"上游 WAF 拦截了网关出口 IP，已暂停轮转，请 {POOL.waf.remaining()}s 后重试",
@@ -2246,7 +2308,8 @@ async def responses_proxy(
                                                     200, None, error_kind=kind)
                                 _record_usage(key.id, final_acc_id, final_model, 0.0, None,
                                               client_ip=_client_ip(request), use_case="responses",
-                                              seq=seq, latency_ms=latency_ms, error_kind=kind)
+                                              seq=seq, latency_ms=latency_ms, error_kind=kind,
+                                              gate=gate)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -2280,7 +2343,7 @@ async def responses_proxy(
                                           total_tokens=usage["total_tokens"],
                                           cached_tokens=usage["cached_tokens"],
                                           seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
-                                          error_kind="success")
+                                          error_kind="success", gate=gate)
                             return
                         except Exception as e:
                             if delivered:
@@ -2304,7 +2367,7 @@ async def responses_proxy(
             seq = _log_chat_row(None, latency_ms, final_model, "resp", "-", 503, None, error_kind=err_kind)
             _record_usage(key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="responses", seq=seq, latency_ms=latency_ms,
-                          error_kind=err_kind)
+                          error_kind=err_kind, gate=gate)
             if err_kind == "waf":
                 msg = _exhaustion_message("waf", last_err_msg, 0, len(order) if order else 0)
             else:
@@ -2393,7 +2456,14 @@ async def anthropic_messages(
         except Exception as e:
             _logger.warning("harness 脱敏失败，按原样发送：%s", e)
 
-    requested = _map_anthropic_model(db, payload.get("model", "auto"), key)
+    requested = payload.get("model", "auto")
+    gate = None
+    if requested == AUTO_WITH_JEV:
+        # 必须抢在 _map_anthropic_model 之前：它会把这个上游不认识的名字
+        # 当成 claude-* 之类的未知模型而降级成 "auto"，门限就永远不会触发。
+        requested, gate = await _gate_route(chat_body, request.headers.get(_ROUTE_MODE_HEADER))
+    else:
+        requested = _map_anthropic_model(db, requested, key)
     allowed = _key_group_models(db, key)
     resolved = _pick_best_model(db, requested, allowed)
     if resolved is None:
@@ -2402,9 +2472,7 @@ async def anthropic_messages(
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"模型 '{requested}' 不存在或已被禁用", "type": "model_not_found"}})
 
-    order = [resolved]
-    if requested in ("auto", ""):
-        order = ([resolved] + _candidate_models(db, {resolved}, allowed))[:8]
+    order = _order_for(db, resolved, requested, allowed, gate)
 
     # 上游一律按流式拉取：Anthropic 的方向就是「消费 Chat SSE 再转事件流」。
     # 客户端若要非流式，我们在内部聚合完再一次性返回。
@@ -2529,7 +2597,7 @@ async def anthropic_messages(
                                           completion_tokens=cost_info["completion_tokens"],
                                           total_tokens=cost_info["total_tokens"],
                                           cached_tokens=cost_info["cached_tokens"],
-                                          seq=seq, error_kind="success")
+                                          seq=seq, error_kind="success", gate=gate)
                             return JSONResponse(content=msg_obj)
                     except Exception as e:
                         kind = _classify_error(0, str(e))
@@ -2544,7 +2612,7 @@ async def anthropic_messages(
             seq = _log_chat_row(None, None, resolved, "anthropic", "-", 503, None, error_kind="no_account")
             _record_usage(key.id, 0, resolved, 0.0, None,
                           client_ip=_client_ip(request), use_case="anthropic",
-                          seq=seq, error_kind="no_account")
+                          seq=seq, error_kind="no_account", gate=gate)
             if POOL.waf.active():
                 return JSONResponse(status_code=503, content={"error": {
                     "message": f"上游 WAF 拦截了网关出口 IP，已暂停轮转，请 {POOL.waf.remaining()}s 后重试",
@@ -2673,7 +2741,8 @@ async def anthropic_messages(
                                                     final_uid, 200, None, error_kind=kind)
                                 _record_usage(key.id, final_acc_id, final_model, 0.0, None,
                                               client_ip=_client_ip(request), use_case="anthropic",
-                                              seq=seq, latency_ms=latency_ms, error_kind=kind)
+                                              seq=seq, latency_ms=latency_ms, error_kind=kind,
+                                              gate=gate)
                                 sess_i.close()
                                 POOL.release(held_uid)
                                 held_uid = ""
@@ -2707,7 +2776,7 @@ async def anthropic_messages(
                                           total_tokens=usage["total_tokens"],
                                           cached_tokens=usage["cached_tokens"],
                                           seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
-                                          error_kind="success")
+                                          error_kind="success", gate=gate)
                             return
                         except Exception as e:
                             if delivered:
@@ -2731,7 +2800,7 @@ async def anthropic_messages(
             seq = _log_chat_row(None, latency_ms, final_model, "anthropic", "-", 503, None, error_kind=err_kind)
             _record_usage(key.id, 0, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="anthropic",
-                          seq=seq, latency_ms=latency_ms, error_kind=err_kind)
+                          seq=seq, latency_ms=latency_ms, error_kind=err_kind, gate=gate)
             if err_kind == "waf":
                 msg = _exhaustion_message("waf", last_err_msg, 0, len(order) if order else 0)
             else:

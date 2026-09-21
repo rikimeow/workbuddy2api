@@ -138,6 +138,29 @@ class Settings:
     MODEL_SOFT_RATE_SECONDS = int(os.getenv("ADMIN_POOL_MODEL_SOFT_RATE", "600"))
     #: 该后端无此模型（code 11102）的负缓存 TTL（秒）。重试无意义，只能换模型/换号。
     MODEL_BLOCK_SECONDS = int(os.getenv("ADMIN_POOL_MODEL_BLOCK", "21600"))
+
+    # ---------- auto-with-jev 路由门限（可选，默认影子模式） ----------
+    #: 模型 `auto-with-jev` 的开关与模式：
+    #:   off    = 不启用：该模型名按 auto 处理（门限完全不调用，无任何额外延迟）
+    #:   shadow = **只记录不生效**（默认）：照常按 auto 语义路由，但把 Jev 的判断
+    #:            写进 usage_logs 供对比；不改变任何实际行为，零风险。
+    #:   on     = 生效：按 Jev 判断出的档位替换模型（失败仍退回 auto）。
+    #: 也可用请求头 `X-Route-Mode: shadow|on` 逐请求覆盖（只能放宽到 on，不能越过 off）。
+    ROUTER_GATE = os.getenv("ADMIN_ROUTER_GATE", "shadow").strip().lower()
+    #: 调用 Jev 的超时（秒）。官方 SDK 默认 10s 太宽松 —— 门限在请求关键路径上，
+    #: 超时即放弃门限退回 auto。见 admin/router_gate.py。实测（复用连接后）单次
+    #: 门限约 0.35-1.5s，Jev 自身波动大；1.2s 会偶发掐掉慢响应，故给到 2.5s。
+    ROUTER_GATE_TIMEOUT = float(os.getenv("ADMIN_ROUTER_GATE_TIMEOUT", "2.5"))
+    #: 允许作为门限 state 出境的最大字符数（只取最后一条 user 消息）。
+    ROUTER_GATE_MAX_CHARS = int(os.getenv("ADMIN_ROUTER_GATE_MAX_CHARS", "4000"))
+    #: 门限结果的会话级缓存 TTL（秒）。多轮对话只付一次门限延迟；0 = 不缓存。
+    ROUTER_GATE_CACHE_TTL = int(os.getenv("ADMIN_ROUTER_GATE_CACHE_TTL", "1800"))
+    #: TypeSafe API Key（https://console.typesafe.ai/keys）。
+    #: 为空时 `auto-with-jev` 直接退回 auto 行为，不会报错。
+    TYPESAFE_API_KEY = os.getenv("TYPESAFE_API_KEY", "").strip()
+    #: TypeSafe API 基址（一般无需改；测试用桩服务时可指向本地）。
+    TYPESAFE_BASE_URL = os.getenv("TYPESAFE_BASE_URL", "https://api.typesafe.ai").rstrip("/")
+
     #: token 保活定时任务的整点（本地时区）。留空则用默认 [22]。
     _raw_keepalive = os.getenv("ADMIN_KEEPALIVE_HOURS", "22")
     KEEPALIVE_HOURS = [int(x) for x in _raw_keepalive.replace("，", ",").split(",")
