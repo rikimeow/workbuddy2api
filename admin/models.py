@@ -25,7 +25,9 @@ class Account(Base):
     # 稳定性状态机：错误计数 / 冷却 / 防撞号 / 禁用原因
     err_count = Column(Integer, default=0)          # 连续上游 5xx 计数
     cool_until = Column(DateTime, nullable=True)    # 冷却截止时间
-    cool_kind = Column(String(16), default="")       # hard_credit | soft_rate | error_threshold | not_found
+    # 宽度须 >= 最长取值："upstream_internal" 有 17 字符，列若建成 VARCHAR(16)
+    # 会在 MySQL 严格模式下报 1406 且被调用处的 rollback 静默吞掉（冷却不落库）。
+    cool_kind = Column(String(24), default="")       # hard_credit | soft_rate | error_threshold | not_found | account_fault | session_dead | waf | upstream_internal
     last_err_at = Column(DateTime, nullable=True)
     last_err_msg = Column(String(255), default="")
     last_picked_at = Column(DateTime, nullable=True)  # 最近一次被选中（仅观测；防撞号窗口已移入进程内存）

@@ -134,10 +134,16 @@ def init_db() -> bool:
         # 迁移：给 accounts 表加稳定性状态机字段
         _ensure_column("accounts", "err_count", "INT", "DEFAULT 0")
         _ensure_column("accounts", "cool_until", "DATETIME", "NULL")
-        _ensure_column("accounts", "cool_kind", "VARCHAR(16)", "DEFAULT ''")
+        _ensure_column("accounts", "cool_kind", "VARCHAR(24)", "DEFAULT ''")
         _ensure_column("accounts", "last_err_at", "DATETIME", "NULL")
         _ensure_column("accounts", "last_err_msg", "VARCHAR(255)", "DEFAULT ''")
         _ensure_column("accounts", "last_picked_at", "DATETIME", "NULL")
+
+        # 迁移：加宽已存在但过窄的字符列（_ensure_column 只「缺则新增」，不会改宽度）。
+        # cool_kind 早期建成 VARCHAR(16)，而代码会写入 "upstream_internal"（17 字符）；
+        # MySQL 严格模式下该 UPDATE 报 1406 并被调用处的 rollback 静默吞掉，
+        # 表现为「这类错误的账号冷却不落库」。
+        _widen_column("accounts", "cool_kind", "VARCHAR(24)")
 
         # 迁移：熔断 / session-dead 连续计数 / 连败降权 / 快过期积分
         # 这些是「跨重启必须保留」的状态：重启后失忆会导致重新踩同一批雷
@@ -183,5 +189,38 @@ def _ensure_column(table: str, col: str, col_type: str, default: str = ""):
                     )
                 )
                 conn.commit()
+    except Exception:
+        pass  # 非 MySQL 或权限不足时静默跳过
+
+
+def _widen_column(table: str, col: str, col_type: str):
+    """把已存在但定义不同的字符列改成 col_type（幂等）。
+
+    与 `_ensure_column` 互补：后者只管「缺则新增」，对已存在但过窄的列无能为力。
+    仅当现有类型与目标不同才 ALTER，避免每次启动都做无谓的 DDL。
+
+    注意：这是**放宽**型变更（VARCHAR(16) → VARCHAR(24)），不会截断既有数据。
+    表名/列名经白名单校验，col_type 为编译期常量。
+    """
+    try:
+        with engine.connect() as conn:
+            cur_type = conn.execute(
+                text(
+                    "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:tbl AND COLUMN_NAME=:col"
+                ),
+                {"tbl": table, "col": col},
+            ).scalar()
+            if not cur_type:
+                return  # 列不存在：由 _ensure_column 负责创建
+            if str(cur_type).lower() == col_type.lower():
+                return  # 已是目标宽度，幂等返回
+            conn.execute(
+                text(
+                    f"ALTER TABLE `{_safe_ident(table)}` "
+                    f"MODIFY COLUMN `{_safe_ident(col)}` {col_type}"
+                )
+            )
+            conn.commit()
     except Exception:
         pass  # 非 MySQL 或权限不足时静默跳过
