@@ -321,6 +321,10 @@ class _WorkBuddyInstall:
             "turing_product_name": "",
             "commit": "",
             "release_date_ms": 0,
+            # 产品身份三件套（都来自 cli/product.json，见下方赋值处的说明）
+            "deployment_type": "",    # deploymentType -> 请求头 X-Product
+            "application_name": "",   # applicationName -> UA 第一段
+            "plugin_name": "",        # authentication.id -> 指纹 extName
             "sources": {},     # 每项值的来源，便于排障
         }
         if inst is not None:
@@ -383,6 +387,44 @@ class _WorkBuddyInstall:
             info["release_date_ms"] = _iso_to_ms(d.strip())
             if info["release_date_ms"]:
                 info["sources"]["release_date_ms"] = "cli/product.json"
+
+        # --- 产品身份三件套（全部来自 cli/product.json）---
+        #
+        # 这三项以前是写死在代码里的，结果是「换个产品线就报错身份」。它们
+        # 在安装包里是明文，能读就读：
+        #
+        #  * deploymentType —— 出站请求头 `X-Product` 的**真正**取值。
+        #    官方客户端的全局 `ProductEndpointHttpInterceptor` 里写的是
+        #        headers[PRODUCT] ||= configuration?.deploymentType ?? "SaaS"
+        #    也就是说凡走该拦截器的请求，X-Product 报的是"部署形态"
+        #    （SaaS / CloudHosted / SelfHosted），而**不是**产品名。
+        #    WorkBuddy 桌面端该字段就是 "SaaS"。
+        #    注意：官方仅在 /v2/activity/workbuddy/banner 这类窄接口上
+        #    硬编码过 X-Product: "WorkBuddy"（stdio-mcp-inspector.js），
+        #    模型请求走的是拦截器那条路，所以取 deploymentType 才对。
+        #
+        #  * applicationName —— UA 第一段的产品名。官方在 app-instance.js 里
+        #    用 `applicationName` 覆写 `electron.app.userAgentFallback`，
+        #    拼出 `${applicationName}/${version} ...`。当前安装包是 "WorkBuddy"。
+        #
+        #  * authentication.id —— 桌面事件指纹里的 `extName`（扩展名）。
+        #    官方默认 "workbuddy-desktop"，同样来自 product.json。
+        for key, val, src_label in (
+            ("deployment_type", cli_product.get("deploymentType")
+                if isinstance(cli_product, dict) else None, "deploymentType"),
+            ("application_name", cli_product.get("applicationName")
+                if isinstance(cli_product, dict) else None, "applicationName"),
+        ):
+            if isinstance(val, str) and val.strip():
+                info[key] = val.strip()
+                info["sources"][key] = f"cli/product.json:{src_label}"
+
+        auth = cli_product.get("authentication") if isinstance(cli_product, dict) else None
+        if isinstance(auth, dict):
+            pid = auth.get("id")
+            if isinstance(pid, str) and pid.strip():
+                info["plugin_name"] = pid.strip()
+                info["sources"]["plugin_name"] = "cli/product.json:authentication.id"
 
         # --- CLI 版本 ---
         # 官方同款判据（见 app.asar 内 resolveBundledCliVersion）：
@@ -610,7 +652,10 @@ class _WorkBuddyInstall:
                 self._cache = {"install_dir": None, "asar": None, "unpacked": None,
                                "desktop_version": "", "cli_version": "",
                                "turing_channel_id": 0,
-                               "turing_product_name": "", "sources": {}}
+                               "turing_product_name": "", "commit": "",
+                               "release_date_ms": 0, "deployment_type": "",
+                               "application_name": "", "plugin_name": "",
+                               "sources": {}}
             self._cache_at = now
             return self._cache
 
@@ -889,6 +934,34 @@ class _WorkBuddyInstall:
             except ValueError:
                 pass
         return self._data().get("release_date_ms") or DEFAULT_RELEASE_DATE_MS
+
+    def deployment_type(self) -> str:
+        """产品部署形态（`cli/product.json` 的 deploymentType），即 `X-Product` 的值。
+
+        读不到时回落到官方硬编码的默认值 "SaaS"（与客户端
+        `?? DeploymentType.SaaS` 的兜底行为一致）。
+        """
+        env = (os.getenv("WORKBUDDY_DEPLOYMENT_TYPE") or "").strip()
+        if env:
+            return env
+        return self._data().get("deployment_type") or "SaaS"
+
+    def application_name(self) -> str:
+        """产品名（`applicationName`），UA 第一段用它。
+
+        读不到时回落到 "WorkBuddy"。
+        """
+        env = (os.getenv("WORKBUDDY_APPLICATION_NAME") or "").strip()
+        if env:
+            return env
+        return self._data().get("application_name") or "WorkBuddy"
+
+    def plugin_name(self) -> str:
+        """扩展名（`authentication.id`），桌面事件指纹的 extName 用它。"""
+        env = (os.getenv("WORKBUDDY_PLUGIN_NAME") or "").strip()
+        if env:
+            return env
+        return self._data().get("plugin_name") or "workbuddy-desktop"
 
     def is_version_dynamic(self) -> bool:
         """桌面端版本是否来自安装包（而非兜底默认）。

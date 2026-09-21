@@ -867,21 +867,63 @@ function enterApp() {
   $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
   $("#proxyUrl").textContent = location.origin + "/v1";
   loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadLogs(); loadSyncConfig(); loadShareInfo();
+  // 还原地址栏里的面板（刷新后停在原页面，而不是跳回「账号」首页）。
+  // updateUrl:false —— 地址栏本来就是这个值，不必再写一次。
+  activateTab(_tabFromUrl(), { updateUrl: false });
 }
 
 // Tabs
-document.querySelectorAll(".tab-btn").forEach(b => b.onclick = () => {
-  document.querySelectorAll(".tab-btn").forEach(x => x.classList.remove("active", "text-wb"));
-  b.classList.add("active");
-  ["accounts","keys","models","groups","usage","schedules","logs","client","sync","settings"].forEach(t => {
-    $(`#panel-${t}`).classList.toggle("hidden", b.dataset.tab !== t);
+// 面板清单与默认面板：默认面板不写进 URL（保持地址栏干净）。
+const TABS = ["accounts","keys","models","groups","usage","schedules","logs","client","sync","settings"];
+const TAB_DEFAULT = "accounts";
+
+/** 从地址栏读当前应显示的面板；非法/缺失一律回落到默认面板。 */
+function _tabFromUrl() {
+  let t = null;
+  try { t = new URLSearchParams(location.search).get("tab"); } catch (e) { /* 老浏览器兜底 */ }
+  return TABS.includes(t) ? t : TAB_DEFAULT;
+}
+
+/**
+ * 激活某个面板：切 class、按需拉数据，并把面板写进 `?tab=`。
+ *
+ * 为什么要写 URL：面板状态原先只活在内存里，刷新/被踢回登录后再进来、
+ * 或把地址发给别人，都会一律跳回「账号」首页 —— 在「客户端参数」「日志」
+ * 这种深层面板上反复操作时尤其烦。
+ *
+ * 用 `replaceState` 而不是 `pushState`：切面板不该在历史栈里堆一长串，
+ * 浏览器「后退」应当离开本页，而不是在面板之间来回跳。
+ */
+function activateTab(name, opts) {
+  if (!TABS.includes(name)) name = TAB_DEFAULT;
+  document.querySelectorAll(".tab-btn").forEach(x => {
+    const on = x.dataset.tab === name;
+    x.classList.toggle("active", on);
+    x.classList.toggle("text-wb", on);
   });
+  TABS.forEach(t => { const el = $(`#panel-${t}`); if (el) el.classList.toggle("hidden", t !== name); });
+
+  if (!opts || opts.updateUrl !== false) {
+    try {
+      const u = new URL(location.href);
+      if (name === TAB_DEFAULT) u.searchParams.delete("tab");
+      else u.searchParams.set("tab", name);
+      history.replaceState(null, "", u);
+    } catch (e) { /* 非 http 环境（file://）下忽略即可 */ }
+  }
+
   // 切到这几个面板时按需拉数据（图表/分组列表/客户端参数不必在首屏就请求）
-  if (b.dataset.tab === "groups") loadGroups();
-  if (b.dataset.tab === "usage") loadUsageStats();
-  if (b.dataset.tab === "client") loadClientProfile();
-  if (b.dataset.tab === "settings") loadAppSource();
-});
+  if (name === "groups") loadGroups();
+  if (name === "usage") loadUsageStats();
+  if (name === "client") loadClientProfile();
+  if (name === "settings") loadAppSource();
+}
+
+document.querySelectorAll(".tab-btn").forEach(b => b.onclick = () => activateTab(b.dataset.tab));
+
+// 前进/后退（含手改地址栏后回车）时同步面板。replaceState 不产生历史项，
+// 所以这只在用户真的跨页面前进后退时触发。
+window.addEventListener("popstate", () => activateTab(_tabFromUrl(), { updateUrl: false }));
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function card(t, v, ic, col) {
@@ -2276,7 +2318,8 @@ const _CP_FIELDS = [
   ["cli_version",     "内嵌 CLI 版本", "text", "UA 第三段"],
   ["ide_name",        "IDE 名称", "text", "X-IDE-Name"],
   ["ide_type",        "IDE 类型", "text", "X-IDE-Type"],
-  ["product",         "产品头", "text", "X-Product"],
+  ["product",         "产品头(X-Product)", "text", "官方取部署形态 deploymentType（WorkBuddy 为 SaaS），不是产品名"],
+  ["application_name", "UA 产品名", "text", "UA 前后两段（官方取 applicationName）"],
   ["turing_channel_id", "风控 channelId", "int", "天御 SDK 渠道号"],
   ["turing_product_name", "风控产品名", "text", "天御 SDK productName"],
   ["commit",          "commit", "text", "安装包提交号"],

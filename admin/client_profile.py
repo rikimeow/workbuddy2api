@@ -85,17 +85,36 @@ DEFAULTS: dict[str, Any] = {
     # --- 用量归属（X-IDE-Name / X-IDE-Type / X-Product）---
     "ide_name": "WorkBuddy",
     "ide_type": "WorkBuddy",
-    #: 请求头 `X-Product` 的值（用量归属用）
-    "product": "WorkBuddy",
-    #: 桌面事件指纹里的 `product` 字段。**与请求头的 X-Product 不是一回事**：
-    #: 官方客户端在遥测里报的是 "SaaS"（产品形态），在请求头里报的是
-    #: "WorkBuddy"（客户端名）。混用会让遥测里的产品字段变成客户端名。
+    #: 请求头 `X-Product` 的值。
+    #:
+    #: **不是产品名，是部署形态。** 官方客户端的全局
+    #: `ProductEndpointHttpInterceptor` 写死为
+    #:     headers["X-Product"] ||= configuration?.deploymentType ?? "SaaS"
+    #: WorkBuddy 桌面端的 `product.json` 里 `deploymentType` 就是 "SaaS"。
+    #: （唯一硬编码 "WorkBuddy" 的地方是 `stdio-mcp-inspector.js` 里对
+    #: `/v2/activity/workbuddy/banner` 那个窄接口，模型请求不走那条路。）
+    #: 原来这里填 "WorkBuddy" 是错的 —— 官方客户端不会这样发，
+    #: 本身就是个可识别的差异。
+    "product": "SaaS",
+    #: UA 第一段的产品名（product.json 的 applicationName）。官方在
+    #: app-instance.js 里用它覆写 electron 的 userAgentFallback，拼出
+    #: `${applicationName}/${version} ...`。
+    "application_name": "WorkBuddy",
+    #: 桌面事件指纹里的 `product` 字段（遥测用，取 deploymentType）。
+    #: **与请求头的 X-Product 不是一回事**：这里是事件里的产品形态。
     "fp_product": "SaaS",
     # --- 风控闸门头（官方客户端所有 API 请求必带）---
     "headers": {
         "X-CodeBuddy-Request": "1",
         "X-Requested-With": "XMLHttpRequest",
         "Accept-Language": "zh-CN",
+        # 数据用途声明：官方**每次模型请求**都带（CLI bundle 里
+        # `ed[PRIVATE_DATA_HEADER] = enableModelOptimization ? "false" : "true"`）。
+        # 语义是「这份数据是否属于不可用于模型优化的私有数据」：
+        # 优化开启（默认）→ "false"，关闭 → "true"。
+        # 缺失它就是一个可识别的差异，所以默认跟随官方默认行为报 "false"；
+        # 若部署方要求「数据不参与优化」，把这里改成 "true" 即可。
+        "X-Private-Data": "false",
     },
     # --- 桌面事件指纹 ---
     "ext_name": "workbuddy-desktop",
@@ -113,8 +132,8 @@ _INT_KEYS = ("cpu_cores", "memory_size", "report_delay", "turing_channel_id",
              "release_date_ms")
 #: 值为字符串的键
 _STR_KEYS = ("desktop_version", "cli_version", "turing_product_name",
-             "ide_name", "ide_type", "product", "fp_product", "ext_name",
-             "os", "arch", "os_version", "timezone", "commit")
+             "ide_name", "ide_type", "product", "application_name", "fp_product",
+             "ext_name", "os", "arch", "os_version", "timezone", "commit")
 #: 字符串字段的最大长度（防止把整个文件塞进配置里）
 _MAX_STR = 512
 #: 风控头名/值的最大长度
@@ -174,6 +193,18 @@ def snapshot() -> dict:
             out["commit"] = WB.commit()
         if real("release_date_ms"):
             out["release_date_ms"] = WB.release_date_ms()
+        # 产品身份三件套：同样只在安装包里真读到才采纳。
+        #  * deploymentType -> 请求头 X-Product（部署形态，官方 WorkBuddy 为 "SaaS"）
+        #  * applicationName -> UA 第一段的产品名
+        #  * authentication.id -> 桌面事件指纹的 extName
+        if real("deployment_type"):
+            out["product"] = WB.deployment_type()
+            # 遥测事件里的 product 字段与请求头同源（都取 deploymentType）
+            out["fp_product"] = WB.deployment_type()
+        if real("application_name"):
+            out["application_name"] = WB.application_name()
+        if real("plugin_name"):
+            out["ext_name"] = WB.plugin_name()
         # 产品名只有产品包里写死了才可信；当前安装包里没有这个字段，
         # 所以不进探测结果（保留兜底值即可，不必伪装成探测到的）。
     except Exception as e:
@@ -410,13 +441,26 @@ def _compose(saved: dict, src: str, detected: dict) -> dict:
 
     抽成纯函数是为了能被缓存：`effective()` 在每个请求上被调用，
     现场探测 + 环境变量扫描约 40µs，不该每个请求都重算一遍。
+
+    关于 `layers` 的顺序（**曾经写反过，是个真 bug**）：
+    下面用 `out[k] = v` 逐层覆盖，所以**越靠后的层优先级越高**。
+    于是「谁优先级高」就要放在**列表末尾**：
+
+        saved 模式：已保存 > 现场探测  ->  [探测, 保存]   保存最后写入
+        auto  模式：现场探测 > 已保存  ->  [保存, 探测]   探测最后写入
+
+    历史实现把这两个分支写反了（saved 模式让探测胜出、auto 模式让保存胜出），
+    后果是「auto 模式下版本升级后自动跟上」这条承诺根本不成立 —— 只要后台
+    保存过一次，真实探测值就永远被那份可能已经过期的档案压住。
+    `sources()` 一直是按正确优先级写的，所以会出现「排障视图说取自现场探测、
+    实际生效的却是已保存值」的自相矛盾，正是这个 bug 的显性症状。
     """
     out = dict(DEFAULTS)
     # headers 要按「兜底 -> 保存 -> 探测」逐层覆盖，不能整体替换：
     # 否则后台只改 Accept-Language 时，其余默认风控头会消失。
     out["headers"] = dict(DEFAULTS.get("headers") or {})
 
-    layers = ([saved, detected] if src == SOURCE_SAVED else [detected, saved])
+    layers = ([detected, saved] if src == SOURCE_SAVED else [saved, detected])
     for layer in layers:
         for k, v in layer.items():
             if k == "headers" and isinstance(v, dict):
@@ -444,7 +488,8 @@ def _compose(saved: dict, src: str, detected: dict) -> dict:
     # 想彻底自定义 UA 的，用 WORKBUDDY_USER_AGENT 环境变量（见 _apply_env）。
     if not out.get("user_agent"):
         out["user_agent"] = _build_ua(out.get("desktop_version"),
-                                      out.get("cli_version"))
+                                      out.get("cli_version"),
+                                      out.get("application_name"))
     return out
 
 
@@ -487,11 +532,17 @@ def _apply_env(profile: dict) -> dict:
     return profile
 
 
-def _build_ua(desktop_version: str | None, cli_version: str | None) -> str:
-    """按官方三段式拼 UA：`WorkBuddy/<v> WorkBuddy/<v> CLI/<cli>`。"""
+def _build_ua(desktop_version: str | None, cli_version: str | None,
+              application_name: str | None = None) -> str:
+    """按官方三段式拼 UA：`WorkBuddy/<v> WorkBuddy/<v> CLI/<cli>`。
+
+    第一段/第二段是产品名（官方取 `applicationName`，见 app-instance.js 里对
+    `electron.app.userAgentFallback` 的覆写），第三段是内嵌 CLI 版本。
+    """
     v = (desktop_version or DEFAULTS["desktop_version"]).strip()
     c = (cli_version or DEFAULTS["cli_version"]).strip()
-    return f"WorkBuddy/{v} WorkBuddy/{v} CLI/{c}"
+    brand = (application_name or DEFAULTS["application_name"]).strip()
+    return f"{brand}/{v} {brand}/{v} CLI/{c}"
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +624,9 @@ def risk_headers() -> dict:
     h = {
         "X-IDE-Name": name,
         "X-IDE-Type": str(p.get("ide_type") or name),
-        "X-Product": str(p.get("product") or name),
+        # X-Product 是部署形态（SaaS/…），**不能**回落到 ide_name（那是产品名）。
+        # 回落到产品名正是修复前的老 bug，会让这个头报成官方从不发的值。
+        "X-Product": str(p.get("product") or DEFAULTS["product"]),
         "X-IDE-Version": str(p.get("desktop_version") or DEFAULTS["desktop_version"]),
     }
     extra = p.get("headers") or {}

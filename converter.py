@@ -69,7 +69,13 @@ def _client_ip_headers(request: Request, purpose: str = "conversation") -> dict:
 
     真实 WorkBuddy 桌面端：
       - X-Agent-Purpose: "conversation" 用于普通对话
-      - X-IDE-Name / X-IDE-Type / X-Product: "WorkBuddy" 用于上游识别 client
+      - X-IDE-Name / X-IDE-Type: "WorkBuddy"（产品名，来自 clientInfoProvider 的
+        platform / ideName，桌面端常量 WORKBUDDY_PLATFORM = "WorkBuddy"）
+      - X-Product: **不是产品名，是部署形态**。官方全局
+        ProductEndpointHttpInterceptor 里写的是
+            headers["X-Product"] ||= configuration?.deploymentType ?? "SaaS"
+        所以这里默认应当是 "SaaS"（= product.json 的 deploymentType），
+        而不是 "WorkBuddy"。可用 ADMIN_UPSTREAM_PRODUCT 单独覆盖。
     """
     ip = None
     xff = request.headers.get("X-Forwarded-For")
@@ -82,11 +88,12 @@ def _client_ip_headers(request: Request, purpose: str = "conversation") -> dict:
         elif request.client:
             ip = request.client.host
     client_name = os.environ.get("ADMIN_UPSTREAM_CLIENT_NAME", "WorkBuddy").strip() or "WorkBuddy"
+    product = (os.environ.get("ADMIN_UPSTREAM_PRODUCT", "SaaS").strip() or "SaaS")
     h = {
         "X-Agent-Purpose": purpose or "conversation",
         "X-IDE-Name": client_name,
         "X-IDE-Type": client_name,
-        "X-Product": client_name,
+        "X-Product": product,
     }
     if ip:
         h["X-Forwarded-For"] = ip
