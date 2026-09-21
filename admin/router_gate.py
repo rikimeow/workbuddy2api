@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -68,6 +69,32 @@ MAX_SCAN_MESSAGES = 12
 
 #: 超长 state 被截断时插入的省略标记。
 _TRUNCATION_MARK = "\n\n...(中间省略 {n} 字符)...\n\n"
+
+# ---------------------------------------------------------------------------
+# 模态检测：三种协议里「图片 / 视频 / 音频」块的 type 名
+# ---------------------------------------------------------------------------
+# OpenAI 用 `image_url`；Anthropic 用 `image`；Responses 用 `input_image`。
+_IMAGE_TYPES = frozenset({"image_url", "image", "input_image"})
+_VIDEO_TYPES = frozenset({"video_url", "video", "input_video"})
+_AUDIO_TYPES = frozenset({"input_audio", "audio", "audio_url"})
+
+#: token_bucket 分档阈值。**按字符数**（不是估算 token）——理由：
+#:   * 口径可预测、可复算，不引入 tokenizer 依赖；
+#:   * 与 Jev 文档里长上下文问题的口径一致（官方 Noul 例子写的是「约 8000 字以上」）；
+#:   * 估算 token（字符/2）在中文下会系统性低估（1 汉字≈1 token 而非 0.5），
+#:     导致「40K 字符的长文档」只算 medium，而它显然该是 long。
+#: 真正的 token 数由上游回传、记账时用精确值，两套口径互不干扰。
+_TOKEN_MEDIUM_MIN = 8000     # 字符
+_TOKEN_LONG_MIN = 32000      # 字符
+
+#: 夜间免费时段（本地时间，含起点不含终点）。hy4-preview 夜间免费就是靠它。
+NIGHT_START_HOUR = 23
+NIGHT_END_HOUR = 8
+
+#: `recent_output` 的字符上限：只在「多轮迭代」时给 Jev 看被改产出的开头。
+#: 刻意很小 —— 目的是让 Jev 知道「在改什么东西」（类型/体量），不是让它读全文；
+#: 全文已由 request 之外的信息承载，而这里多发一个字都是**出境数据 + token 成本**。
+RECENT_OUTPUT_CHARS = 500
 
 
 @dataclass(frozen=True)
@@ -491,36 +518,247 @@ def truncate_head_tail(text: str, limit: int) -> str:
             + (text[-tail:] if tail else ""))
 
 
-def extract_state(body: dict) -> str:
-    """取最后一条 user 消息作为 state（超长时首尾各留一半）。
+def _now_hhmm() -> str:
+    """本地时间 HH:MM（供 state 里的 ``time`` 字段）。"""
+    return time.strftime("%H:%M")
 
-    为什么不是整个请求体：Jev 的 64k 预算里 state 最多 32k，而门限要的是
-    「这条请求要什么能力」；只发最后一条 user 消息也把**出境数据量**压到最小。
 
-    超长时用 `truncate_head_tail()` 保留首尾而非只留开头（见该函数的说明：
-    用户的真实诉求常在末尾）。
+def _is_night(now_hour: int | None = None) -> bool:
+    """是否在夜间免费时段（默认 23:00~08:00，跨零点）。
+
+    为什么用代码判而不是问 Jev：这是**确定性事实**，Jev 既不知道现在几点、
+    也不该被要求去算。而 hy4-preview 的「夜间免费」正需要这个信号才能被利用。
+
+    时段边界刻意做成常量、可调：上游的「夜间」具体口径未经证实（标签只说
+    「夜间免费」，没说几点到几点），所以这里用最常见的 23:00~08:00，
+    并允许通过环境变量覆盖。
     """
-    msgs = body.get("messages")
-    if not isinstance(msgs, list):
-        return ""
-    tail = msgs[-MAX_SCAN_MESSAGES:] if len(msgs) > MAX_SCAN_MESSAGES else msgs
-    for m in reversed(tail):
-        if not isinstance(m, dict) or m.get("role") != "user":
+    h = time.localtime().tm_hour if now_hour is None else now_hour
+    start, end = _night_range()
+    if start <= end:                      # 不跨零点
+        return start <= h < end
+    return h >= start or h < end          # 跨零点（默认情形：23 点后或 8 点前）
+
+
+def _night_range() -> tuple[int, int]:
+    """夜间时段的 (起, 止) 小时数。可用环境变量覆盖。"""
+    try:
+        start = int(os.getenv("ADMIN_ROUTER_GATE_NIGHT_START", str(NIGHT_START_HOUR)))
+        end = int(os.getenv("ADMIN_ROUTER_GATE_NIGHT_END", str(NIGHT_END_HOUR)))
+        return max(0, min(23, start)), max(0, min(24, end))
+    except (TypeError, ValueError):
+        return NIGHT_START_HOUR, NIGHT_END_HOUR
+
+
+def _iter_text_chars(body: dict):
+    """遍历请求里所有「文本字符」，同时覆盖两种协议的容器字段。
+
+    踩过的坑：`messages`（OpenAI / Anthropic chat）与 `input`（Responses 协议）
+    是两个不同的顶层字段。早期只扫 `messages`，导致 **Responses 请求恒定被判
+    `token_bucket=short`** —— 长文档走 Responses 路径时系统性漏判 medium/long。
+    而同一文件里的 `_has_modal` 两个字段都扫，两边不一致就是遗漏。
+
+    产出 (文本片段) 生成器，由调用方决定是数长度还是拼接。
+    """
+    for container in ("messages", "input"):
+        node = body.get(container)
+        if not isinstance(node, list):
             continue
-        content = m.get("content")
-        text = ""
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            # Anthropic / Responses 的 content 是分块列表，只取文本块
-            parts = [
-                b.get("text", "")
-                for b in content
-                if isinstance(b, dict) and isinstance(b.get("text"), str)
-            ]
-            text = "\n".join(p for p in parts if p)
-        if text.strip():
-            return truncate_head_tail(text, _max_chars())
+        for m in node:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if isinstance(content, str):
+                yield content
+            elif isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and isinstance(b.get("text"), str):
+                        yield b["text"]
+
+
+def _token_bucket(body: dict) -> str:
+    """按**字符数**分档：``short`` / ``medium`` / ``long``。
+
+    阈值：short < 8000 字符、medium 8K~32K、long >= 32K（见 `_TOKEN_MEDIUM_MIN`
+    / `_TOKEN_LONG_MIN` 的说明：为什么按字符而不是估算 token）。
+
+    统计范围是**整个会话的消息**（不只最后一条）：长文档任务的特征是前面挂了
+    大量材料，只看最后一句会把它误判成 short。
+
+    只数文本块，忽略图片/音频（base64 体积会把字数撑爆，与「文档有多长」无关）。
+    同时覆盖 `messages` 与 Responses 的 `input`（见 `_iter_text_chars`）。
+    """
+    total_chars = sum(len(t) for t in _iter_text_chars(body))
+    if total_chars >= _TOKEN_LONG_MIN:
+        return "long"
+    if total_chars >= _TOKEN_MEDIUM_MIN:
+        return "medium"
+    return "short"
+
+
+def _has_modal(body: dict, types: frozenset) -> bool:
+    """请求体里是否含指定模态的块（只做结构判定，不解码内容）。
+
+    递归扫 `messages` 与 Responses 的 `input`，深度限制防止畸形请求炸栈。
+    """
+    def _scan(node, depth=0) -> bool:
+        if depth > 4:
+            return False
+        if isinstance(node, dict):
+            if node.get("type") in types:
+                return True
+            return any(_scan(v, depth + 1) for v in node.values())
+        if isinstance(node, list):
+            return any(_scan(v, depth + 1) for v in node)
+        return False
+
+    return _scan(body.get("messages")) or _scan(body.get("input"))
+
+
+def extract_state(body: dict) -> dict:
+    """构造结构化 state（dict）：请求文本 + 代码算出的旁路字段。
+
+    为什么是 dict：档位 criteria 里引用了 `token_bucket` / `has_image` /
+    `has_video` / `has_audio` / `is_night` 这些**代码能算、Jev 不该猜**的字段
+    （让 Jev 去数 token 或看时间既不准也没必要）。Jev 的 `state` 接受任意 JSON。
+
+    字段（缺省一律给明确的 false/值，不留 undefined，避免 criteria 里的反引号
+    引用指向空）：
+      * ``request``     —— 最后一条 user 消息，超长时首尾各留一半
+      * ``turn_index``  —— 这是会话里的第几轮用户发言（1 = 首轮）
+      * ``is_refinement``—— 是否在「多轮迭代同一份产出」（见 `_turn_info`）
+      * ``recent_output``—— 上一条 assistant 回复的开头（≤500 字符），
+        仅在 `is_refinement` 为真时有值；让 Jev 能看到「在改什么东西」
+      * ``time``        —— 本地时间 HH:MM
+      * ``is_night``    —— 是否在夜间免费时段（默认 23:00~08:00）
+      * ``token_bucket``—— short / medium / long（按字符数分档）
+      * ``has_image`` / ``has_video`` / ``has_audio`` —— 模态检测
+
+    只发最后一条 user 消息仍是为把**出境数据量**压到最小。
+    """
+    text = _last_user_text(body)
+    turn_index, is_refinement = _turn_info(body)
+    out = {
+        "request": truncate_head_tail(text, _max_chars()) if text else "",
+        "turn_index": turn_index,
+        "is_refinement": is_refinement,
+        "recent_output": _recent_output(body) if is_refinement else "",
+        "time": _now_hhmm(),
+        "is_night": _is_night(),
+        "token_bucket": _token_bucket(body),
+        "has_image": _has_modal(body, _IMAGE_TYPES),
+        "has_video": _has_modal(body, _VIDEO_TYPES),
+        "has_audio": _has_modal(body, _AUDIO_TYPES),
+    }
+    return out
+
+
+def _turn_info(body: dict) -> tuple[int, bool]:
+    """返回 (turn_index, is_refinement)。
+
+    `turn_index` = 会话里 user 发言的条数（本次是第几条），1 表示首轮。
+
+    `is_refinement` = 是否属于「多轮迭代同一份产出」——判据是**既有前文 assistant
+    回复、且本次请求明显是短指令**。为什么要这个信号：实测（本机 WorkBuddy 使用
+    调查）「投放数据分析」这类任务「一轮要改十几次」（删模块、换口径、加交叉分析、
+    同比），而门限的档位缓存按会话首句定调 15 分钟 —— 第 2~15 轮的修改请求会被
+    首轮档位钉住。把「这是第 N 轮、且像在改东西」告诉 Jev，它才有机会判出
+    「这个会话本身是个复杂任务」。
+
+    判据刻意保守（两个条件同时满足才为真）：
+      * 之前至少有 1 条 assistant 消息（说明已经产出过东西）
+      * 本次 request 较短（< 200 字符）——修改指令通常很短；长请求更像新任务
+    """
+    containers = [body.get("messages"), body.get("input")]
+    user_n = 0
+    has_prior_assistant = False
+    for node in containers:
+        if not isinstance(node, list):
+            continue
+        for m in node:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role == "user":
+                user_n += 1
+            elif role == "assistant":
+                has_prior_assistant = True
+    turn_index = max(1, user_n)
+    short_req = len(_last_user_text(body)) < 200
+    return turn_index, bool(turn_index > 1 and has_prior_assistant and short_req)
+
+
+def _recent_output(body: dict) -> str:
+    """取**上一条 assistant 回复**的开头（≤ `RECENT_OUTPUT_CHARS` 字符）。
+
+    为什么需要它：只有 `is_refinement=true` 这个标记时，Jev 看得到「用户在改东西」
+    却看不到「改的是什么」—— 实测那样反而让它更困惑（置信度从 0.57 掉到 0.39），
+    因为它在遵守一条没有信息支撑的指令。给出被改产出的开头，它才能判断
+    「这个产出本身是复杂报告还是简单文本」，从而决定该不该升档。
+
+    只取开头（不是首尾）：目的是判断产出的**类型与体量**，开头足够；而且这个字段
+    是纯增量成本（出境数据 + Jev 输入 token），越小越好。
+    """
+    containers = [body.get("messages"), body.get("input")]
+    for node in containers:
+        if not isinstance(node, list):
+            continue
+        for m in reversed(node):
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            content = m.get("content")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts = [
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and isinstance(b.get("text"), str)
+                ]
+                text = "\n".join(p for p in parts if p)
+            if text.strip():
+                return text[:RECENT_OUTPUT_CHARS]
+    return ""
+
+
+def _last_user_text(body: dict) -> str:
+    """取最后一条 user 消息的纯文本（找不到返回空串）。
+
+    只扫描最后 MAX_SCAN_MESSAGES 条：再往前的历史对「这条请求要什么能力」影响很小，
+    而扫描窗口越小越省事（这是原实现的取舍，保留）。
+
+    同时覆盖 `messages` 与 Responses 的 `input` —— 早期只扫 `messages`，
+    导致 Responses 请求的 `request` 恒为空串、门限直接 `empty_state` 跳过
+    （见 `_iter_text_chars` 的说明）。
+    """
+    for container in ("messages", "input"):
+        msgs = body.get(container)
+        if not isinstance(msgs, list):
+            continue
+        tail = msgs[-MAX_SCAN_MESSAGES:] if len(msgs) > MAX_SCAN_MESSAGES else msgs
+        for m in reversed(tail):
+            if not isinstance(m, dict):
+                continue
+            # Responses 的 input 项可能没有 role 字段；只有显式声明了非 user
+            # 的才跳过（避免把 Responses 的输入项整体漏掉）。
+            role = m.get("role")
+            if role is not None and role != "user":
+                continue
+            content = m.get("content")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                # Anthropic / Responses 的 content 是分块列表，只取文本块
+                parts = [
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and isinstance(b.get("text"), str)
+                ]
+                text = "\n".join(p for p in parts if p)
+            if text.strip():
+                return text
     return ""
 
 
@@ -618,7 +856,9 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
         )
 
     state = extract_state(body)
-    if not state:
+    # state 现在是 dict（含 time/token_bucket/模态等旁路字段），所以要看
+    # `request` 是否真的有内容 —— 空请求没必要花一次 Jev 调用。
+    if not state.get("request"):
         return GateResult(active=False, shadow=shadow, fallback="empty_state")
 
     # 一次取配置快照，保证同一次判断里的档位/提问/白名单来自**同一份配置**
