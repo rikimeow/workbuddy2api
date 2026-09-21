@@ -46,6 +46,10 @@ sync_auth.bat
 start_admin.bat
 start_converter.bat
 
+# 本机部署笔记（含内网 IP、本机路径、上游私有排查口径），仅本地用。
+# 保留在磁盘上以便 AI 会话自动读取，但不要推到公开仓库。
+AGENTS.md
+
 # ===== 数据库备份（含真实账号凭据 token，禁止提交） =====
 backup_*.sql
 *.sql.gz
