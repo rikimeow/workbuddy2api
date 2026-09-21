@@ -66,6 +66,9 @@ MAX_STATE_CHARS = 4000
 #: 请求体里最多扫描多少条消息去找最后一条 user 消息。
 MAX_SCAN_MESSAGES = 12
 
+#: 超长 state 被截断时插入的省略标记。
+_TRUNCATION_MARK = "\n\n...(中间省略 {n} 字符)...\n\n"
+
 
 @dataclass(frozen=True)
 class Tier:
@@ -442,11 +445,45 @@ def gate_mode(header_value: str | None = None) -> str:
     return env_mode
 
 
+def truncate_head_tail(text: str, limit: int) -> str:
+    """超长文本取**首尾两段**，中间用省略标记连接；不超长则原样返回。
+
+    为什么不是「只取开头」（早期实现）：这是 **Lost in the Middle** 直接对应的坑 ——
+    Liu et al. 2024（`Lost in the Middle: How Language Models Use Long Contexts`，
+    TACL，该现象在 6 个模型家族上复现）发现：**相关信息位于上下文开头或结尾时
+    准确率最高，位于中间时显著下降（>30%）**。
+
+    而门限这个具体任务里，「最后一条 user 消息」的**尾部**往往正是用户真正的诉求
+    （长背景 + 末尾提问是很常见的写法）。只取开头等于**系统性地丢掉提问本身**，
+    只剩背景 —— 这会让 Jev 判不出真实意图。首尾都留才贴合那条 U 型曲线。
+
+    中间加省略标记而不是直接拼接：不加的话两段会被读成一句话中间突然跳变，
+    反而可能误判。标记明确告诉模型「这里断开了」。
+    """
+    text = text or ""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    # 省略标记本身也占预算。关键：标记里的 `{n}` 会被替换成真实省略字符数，
+    # 而数字位数会影响标记长度 —— 直接按**最大可能位数**（即 len(text) 的位数）
+    # 预留预算，就能保证最终长度一定不超过 limit（omitted <= len(text) 恒成立）。
+    mark_len = len(_TRUNCATION_MARK.format(n=len(text)))
+    budget = max(0, limit - mark_len)
+    head = budget // 2
+    tail = budget - head
+    omitted = len(text) - head - tail
+    return (text[:head]
+            + _TRUNCATION_MARK.format(n=omitted)
+            + (text[-tail:] if tail else ""))
+
+
 def extract_state(body: dict) -> str:
-    """取最后一条 user 消息作为 state（截断到上限）。
+    """取最后一条 user 消息作为 state（超长时首尾各留一半）。
 
     为什么不是整个请求体：Jev 的 64k 预算里 state 最多 32k，而门限要的是
-    「这条请求要什么能力」，开头部分足够；同时这也把**出境数据量**压到最小。
+    「这条请求要什么能力」；只发最后一条 user 消息也把**出境数据量**压到最小。
+
+    超长时用 `truncate_head_tail()` 保留首尾而非只留开头（见该函数的说明：
+    用户的真实诉求常在末尾）。
     """
     msgs = body.get("messages")
     if not isinstance(msgs, list):
@@ -468,7 +505,7 @@ def extract_state(body: dict) -> str:
             ]
             text = "\n".join(p for p in parts if p)
         if text.strip():
-            return text[:_max_chars()]
+            return truncate_head_tail(text, _max_chars())
     return ""
 
 

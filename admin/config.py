@@ -153,6 +153,9 @@ class Settings:
     #: 门限约 0.35-1.5s，Jev 自身波动大；1.2s 会偶发掐掉慢响应，故给到 2.5s。
     ROUTER_GATE_TIMEOUT = float(os.getenv("ADMIN_ROUTER_GATE_TIMEOUT", "2.5"))
     #: 允许作为门限 state 出境的最大字符数（只取最后一条 user 消息）。
+    #: 超长时**首尾各留一半**（不是只取开头）：用户的真实诉求常在末尾，
+    #: 只取开头会系统性丢掉它 —— 这是 Lost in the Middle 直接对应的坑，
+    #: 见 admin/router_gate.py 的 `truncate_head_tail()`。
     ROUTER_GATE_MAX_CHARS = int(os.getenv("ADMIN_ROUTER_GATE_MAX_CHARS", "4000"))
     #: 门限结果的会话级缓存 TTL（秒）。多轮对话只付一次门限延迟；0 = 不缓存。
     ROUTER_GATE_CACHE_TTL = int(os.getenv("ADMIN_ROUTER_GATE_CACHE_TTL", "1800"))
