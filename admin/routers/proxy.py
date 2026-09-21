@@ -568,6 +568,23 @@ def _sse_has_error_event(body: str) -> bool:
     return False
 
 
+def _sse_real_model(body: str) -> str:
+    """从上游响应里取它**实际使用**的模型名；取不到返回空串。
+
+    请求 model="auto" 时，上游按智能路由挑一个具体模型，并在响应每个 chunk 的
+    ``model`` 字段回传真名（实测：请求 auto → 响应 model="hy4-preview"）。
+    记账/日志必须用这个真名，因为：
+      * 后端用量统计按 model 维度展示，全记成 "auto" 就看不出实际用了什么；
+      * ``_fetch_real_credits`` 是按 ``r.get("model") == model`` 去上游用量接口
+        匹配的，记成 "auto" 会匹配不上，导致真实积分回填失败。
+    """
+    for obj in _iter_json_objects(body):
+        m = obj.get("model")
+        if isinstance(m, str) and m.strip():
+            return m.strip()
+    return ""
+
+
 #: 各种协议里「真实正文增量」的字段名。只有看到其中之一，才认为这条流是健康的。
 _CONTENT_FIELDS = ("content", "reasoning_content", "text", "thinking", "tool_calls")
 
@@ -1203,7 +1220,8 @@ def _pick_best_model(db: Session, requested_model: str,
 
     策略：
       - 用户指定了具体模型 → 校验白名单后直接用（或返回 None 表示被拒）
-      - 用户传 "auto" 或空 → 优先选免费模型（credit_multiplier=0），没有免费的才选付费的
+      - 用户传 "auto" 或空 → 见下：默认**透传 "auto"** 由上游智能路由决定；
+        关掉 ADMIN_AUTO_PASSTHROUGH 时退回「免费优先」本地自选
       - 未配置任何模型规则时放行全部（向后兼容），返回原始 model
       - allowed 非 None 时（Key 绑定了分组），只在 allowed 集合内选择
     """
@@ -1225,7 +1243,15 @@ def _pick_best_model(db: Session, requested_model: str,
             return requested_model
         return None  # 被白名单拒绝
 
-    # auto 模式：有配置时免费优先，无配置也从后端取模型列表自选（绝不透传 auto）
+    # ---- auto 模式 ----
+    # 默认**透传 "auto"**：上游自己就是智能路由（官方 CLI 也传 auto），
+    # 比本地「哪个免费用哪个」更懂该用哪个模型。
+    # 分组场景除外：分组要限制模型集合，而透传后上游可能挑到组外的模型，
+    # 那就等于绕过了分组限制。
+    if allowed is None and settings.AUTO_PASSTHROUGH:
+        return "auto"
+
+    # 以下为本地自选（ADMIN_AUTO_PASSTHROUGH=0 或绑定了分组时）
     if allowed is not None:
         # 分组内：免费优先，否则任意组内模型
         free_in_group = _get_free_models(db) & allowed
@@ -1258,14 +1284,17 @@ def _pick_best_model(db: Session, requested_model: str,
             pass
         return "deepseek-v4-flash"  # 兜底：无配置且后端不可达时用默认模型
 
+    # 一律 sorted：_get_free_models / _get_enabled_models 返回 set，
+    # 而 set 无序，list(set)[0] 会随哈希种子随机漂 —— 曾把免费的生图模型
+    # 当对话模型选中（上游 400，被判 5xx 后熔断整池）。
     free_models = _get_free_models(db)
     if free_models:
-        return list(free_models)[0]  # 取第一个免费模型
+        return sorted(free_models)[0]
 
     # 无免费模型：取任意一个启用的
     enabled = _get_enabled_models(db)
     if enabled:
-        return list(enabled)[0]
+        return sorted(enabled)[0]
 
     return None  # 有配置但全禁用
 
@@ -1786,6 +1815,10 @@ async def chat_completions(
                             acc_i.last_used_at = datetime.utcnow()
                             _note_success(db2, acc_i)
                             usage = _parse_usage(text)
+                            # 透传 auto 时请求发的是 "auto"，但上游响应带**实际使用**的
+                            # 模型名 —— 日志与记账必须用真名，否则统计里全是 auto，
+                            # 且真实积分回填（按 model 匹配）会失败。
+                            final_model = _sse_real_model(text) or final_model
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             status_out = 200
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
@@ -2057,13 +2090,15 @@ async def responses_proxy(
                             _note_success(db2, acc_i)  # 成功清零连败计数
                             updated = sess_i.updated_json()
                             total_toks = cost_info["total_tokens"] or cost_info["completion_tokens"]
-                            seq = _log_chat_row(None, None, m, "resp", acc_i.uid or "-", 200, total_toks, error_kind="success")
+                            # 透传 auto 时 m 就是 "auto"，用上游回传的真名记账/记日志。
+                            rec_model = _sse_real_model(r.text) or m
+                            seq = _log_chat_row(None, None, rec_model, "resp", acc_i.uid or "-", 200, total_toks, error_kind="success")
                             sess_i.close()
                             if sticky_key and held_uid:
                                 POOL.sticky.bind(sticky_key, held_uid)
                             POOL.release(held_uid)
                             held_uid = ""
-                            _record_usage(key.id, acc_i.id, m, cost_info["credits"], updated,
+                            _record_usage(key.id, acc_i.id, rec_model, cost_info["credits"], updated,
                                           client_ip=_client_ip(request), use_case="responses",
                                           prompt_tokens=cost_info["prompt_tokens"],
                                           completion_tokens=cost_info["completion_tokens"],
@@ -2226,6 +2261,8 @@ async def responses_proxy(
                             acc_i.last_used_at = datetime.utcnow()
                             _note_success(db2, acc_i)
                             usage = _parse_usage(text)
+                            # 透传 auto 时用上游回传的真名记账（见 _sse_real_model）。
+                            final_model = _sse_real_model(text) or final_model
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
                             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
@@ -2477,14 +2514,16 @@ async def anthropic_messages(
                             _note_success(db2, acc_i)  # 成功清零连败计数
                             updated = sess_i.updated_json()
                             total_toks = cost_info["total_tokens"] or cost_info["completion_tokens"]
-                            seq = _log_chat_row(None, None, m, "anthropic", acc_i.uid or "-", 200,
+                            # 透传 auto 时 m 就是 "auto"，用上游回传的真名记账/记日志。
+                            rec_model = _sse_real_model(r.text) or m
+                            seq = _log_chat_row(None, None, rec_model, "anthropic", acc_i.uid or "-", 200,
                                                 total_toks, error_kind="success")
                             sess_i.close()
                             if sticky_key and held_uid:
                                 POOL.sticky.bind(sticky_key, held_uid)
                             POOL.release(held_uid)
                             held_uid = ""
-                            _record_usage(key.id, acc_i.id, m, cost_info["credits"], updated,
+                            _record_usage(key.id, acc_i.id, rec_model, cost_info["credits"], updated,
                                           client_ip=_client_ip(request), use_case="anthropic",
                                           prompt_tokens=cost_info["prompt_tokens"],
                                           completion_tokens=cost_info["completion_tokens"],
@@ -2648,6 +2687,8 @@ async def anthropic_messages(
                             acc_i.last_used_at = datetime.utcnow()
                             _note_success(db2, acc_i)
                             usage = _parse_usage(text)
+                            # 透传 auto 时用上游回传的真名记账（见 _sse_real_model）。
+                            final_model = _sse_real_model(text) or final_model
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
                             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None

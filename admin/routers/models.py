@@ -7,6 +7,7 @@
 """
 import httpx
 import json
+import logging
 import time
 from typing import Optional
 
@@ -14,11 +15,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+import upstream_compat
 from admin import backend
 from admin.config import settings
 from admin.db import get_db
 from admin.models import Account, ModelConfig
 from admin.security import require_admin
+
+logger = logging.getLogger("admin.models")
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 
@@ -92,6 +96,12 @@ def _do_sync_models(db: Session) -> dict:
     """从后端拉取可用模型列表并同步到本地数据库（upsert）。
 
     需要一个有效账号来调用后端 API；优先选 active 且余额 > 0 的账号。
+
+    **只同步「对话模型」**：上游返回的 ``data.models`` 是全部模型（含生图等
+    非对话模型），直接入库会让它们通过白名单、进而被 auto 选中当对话模型用
+    （实测事故：免费的生图模型被选中 → 上游 400 → 被判 5xx → 熔断整池）。
+    因此这里走 ``upstream_compat.normalize_catalog`` 的分类结果，只取 ``chat``：
+    它按官方 CLI 名单 + tags（text-to-image）+ 输出长度过滤，与 /gw 路径同源。
     """
     acc = db.query(Account).filter(
         Account.status == "active", Account.balance_remain > 0
@@ -100,11 +110,18 @@ def _do_sync_models(db: Session) -> dict:
         raise HTTPException(status_code=503, detail="无可用账号（无法连接后端获取模型列表）")
     try:
         with backend.AccountSession(acc.auth_json) as sess:
-            models_raw = sess.fetch_models()
+            raw = sess.cm.fetch_models_raw()   # 保留完整结构（models + agents + tags）
             acc.auth_json = sess.updated_json()
         db.commit()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"获取模型列表失败: {e}")
+
+    # 分类过滤：失败时退回原始列表（宁可不升级行为，也不要让同步整个失败）
+    try:
+        models_raw = upstream_compat.normalize_catalog(raw)["chat"]
+    except Exception as e:
+        logger.warning("模型目录分类失败，回退为全量列表：%s", e)
+        models_raw = (raw.get("data") or {}).get("models") or []
 
     import re
 
@@ -114,7 +131,10 @@ def _do_sync_models(db: Session) -> dict:
     for m in models_raw:
         mid = m.get("id")
         if not mid or mid.lower() == "auto":
-            continue  # 跳过上游聚合模型 "auto"，我们系统有自己的免费优先 auto 逻辑
+            # 跳过上游聚合模型 "auto"：它由 _pick_best_model 单独处理
+            # （默认透传给上游智能路由，ADMIN_AUTO_PASSTHROUGH=0 时本地免费优先），
+            # 不需要进白名单。
+            continue
         # 解析积分倍率
         raw_credits = m.get("credits") or ""
         multiplier = 0.0

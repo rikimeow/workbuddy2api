@@ -116,6 +116,13 @@ class Settings:
     STICKY_GC_SECONDS = int(os.getenv("ADMIN_SESSION_STICKY_GC", "300"))
     #: 单请求最多换号次数（原实现硬编码 3，这里可配）。
     MAX_ROTATE = int(os.getenv("ADMIN_POOL_MAX_ROTATE", "3"))
+    #: auto 是否**透传给上游**（用官方智能路由，与桌面端 / CLI 行为一致）。
+    #: 1（默认）= 透传：请求 model 原样发 "auto"，由上游按任务复杂度挑模型。
+    #: 0        = 旧行为：本地「免费优先」自选（省钱，但丢掉官方路由，
+    #:            且会在免费池里按 set 顺序随机漂 —— 曾导致生图模型被当对话模型）。
+    #: 注意：Key 绑定了模型分组时**一律不透传**（分组要限制模型集合，
+    #: 而上游 auto 会挑到组外的模型），见 _pick_best_model。
+    AUTO_PASSTHROUGH = os.getenv("ADMIN_AUTO_PASSTHROUGH", "1") != "0"
     #: 软限流（429）冷却基数（秒）；连续触发按 2 倍指数退避，封顶 SOFT_RATE_MAX。
     SOFT_RATE_SECONDS = int(os.getenv("ADMIN_POOL_SOFT_RATE", "600"))
     #: 软冷却指数退避封顶（秒）。默认 2h，与参考实现一致。
