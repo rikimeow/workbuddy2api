@@ -668,6 +668,7 @@
             每档 = 一个上游模型 id + 一段能力描述。<b>描述是判断质量的命门</b>：
             Jev 靠它区分档位，写得越具体互斥越准（避免「好 / 一般 / 差」这类没边界的说法）。
             模型 id 不能是 <code>auto</code>（那会把路由权交回上游）。
+            最多 8 档 —— 这是本项目的取舍（Jev 本身支持 255 个），档位越多判断越分散。
           </p>
           <div id="rgTiers" class="space-y-2"></div>
           <div id="rgTierWarn" class="text-[11px] text-amber-600 mt-2"></div>
@@ -2913,7 +2914,7 @@ function _rgAddTierRow(model, desc){
 
 function rgAddTier(){
   const n = $("#rgTiers").querySelectorAll(".rg-tier").length;
-  if(n >= (_rgState?.limits?.max_tiers || 4)){ toast(`最多 ${_rgState?.limits?.max_tiers||4} 个档位`,"err"); return; }
+  if(n >= (_rgState?.limits?.max_tiers || 8)){ toast(`最多 ${_rgState?.limits?.max_tiers||8} 个档位`,"err"); return; }
   _rgAddTierRow("", "");
   rgPreviewJson();
 }

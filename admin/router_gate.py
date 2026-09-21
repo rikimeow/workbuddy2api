@@ -123,9 +123,16 @@ QUESTIONS: dict = {
 QUESTION_KEYS: tuple[str, ...] = ("capability", "needs_reasoning", "needs_long_context")
 QUESTION_TYPES: dict[str, str] = {k: v["type"] for k, v in QUESTIONS.items()}
 
-#: 档位数量边界。1 个档位没有选择余地；>4 个会让 Jev 的 Choice 判断发散。
+#: 档位数量边界。
+#:
+#: 注意**上限不是 Jev 的限制**：官方 Choice 支持最多 255 个选项，且明确建议
+#: 「给全量列表而不是缩略版」。这里限 8 是**我们这边的工程取舍**：
+#:   * 每个档位 = 一个上游模型，有意义的下游模型本就没几个；
+#:   * 档位越多，Jev 的选择越分散、置信度越低（3 选 1 比 10 选 1 可靠得多）；
+#:   * 每档的描述都进 criteria，会按输入 token 计费。
+#: 下限 2：1 个档位没有选择余地，等于没门限。
 MIN_TIERS = 2
-MAX_TIERS = 4
+MAX_TIERS = 8
 
 #: 合法的门限模式（供后台 API 校验，避免校验逻辑与 `gate_mode` 各写一份而漂移）。
 _MODE_VALID = ("off", "shadow", "on")
