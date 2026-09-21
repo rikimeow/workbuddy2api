@@ -59,6 +59,7 @@
   - [10.2 并发：在途租约（把并发摊平到全池）](#102-并发在途租约把并发摊平到全池)
   - [10.3 会话粘性：同一会话固定同一账号](#103-会话粘性同一会话固定同一账号)
   - [10.4 错误分类与账号处置（一张表看懂）](#104-错误分类与账号处置一张表看懂)
+    - [10.4.0 上游错误码全表（逆向官方客户端得到）](#1040-上游错误码全表逆向官方客户端得到)
     - [10.4.1 HTTP 200 不等于成功](#1041-http-200-不等于成功)
   - [10.5 WAF：IP 级 fail-fast](#105-wafip-级-fail-fast)
   - [10.6 轮转退避：指数 + 抖动](#106-轮转退避指数--抖动)
@@ -1092,9 +1093,9 @@ workbuddy2api/
 │   ├── wb_paths.py           # 客户端路径覆盖（安装目录/产物目录）落库并注入 wb_install
 │   ├── jobrunner.py          # 后台任务执行器（拆包等耗时操作异步化 + 进度轮询）
 │   ├── routers/              # accounts / app_source / client_profile / groups / growth / keys / proxy / schedules / logs / stats / sync / models
-│   └── static/index.html     # 纯 HTML + TailwindCSS + FontAwesome 管理大屏
+│   └── static/index.html     # 纯 HTML + TailwindCSS + FontAwesome 管理大屏（面板状态写入 ?tab=）
 ├── tests/                    # 本地回归测试（.gitignore 忽略，不进仓库）
-│   ├── test_pool.py          # 号池治理 / 错误分类 / 200 体内错误 / 端口优先级 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包 / 端口接管（438 项）
+│   ├── test_pool.py          # 号池治理 / 错误分类 / 200 体内错误 / 端口优先级 / 会话键 / 画布 id / SSE 聚合 / 安装发现 / 客户端参数 / 拆包 / 端口接管 / 限流码族 / 链路头族（548 项）
 │   ├── test_e2e_db.py        # 真实库端到端：迁移 / 保活任务 / 选号链路（48 项）
 │   └── test_gateway_smoke.py # 真实上游端到端冒烟（9 项，会消耗少量积分）
 ├── wb_install.py             # WorkBuddy 安装位置 / 版本号 / 风控配置自动发现（不写死盘符）
@@ -1110,6 +1111,20 @@ workbuddy2api/
 
 > `scripts/*.py` 与 `tests/` 都被 `.gitignore` 忽略（本地回归工具，不进仓库）。
 > 它们在本机检出里仍然可用。
+
+#### 管理大屏的面板状态：地址栏 `?tab=`
+
+面板切换会同步写进地址栏（`?tab=client` / `?tab=logs` …），刷新后停在**当前**面板，
+不再跳回「账号」首页；直接把链接发给别人也能打开同一面板。两个实现要点：
+
+- 用 `history.replaceState` 而不是 `pushState` —— 切面板不该往历史栈里堆一长串，
+  浏览器「后退」应当离开本页，而不是在面板之间来回跳。同时监听 `popstate`，
+  真跨页面前进/后退时同步面板（地址栏被手改后回车也走这条）；
+- 面板名走**白名单**（那 10 个 `data-tab`），非法/缺失一律回落 `accounts`；
+  默认面板不写进 URL，保持地址栏干净。
+
+面板名 → 懒加载的对应关系保持不变（`groups`/`usage`/`client`/`settings` 各自按需拉数据），
+所以从 URL 恢复面板时数据照样会加载，不是只切了个样式。
 
 ---
 
@@ -1176,10 +1191,10 @@ workbuddy2api/
 |------|------|------|----------------|
 | `model_block` | 400/404 + `11102` | 该 (账号,模型) 负缓存，指数退避封顶 24h；**换模型** | 官方确定「该后端无此模型」，换号重试无意义，只有换模型有效 |
 | `session_dead` | `12153` / **401** / "Offline user session not found" | **连续 3 次**才禁用 | 该错误会被临时触发（上游抖动、并发刷新 token），一次就禁用等于误杀健康号；401 token 过期换号即可恢复 |
-| `account_fault` | `11140` / `14017` | 冷却 30 分钟后换号 | 账号级授权故障，常带 429 状态码，**必须先于限流判定** |
-| `model_rate` | `6004` | **只冷却该模型**，然后**换号继续** | 6004 是**账号级**额度，换号就能继续；「切个模型就能用」的号也不该被整体摘出池子 |
-| `hard_credit` | 402/412 或余额文案 | 冷却到**次日 04:00** | 日额度在凌晨重置，04:00 是重置完成后的安全时点 |
-| `soft_rate` | 429 | 有重置时间就精确对齐，否则有界指数退避（封顶 2h） | 精确对齐避免把全池推到封顶 |
+| `account_fault` | `11140` / `14015` / `14016` / `14017` | 冷却 30 分钟后换号 | 账号级授权/授权态故障，常带 429 状态码，**必须先于限流判定** |
+| `model_rate` | `6004` / `6008` | **只冷却该模型**，然后**换号继续** | 日级额度（TPD/RPD）是**账号级**额度，换号就能继续；「切个模型就能用」的号也不该被整体摘出池子 |
+| `soft_rate` | 429 或 `6000`–`6003` / `6005`–`6007` | 有重置时间就精确对齐，否则有界指数退避（封顶 2h） | 秒/分/时级限流是账号级的，换个号立刻可用，所以退避要**有界** |
+| `hard_credit` | 402/412 或 `14001`/`14012`/`14013`/`14014`/`14018` 或余额文案 | 冷却到**次日 04:00** | 日额度在凌晨重置，04:00 是重置完成后的安全时点 |
 | `upstream_internal` | **HTTP 200 但体内是错误信封**（JSON-RPC `-32603` / `ENOSPC` / `error` 字段） | 15s 短冷却 + 换号重试 + 连败计数 | 见 10.4.1。上游会把内部故障塞进 200 响应，只看状态码会误判成成功 |
 | `waf` | 403 且**无业务信封** | 短冷却 + IP 级 fail-fast | 见 11.5 |
 | `server` | 5xx / **408 / 425** | 熔断，指数退避封顶 6h | 比原「累计 5 次固定 10 分钟」更贴合：固定时长对持续坏的号太短、对偶发又太长；408/425 是瞬时错误，绝不能算客户端错误 |
@@ -1189,6 +1204,68 @@ workbuddy2api/
 分类元组集中定义在 `_RETRYABLE_KINDS` / `_MODEL_SWITCH_KINDS`，五处轮转循环
 **共用同一份**（`test_rotation_call_sites_share_one_policy` 静态校验）。
 历史教训：每处各复制一份列表，改了一处漏了另一处，就会出现「某条路径报错但不换号」这种极难复现的漂移 bug。
+
+**限流重置时间优先读响应头**（`_reset_at_from_headers`，与官方客户端同款口径）：
+
+| 头 | 形态 | 说明 |
+|----|------|------|
+| `Retry-After` | 整数**秒** | 最权威，优先；日期形态按官方行为忽略 |
+| `anthropic-ratelimit-unified-reset` | epoch 秒 或 HTTP 日期 | 次优先 |
+| `x-ratelimit-reset` | epoch 秒 或 HTTP 日期 | 再次 |
+
+头里拿不到才回落到解析响应体文案（`_parse_reset_at`），两者都拿不到才用有界指数退避。
+**为什么优先读头**：429 的文案是给人看的、会随上游版本变化；头是机器契约。
+只读文案的实现，上游换个措辞就解析不出重置时间，冷却只能靠猜。
+另外「解析出的时间已过去」必须当无效 —— 否则冷却立即失效，等于没冷却。
+
+#### 10.4.0 上游错误码全表（逆向官方客户端得到）
+
+下面这张表**不是猜的**，是从官方 WorkBuddy 桌面端 `app.asar` 里的 CLI bundle
+（`cli/dist/codebuddy.js`）中提取的权威枚举 `ServerErrorCode`，以及客户端自己的
+判定函数 `isTransientRateLimitBusinessCode` / `isCraftDailyQuotaBusinessCode` /
+`isQuotaExhaustedError`。
+
+**限流码族 `6000`–`6008`**（这是我们原先漏得最狠的一块 —— 只处理了 `6004`）：
+
+| 码 | 名称 | 维度 | 客户端是否重试 | 本网关处置 |
+|----|------|------|----------------|-----------|
+| `6000` | CraftRateLimit | 未细化 | 是 | `soft_rate` |
+| `6001` | CraftRateTPSLimit | 每秒 token | 是 | `soft_rate` |
+| `6002` | CraftRateTPMLimit | 每分钟 token | 是 | `soft_rate` |
+| `6003` | CraftRateTPHLimit | 每小时 token | 是 | `soft_rate` |
+| `6004` | CraftRateTPDLimit | **每天** token | **否**（日额度） | `model_rate` |
+| `6005` | CraftRateRPSLimit | 每秒请求 | 是 | `soft_rate` |
+| `6006` | CraftRateRPMLimit | 每分钟请求 | 是 | `soft_rate` |
+| `6007` | CraftRateRPHLimit | 每小时请求 | 是 | `soft_rate` |
+| `6008` | CraftRateRPDLimit | **每天**请求 | **否**（日额度） | `model_rate` |
+
+客户端把 `{6004, 6008}` 单独拿出来当「日额度、不重试」，其余 `6000`–`6008`
+都当瞬时限流重试。本网关比客户端更细一层，因为**我们是号池**：
+秒/分/时级是**账号级**额度 → 换号立刻可用 → `soft_rate`；
+日级是该**账号×该模型**的日额度 → 换号或换模型都可解 → `model_rate`。
+
+**额度/授权码**：
+
+| 码 | 名称 | 本网关处置 | 为什么 |
+|----|------|-----------|--------|
+| `14001` | UsageLimitExceeded | `hard_credit` | 个人用量超限，等分钟级不会恢复 |
+| `14012` | UsageLimitExceededEnterprise | `hard_credit` | 企业用量超限 |
+| `14013` | UsageLimitExceededTencent | `hard_credit` | 腾讯侧用量超限 |
+| `14014` | UsageLimitEnterpriseExhausted | `hard_credit` | 企业额度用尽 |
+| `14018` | UsageLimitUserExhausted | `hard_credit` | 个人额度用尽 |
+| `14015` | UsageLimitLicenseExpired | `account_fault` | 授权到期，非额度问题 |
+| `14016` | UsageLimitEnterpriseNotActivated | `account_fault` | 企业未开通，非额度问题 |
+| `14017` | UsageLimitUserNotActivated | `account_fault` | 试用未激活，非额度问题 |
+| `11140` | — | `account_fault` | 账号级授权风控 |
+| `11102` | — | `model_block` | 该后端无此模型（确定性） |
+| `11115` | ContextTooLong | 透传客户端 | 上下文超长，换号无意义 |
+| `10105` | ConversationLimitExceeded | 透传客户端 | 并发会话数超限 |
+| `15001` | WebSearchRateLimit | 透传客户端 | 仅联网搜索受限 |
+
+**关键教训**：这些码**不总是配 `429`** —— 上游会把限流包在 **HTTP 200 或 400** 里返回。
+只看状态码的实现会把它落到 `status >= 400 → "client"`（**不可重试**）或 `"transport"`，
+于是「限流了却不换号」。所以码判定必须**先于**通用 429 与「其余 4xx」两层
+（`test_upstream_error_code_taxonomy` 对全族 9 个码 × 多状态码做了穷举断言）。
 
 #### 10.4.1 HTTP 200 不等于成功
 
@@ -1287,6 +1364,32 @@ WAF 403 拦的是**网关出口 IP**，不是账号（实测 3 个账号 1 秒�
 `ADMIN_KEEPALIVE_ACCOUNT_GAP`（默认 0.8s）**串行节流** —— 批量并发刷新 token 是
 很明显的机器特征；`12153` 连续计数达到 3 次才禁用（与 11.4 同源口径）。
 
+#### 10.8.1 官方客户端的刷新节奏（逆向对照）
+
+官方**没有**任何「登录态心跳」接口 —— 这一点值得记下来，避免以后误加一个上游根本
+不存在的保活请求。客户端靠的是**低频刷新 + 失败退避**：
+
+| 项 | 官方取值 | 说明 |
+|----|---------|------|
+| 正常刷新间隔 | **24h** ± 抖动（`86400s + rand(0..10min) - 5min`） | 远长于我们的每夜一次 |
+| 短有效期兜底 | 若 `expiresAt` 距今 < 24h → **5min + rand(0..60s)** | token 快过期时提前刷 |
+| 最小间隔 | `MIN_REFRESH_DELAY_MS = 15000`；30s 内不重复刷新 | 防抖 |
+| 失败重试 | `min(5000·2^(n-1), 60000)` → 5/10/20/40/60s，最多 5 次 | 与我们的退避口径一致 |
+| 401/403 | **不重试** | 授权态问题，重试无意义 |
+
+刷新接口：`POST /v2/plugin/auth/token/refresh`，头为官方专门的组合
+`X-Refresh-Token` + **`X-Auth-Refresh-Source: plugin`** + `X-Domain`。
+（注意上游 auth 路径带 `/v2/plugin/` 前缀，来自 `product.json` 的 `prefixPath: "/plugin"`，
+漏掉这一段会 404。）
+
+登录轮询参数（`/v2/plugin/auth/state` → 开浏览器 → 轮询 `/v2/plugin/auth/token?state=`）：
+**1000ms 间隔、300s 超时**；轮询期间必须带四个抑制头
+`X-No-Authorization` / `X-No-User-Id` / `X-No-Enterprise-Id` / `X-No-Department-Info`（值均为字符串 `"true"`），
+否则会被判成「未授权访问受保护接口」。
+
+我们现行的「每晚 22:00 串行刷新」比官方更保守（更晚、更省），方向是对的：
+官方 24h 节奏对**真人单客户端**合适，对**号池**则太稀疏（号会静默失效）。
+
 ### 10.9 拟人化请求头
 
 出站请求补齐官方客户端形状的头，缺哪个就少一个「这是真人客户端」的证据：
@@ -1298,9 +1401,45 @@ WAF 403 拦的是**网关出口 IP**，不是账号（实测 3 个账号 1 秒�
 | `X-IDE-Version` | 同桌面端版本（来自档案） | 用量归属，报旧版本是明显特征 |
 | `X-Machine-ID` / `X-Session-ID` | `md5("machine:{uid}")` 稳定派生 | 「每个账号一台固定虚拟设备」：每次随机 = 频繁换设备（异常）；全池共用常量 = 多号同设备（最易被识别）。两者都错 |
 | `X-Conversation-*` / `X-Request-ID` / `X-B3-*` | 会话键派生，**轮转循环外只算一次** | 一次 user send 内所有尝试复用同一份 —— 换号重试若换了会话 ID，上游看到的是 N 个并发会话而非一次对话的一次重试 |
+| `traceparent` / `b3` / `X-Trace-ID` | 与 `X-B3-TraceId`/`X-B3-SpanId` **同一份**值 | 官方每次模型请求都注入这一整套（`injectOtelSpanHeaders`）。**发得不一致比不发更糟**：同一请求里两个不同 traceId 是自相矛盾的特征 |
+| `X-Agent-Intent` | `craft` | 官方模型请求恒带，无 `meta` 时的兜底值 |
+| `X-Private-Data` | `false`（默认） | 官方每次模型请求都带的「数据用途」声明：模型优化开启 → `false`，关闭 → `true`。缺失即可识别 |
 | `Accept-Language` | `zh-CN` | 缺失会被上游按语言异常误判 |
 
+> **逆向同时确认「本版本不存在的头」**：`X-Moderation-Type` / `X-Expert-Id` /
+> `X-Expert-Team-Task` 在 5.5.6 的两个 CLI bundle 里命中数均为 **0**，
+> `X-Machine-ID` 也是 0（官方只用 `X-Machine-Id`，且仅用于 `/v2/feedback` 与诊断，
+> **不在模型请求上**）。所以这些**不能发** —— 发一个上游从未见过的头，
+> 比不发更容易被识别（`test_client_header_shape_matches_official` 有反向断言锁住）。
+
+> **`X-B3-ParentSpanId` 故意不发**：官方只在存在父 span 时携带（`ec && setHeader(...)`），
+> 网关发出的都是根请求，带上反而异常。
+
 以上头与桌面指纹**统一由「客户端参数档案」提供**，可在后台查看/修改/同步（见 §10.10.1）。
+
+#### 10.9.1 风控 SDK（Turing）到底发了什么 —— 一个反直觉的结论
+
+逆向官方客户端的结论是：**没有 `X-Turing-*` 头，也没有可在纯 JS 里复刻的签名算法。**
+
+官方接入的是腾讯 T-Sec TuringShield **原生 SDK**（`native/turing-sdk/` →
+`turing_sdk.node` → `TuringShieldSDK.dll`）。它对 HTTP 只暴露两个**互斥**的头：
+
+```
+X-Device-Token        成功
+X-Device-Token-Error  失败
+```
+
+device token 由 DLL 采集本机硬件指纹后向 `https://tdid.m.qq.com/tmf` 换取，
+是个**不透明字符串**。JS 层只负责透传，所以：
+
+* **纯 Python 网关无法自行生成**这个 token —— 没有可复刻的算法；
+* 但官方客户端**自带「未配置就降级」路径**：拿不到 token 时照常发请求，
+  只是不带这个头（或带 `X-Device-Token-Error`）。所以我们**省略它不算异常**；
+* 参数：`channelId=109144`（来自 `product.json`）、软过期 5 分钟、
+  后台异步刷新**绝不阻塞当前请求**、刷新退避 `min(30s·2^(n-1), 60s)`。
+
+顺带纠正两个容易搞混的点：`machineId` 只用于 `X-Machine-Id`（反馈接口 `/v2/feedback`）
+和诊断上报，**不在模型请求上**；`qimei36` **只进遥测事件体，不进 HTTP 头**。
 
 ### 10.10 客户端版本与逆向产物：自动发现 / 自动产出
 
@@ -1546,11 +1685,38 @@ python -c "from wb_install import WB; print(WB.describe())"
 
 **后台「客户端参数」面板**（`/admin` → 客户端参数）：
 
-- **探测本机客户端** —— 扫描安装包，读出真实版本号 / channelId / commit；
+- **探测本机客户端** —— 扫描安装包，读出真实版本号 / channelId / commit / 产品身份；
 - **直接改任意字段并保存** —— 改完**立即生效，无需重启进程**（缓存 30 秒 TTL，保存时立即失效）；
 - **切换取值策略** —— auto ↔ saved；
 - **来源排障视图** —— 每项当前取自哪一层（环境变量 / 现场探测 / 已保存 / 内置兜底）；
 - **重置** —— 清空保存值，回到纯探测 + 兜底。
+
+**能自动探测出哪些**（`cli/product.json` 是唯一数据源，读不到就不报，绝不用兜底值冒充）：
+
+| 键 | product.json 字段 | 生效位置 |
+|----|------------------|----------|
+| `desktop_version` | 安装清单 / `genieVersion` | UA、`X-IDE-Version` |
+| `cli_version` | `cli/package.json` | UA 第三段 |
+| `turing_channel_id` | `config.turingSdk.channelId` | 天御 SDK |
+| `commit` / `release_date_ms` | `commit` / `date` | 桌面事件指纹 |
+| `product` / `fp_product` | `deploymentType` | 请求头 `X-Product`、遥测 product |
+| `application_name` | `applicationName` | UA 前后两段 |
+| `ext_name` | `authentication.id` | 指纹 `extName` |
+
+**`X-Product` 不是产品名，是部署形态** —— 这是很容易搞错、且错了就很显眼的一项。
+官方客户端的全局 `ProductEndpointHttpInterceptor` 里写死了：
+
+```js
+config.headers["X-Product"] ||= configuration?.deploymentType ?? "SaaS";
+```
+
+即凡走该拦截器的请求（**模型请求就是走这条**），`X-Product` 报的是
+`SaaS` / `CloudHosted` / `SelfHosted` 这类**部署形态**，而不是 `WorkBuddy`。
+唯一硬编码 `X-Product: "WorkBuddy"` 的地方是 `stdio-mcp-inspector.js` 里
+`/v2/activity/workbuddy/banner` 那个窄接口 —— 拿它当通用值会错。
+本项目的 `admin/backend.py` 事件上报路径一直是 `"SaaS"`，与此结论一致。
+
+**取值优先级**（`effective()`）：
 
 **同步到线上**：`/api/sync/push` 会带上 `client_profile`（推送的是 `effective`，
 即当下真实生效的完整参数，而不是本地那点增量配置）。
@@ -1562,6 +1728,14 @@ python -c "from wb_install import WB; print(WB.describe())"
 
 > **不传 `machineId` / `sessionId`**：这两个是**账号级**的，必须由各端按自己库里的
 > uid 稳定派生。跟着传会让所有账号共用同一台「设备」—— 而那正是最容易被批量识别的特征。
+
+> **已修的一个反向 bug（`_compose` 层优先级写反）**：`out[k] = v` 逐层覆盖，
+> 所以优先级高的层必须放在列表**末尾**。历史实现把两个分支都写反了 ——
+> `saved` 模式让探测胜出、`auto` 模式让保存胜出，于是「auto 下版本升级后自动跟上」
+> 这条承诺根本不成立：只要在后台保存过一次，真实探测值就被那份可能已过期的档案压住。
+> `sources()` 一直是按正确优先级写的，所以症状表现为「排障视图说取自现场探测、
+> 实际生效的却是已保存值」的自相矛盾。现已修正，并在 `test_pool.py` 里加了
+> 四个方向的回归断言（含「`sources()` 与 `effective()` 必须自洽」）。
 
 **一个刻意留下的坑（已加测试钉住）**：`user_agent` **不可保存**。
 它 100% 由 `desktop_version` + `cli_version` 派生；若允许独立保存，就会出现
@@ -1636,7 +1810,7 @@ cache miss     5.2 ms      每 30 秒最多一次
 ### 10.12 这批改动的验证
 
 ```bash
-.venv\Scripts\python.exe tests\test_pool.py            # 438 项，不依赖库/网络
+.venv\Scripts\python.exe tests\test_pool.py            # 548 项，不依赖库/网络
 .venv\Scripts\python.exe test_upstream_compat.py       #  74 项，上游协议兼容/思考开关（本地文件，不入仓库）
 .venv\Scripts\python.exe tests\test_e2e_db.py          #  48 项，连真实 MySQL（只读 + 幂等迁移）
 .venv\Scripts\python.exe tests\test_gateway_smoke.py   #   9 项，真实上游端到端（会消耗少量积分）
@@ -1715,7 +1889,7 @@ cache miss     5.2 ms      每 30 秒最多一次
 - 客户端参数档案（UA / 版本号 / 风控头 / 桌面指纹）的**探测→保存→生效→同步**闭环；
 - 后台一键拆包与路径自动补齐（`ADMIN_DEV_TOOLS`）；
 - `create_canvas` 的真实 id 口径与两段式状态机（`accept` → 完成 → `claim`）；
-- 全部测试（`test_pool.py` 438 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
+- 全部测试（`test_pool.py` 548 项 / `test_e2e_db.py` / 网关冒烟 / 实测脚本）。
 
 ### 如果引用有误
 

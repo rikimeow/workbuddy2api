@@ -10,7 +10,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, Header, Request
@@ -192,10 +192,22 @@ def _upstream_extra_headers(request: Request, purpose: str = "conversation",
 
 
 def _session_headers(body: dict, uid: str) -> dict:
-    """构造会话头族（对话 ID / 对话轮级聚合主键 / 消息级 ID / B3 链路）。
+    """构造会话头族（对话 ID / 对话轮级聚合主键 / 消息级 ID / 链路追踪）。
 
     调用方在**轮转循环外**生成一次、循环内复用，保证换号重试时上游看到的是
     同一次对话轮，而不是 N 个并发会话。
+
+    链路头族（依据官方客户端 CLI 的 `injectOtelSpanHeaders`，见逆向报告
+    `workbuddy-auth-protocol-report.md`）—— 官方在**每次模型请求**上都会注入
+    这一整套，缺一个就是可识别的「非官方客户端」特征：
+
+        traceparent  00-<traceId32>-<spanId16>-<01|00>
+        b3           <traceId32>-<spanId16>-<1|0>
+        X-B3-TraceId / X-B3-SpanId / X-B3-Sampled
+        X-Trace-ID   <traceId32>
+
+    注意 `X-B3-ParentSpanId` **故意不发**：官方只在存在父 span 时才带
+    （`ec && setHeader(...)`）；网关发出的都是**根请求**，带了反而异常。
     """
     h: dict[str, str] = {}
     conv_id = pool.extract_session_key(body)
@@ -214,9 +226,18 @@ def _session_headers(body: dict, uid: str) -> dict:
     mid = hashlib.sha256(f"{time.time_ns()}:{uid}:msg".encode()).hexdigest()[:32]
     h["X-Conversation-Message-ID"] = mid
     h["X-Request-ID"] = mid
+    # span id 为 16 hex（8 字节），trace id 为 32 hex（16 字节）—— OTEL 规范。
+    span = mid[:16]
     h["X-B3-TraceId"] = trace
-    h["X-B3-SpanId"] = mid[:16]
+    h["X-B3-SpanId"] = span
     h["X-B3-Sampled"] = "1"
+    h["X-Trace-ID"] = trace
+    # 单头 b3 与 W3C traceparent：与上面的 X-B3-* 保持**同一份** trace/span，
+    # 否则三个头互相矛盾，比不发更容易被识别。
+    h["b3"] = f"{trace}-{span}-1"
+    h["traceparent"] = f"00-{trace}-{span}-01"
+    # 官方模型请求恒带 X-Agent-Intent，默认 "craft"（无 meta 时的兜底值）。
+    h["X-Agent-Intent"] = "craft"
     return h
 
 
@@ -397,15 +418,69 @@ _SESSION_DEAD_MARKERS = ["Offline user session not found", "12153", "session not
 
 #: 账号级授权/配额故障：不是余额问题，也不是限流，而是「这个号当前不允许调」。
 #:   * 11140 "request illegal" —— 账号级授权风控；
-#:   * 14017 "trial not activated" —— 试用未激活/注册未完成。
-#: 两者都应当**换号并冷却**，而不是无限重试同一个号；也不能误判成 429 软限流
+#:   * 14017 "trial not activated" —— 试用未激活/注册未完成；
+#:   * 14015 "license expired" —— 授权到期；
+#:   * 14016 "enterprise not activated" —— 企业未开通。
+#: 都应当**换号并冷却**，而不是无限重试同一个号；也不能误判成 429 软限流
 #: （14017 常带 429 状态码），否则会把一个长期不可用的号当「等一会就好」处理。
-_ACCOUNT_FAULT_CODES = ("11140", "14017")
+#:
+#: 注：14015/14016 **不在**上游 `isQuotaExhaustedError` 集合里，语义是「授权态问题」
+#: 而非「额度用完」，所以走 account_fault（30 分钟冷却）而不是 hard_credit（次日 04:00）。
+_ACCOUNT_FAULT_CODES = ("11140", "14017", "14015", "14016")
 _ACCOUNT_FAULT_MARKERS = ("request illegal from an unapproved channel",
                           "trial version is not yet activated",
-                          "trial not activated")
+                          "trial not activated",
+                          "license expired",
+                          "enterprise not activated")
 
-#: 模型级限流：code 6004「该模型的使用量超限」。只冷却**这一个模型**，
+# ---------------------------------------------------------------------------
+# 上游限流错误码族（6000–6008）
+#
+# 依据：官方客户端 CLI bundle 里的权威枚举 `ServerErrorCode`（我们原先**只知道 6004**，
+# 整族其余 7 个码全部漏判 —— 而它们恰恰就是「限速限流」本身）：
+#
+#     6000 CraftRateLimit   限流基值（未细化）
+#     6001 CraftRateTPSLimit  每秒 token 数
+#     6002 CraftRateTPMLimit  每分钟 token 数
+#     6003 CraftRateTPHLimit  每小时 token 数
+#     6004 CraftRateTPDLimit  每天 token 数   ← 原先唯一处理的
+#     6005 CraftRateRPSLimit  每秒请求数
+#     6006 CraftRateRPMLimit  每分钟请求数
+#     6007 CraftRateRPHLimit  每小时请求数
+#     6008 CraftRateRPDLimit  每天请求数
+#
+# 客户端的判定（bundle 内 `isTransientRateLimitBusinessCode` / `isCraftDailyQuotaBusinessCode`）：
+#     e_ = {6004, 6008}                  → 日额度，**不重试**（换号也没用，当天用完了）
+#     6000–6008 且 ∉ e_                 → 瞬时限流，**重试**（等一会/换号就能过）
+#
+# 对本网关的含义（比客户端更细，因为我们是号池）：
+#   * 秒/分/时级（6000–6003、6005–6007）是**账号级**额度 → 换号立刻可用 → soft_rate；
+#   * 日级（6004、6008）是**该账号×该模型**的日额度 → 换号可用、同号换模型也可用
+#     → model_rate（只冷却这一对）。
+#
+# 为什么必须按码判定而不是只看 429：上游会把限流包在 **HTTP 200** 或 **400** 里返回。
+# 此时旧逻辑会落到最后 `status >= 400 → "client"`（**不可重试**）或 `"transport"`，
+# 于是「限流了却不换号」—— 正是用户反馈的「接口直接报错，没有切换其它账号」。
+_ACCOUNT_RATE_CODES = frozenset({"6000", "6001", "6002", "6003",
+                                "6005", "6006", "6007"})
+#: 该账号对该模型的**日**额度：只冷这一对，换模型/换号都可解。
+_MODEL_RATE_CODES = frozenset({"6004", "6008"})
+#: 全族并集，仅用于自检与文档（分类走上面两个子集）。
+_RATE_LIMIT_CODES = _ACCOUNT_RATE_CODES | _MODEL_RATE_CODES
+
+#: 额度彻底耗尽（客户端 `isQuotaExhaustedError` 的精确集合）。
+#: 这组是**持久**失败：当天的额度真的用完了，等几分钟不会恢复，
+#: 换号也未必有额度 —— 按次日 04:00 冷却，避免每次请求都白转一轮。
+#:   14001 UsageLimitExceeded            个人用量超限
+#:   14012 UsageLimitExceededEnterprise  企业用量超限
+#:   14013 UsageLimitExceededTencent     腾讯侧用量超限
+#:   14014 UsageLimitEnterpriseExhausted 企业额度用尽
+#:   14018 UsageLimitUserExhausted       个人额度用尽
+#: （14002 ConversationChatTooMany / 10105 ConversationLimitExceeded 是**会话数**限制，
+#:   不是额度，语义不同，故不并入这里。）
+_QUOTA_EXHAUSTED_CODES = frozenset({"14001", "14012", "14013", "14014", "14018"})
+
+#: 模型级限流：code 6004/6008「该模型的使用量超限」。只冷却**这一个模型**，
 #: 该账号对其他模型仍可用 —— 否则「切个模型就能继续用」的号会被整体摘出池子。
 _MODEL_RATE_CODE = "6004"
 #: 该后端无此模型：code 11102。这是确定性答复，重试无意义，只能换模型/换号。
@@ -701,9 +776,18 @@ def _classify_error(status: int, body: str) -> str:
             if m in body_l:
                 return "account_fault"
 
-    # 4. 模型级限流（只冷却该模型）
-    if code == _MODEL_RATE_CODE:
+    # 4. 上游限流码族 6000–6008（客户端权威枚举 ServerErrorCode）。
+    #     必须在「通用 429」和「其余 4xx」之前 —— 上游会把限流包在 200/400 里返回，
+    #     落到后面就会被判成 client（不可重试）或 transport，于是「限流却不换号」。
+    #     日级（6004/6008）只冷该模型；秒/分/时级（其余）是账号级，换号即可。
+    if code in _MODEL_RATE_CODES:
         return "model_rate"
+    if code in _ACCOUNT_RATE_CODES:
+        return "soft_rate"
+    # 4b. 额度彻底耗尽（14001/14012/14013/14014/14018）：持久失败，
+    #     按次日 04:00 硬冷却。必须先于通用 429 —— 这些码常带 429 状态码。
+    if code in _QUOTA_EXHAUSTED_CODES:
+        return "hard_credit"
 
     # 5. 余额/额度不足（硬冷却到次日 04:00）—— 必须在通用限流之前
     if status in (402, 412):
@@ -1039,6 +1123,72 @@ def _parse_reset_at(msg: str) -> datetime | None:
     except Exception:
         return None
 
+
+
+def _reset_at_from_headers(headers) -> datetime | None:
+    """从上游**响应头**解析限流重置时间（官方客户端同款口径）。
+
+    为什么必须读头而不是只读文案：429 的响应体文案是**人类可读**的、会随上游版本
+    变化，而 `Retry-After` / `x-ratelimit-reset` 是**机器可读**的契约字段。
+    官方客户端（CLI bundle `parseRetryAfterMs` / `parseRateLimitResetMs`）读的就是这两个：
+
+        retry-after                            → 整数**秒**（相对量）
+        anthropic-ratelimit-unified-reset      → epoch 秒 或 HTTP 日期
+        x-ratelimit-reset                      → 同上
+
+    与官方一致的取舍：
+      * `Retry-After` **只认整数秒**，日期形态按官方行为忽略（`httpx` 已帮我们把
+        相对秒规整进这个头，所以这里再解析一次整数即可）；
+      * reset 头先试纯数字（epoch 秒），失败再试 HTTP 日期；
+      * 解出来的时间若已过去（<= now）则视为无效，继续看下一个头 —— 返回过去的时间
+        会让冷却立即失效，等于没冷却。
+
+    返回 UTC naive（与库内 `datetime.utcnow()` 口径一致），失败返回 None。
+    """
+    if not headers:
+        return None
+    try:
+        get = headers.get
+    except AttributeError:
+        return None
+
+    now = datetime.utcnow()
+
+    # 1) Retry-After：整数秒的相对量（最权威，优先）
+    raw = get("retry-after")
+    if raw:
+        try:
+            secs = int(str(raw).strip())
+            if secs > 0:
+                return now + timedelta(seconds=secs)
+        except (TypeError, ValueError):
+            pass  # 日期形态：按官方行为忽略
+
+    # 2) reset 头：epoch 秒 或 HTTP 日期
+    for name in ("anthropic-ratelimit-unified-reset", "x-ratelimit-reset"):
+        raw = get(name)
+        if not raw:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        when: datetime | None = None
+        if text.isdigit():
+            try:
+                when = datetime.utcfromtimestamp(int(text))
+            except (OverflowError, OSError, ValueError):
+                when = None
+        if when is None:
+            # HTTP 日期（RFC 7231）→ datetime
+            try:
+                from email.utils import parsedate_to_datetime
+                when = parsedate_to_datetime(text).astimezone(
+                    timezone.utc).replace(tzinfo=None)
+            except Exception:
+                when = None
+        if when is not None and when > now:
+            return when
+    return None
 
 
 def _account_session_safe(db: Session, acc: Account) -> backend.AccountSession | None:
@@ -1651,7 +1801,7 @@ async def chat_completions(
                                     text = detail[:500].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:500]
                                     kind = _classify_error(r.status_code, text)
                                     _apply_account_policy(db2, acc_i, kind, r.status_code, text,
-                                                          model=m, reset_at=_parse_reset_at(text))
+                                                          model=m, reset_at=_reset_at_from_headers(getattr(r, "headers", None)) or _parse_reset_at(text))
                                     _maybe_degrade(db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
@@ -1729,7 +1879,7 @@ async def chat_completions(
                                 kind = _classify_error(200, text)
                                 if can_retry:
                                     _apply_account_policy(db2, acc_i, kind, 200, text[:500],
-                                                          model=m, reset_at=_parse_reset_at(text))
+                                                          model=m, reset_at=_reset_at_from_headers(getattr(r, "headers", None)) or _parse_reset_at(text))
                                     _maybe_degrade(db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
@@ -2009,7 +2159,7 @@ async def responses_proxy(
                                 text = r.text[:500]
                                 kind = _classify_error(r.status_code, text)
                                 _apply_account_policy(db2, acc_i, kind, r.status_code, text,
-                                                      model=m, reset_at=_parse_reset_at(text))
+                                                      model=m, reset_at=_reset_at_from_headers(getattr(r, "headers", None)) or _parse_reset_at(text))
                                 _maybe_degrade(db2, acc_i)
                                 sess_i.close()
                                 POOL.release(held_uid)
@@ -2152,7 +2302,7 @@ async def responses_proxy(
                                     text = detail[:500].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:500]
                                     kind = _classify_error(r.status_code, text)
                                     _apply_account_policy(db2, acc_i, kind, r.status_code, text,
-                                                          model=m, reset_at=_parse_reset_at(text))
+                                                          model=m, reset_at=_reset_at_from_headers(getattr(r, "headers", None)) or _parse_reset_at(text))
                                     _maybe_degrade(db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
@@ -2428,7 +2578,7 @@ async def anthropic_messages(
                                 text = r.text[:500]
                                 kind = _classify_error(r.status_code, text)
                                 _apply_account_policy(db2, acc_i, kind, r.status_code, text,
-                                                      model=m, reset_at=_parse_reset_at(text))
+                                                      model=m, reset_at=_reset_at_from_headers(getattr(r, "headers", None)) or _parse_reset_at(text))
                                 _maybe_degrade(db2, acc_i)
                                 sess_i.close()
                                 POOL.release(held_uid)
@@ -2574,7 +2724,7 @@ async def anthropic_messages(
                                     text = detail[:500].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:500]
                                     kind = _classify_error(r.status_code, text)
                                     _apply_account_policy(db2, acc_i, kind, r.status_code, text,
-                                                          model=m, reset_at=_parse_reset_at(text))
+                                                          model=m, reset_at=_reset_at_from_headers(getattr(r, "headers", None)) or _parse_reset_at(text))
                                     _maybe_degrade(db2, acc_i)
                                     sess_i.close()
                                     POOL.release(held_uid)
