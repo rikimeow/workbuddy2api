@@ -44,6 +44,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -84,11 +85,12 @@ GATE_TIERS: tuple[Tier, ...] = (
     Tier("deep-model", "多步推理、数学与逻辑推导、方案权衡、长上下文分析、疑难调试"),
 )
 
-#: 生效模式下允许透传给上游的模型 id 全集（= 三个档位）。
+#: 生效模式下允许透传给上游的模型 id 全集（= 档位的模型 id）。
 #:
-#: 校验时用的是这个集合而不是「全部已启用模型」：门限只允许在这三档之间选，
+#: 校验时用的是这个集合而不是「全部已启用模型」：门限只允许在档位之间选，
 #: 也**天然排除 `auto` 本身** —— 否则就等于把路由权又交回上游，门限被悄悄架空。
-_ALLOWED_MODELS = frozenset(t.model for t in GATE_TIERS)
+#: 档位可配后改用 `allowed_models()` 动态计算；这里保留常量作为**默认值**的固化视图。
+_DEFAULT_ALLOWED_MODELS = frozenset(t.model for t in GATE_TIERS)
 
 QUESTIONS: dict = {
     "capability": {
@@ -110,6 +112,196 @@ QUESTIONS: dict = {
         ),
     },
 }
+
+#: question key 与类型是**解析契约**，不可配置：
+#:   `_parse()` 按名字读 answers[...]，按类型取字段（choice 读 .choice/.confidence，
+#:   noul 读 .noul）。改名或改类型 → 解析失败 → 全部 fallback。
+#: 后台只能改 instructions 文案；下面的常量同时供后台 API 做校验。
+QUESTION_KEYS: tuple[str, ...] = ("capability", "needs_reasoning", "needs_long_context")
+QUESTION_TYPES: dict[str, str] = {k: v["type"] for k, v in QUESTIONS.items()}
+
+#: 档位数量边界。1 个档位没有选择余地；>4 个会让 Jev 的 Choice 判断发散。
+MIN_TIERS = 2
+MAX_TIERS = 4
+
+#: 合法的门限模式（供后台 API 校验，避免校验逻辑与 `gate_mode` 各写一份而漂移）。
+_MODE_VALID = ("off", "shadow", "on")
+
+# ---------------------------------------------------------------------------
+# 运行时配置（后台可改，DB > 环境变量 > 默认值）
+# ---------------------------------------------------------------------------
+#: SystemSetting 里的键名：一个 JSON 承载全部后台可配项。
+#:
+#: {
+#:   "mode": "off"|"shadow"|"on",
+#:   "api_key": "...", "base_url": "https://...", "model": "jev-latest",
+#:   "tiers": [{"model": "fast-model", "description": "..."}, ...],
+#:   "questions": {"capability": {"instructions": "..."}, ...}
+#: }
+#:
+#: 字段全部可选；缺省 = 用下一级来源。空串视为「清除该 DB 项」，退回下一级。
+CONFIG_KEY = "router_gate_config"
+
+#: DB 配置缓存时长（秒）。**只影响「别的进程改了值」的收敛延迟** ——
+#: 本进程保存时主动调 `invalidate()`，立即生效。单进程部署下基本用不到。
+_CFG_TTL = 30.0
+_cfg: dict | None = None
+_cfg_at = 0.0
+_cfg_lock = threading.Lock()
+
+
+def _load_cfg_raw(db=None) -> dict:
+    """从 SystemSetting 读原始配置 dict。失败/缺失/坏 JSON 一律返回 {}（退回下一级来源）。
+
+    **绝不抛异常**：配置读取在请求关键路径上，读不到只该退回默认值。
+    """
+    from admin.db import SessionLocal
+    from admin.models import SystemSetting
+
+    own = db is None
+    if own:
+        db = SessionLocal()
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == CONFIG_KEY).first()
+        if not row or not (row.value or "").strip():
+            return {}
+        obj = json.loads(row.value)
+        return obj if isinstance(obj, dict) else {}
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("router_gate 配置读取失败，按默认值处理：%s", e)
+        return {}
+    finally:
+        if own:
+            db.close()
+
+
+def _cfg_snapshot(db=None) -> dict:
+    """带 TTL 缓存的配置快照。"""
+    global _cfg, _cfg_at
+    now = time.time()
+    with _cfg_lock:
+        if _cfg is not None and (now - _cfg_at) < _CFG_TTL:
+            return _cfg
+    raw = _load_cfg_raw(db)
+    with _cfg_lock:
+        _cfg = raw
+        _cfg_at = time.time()
+        return _cfg
+
+
+def invalidate() -> None:
+    """清配置缓存**和会话判断缓存**。
+
+    判断缓存必须一起清：档位定义改了以后，缓存里的 `GateResult` 引用的还是旧档位，
+    继续用会让「后台改了没生效」，而且新旧档位混着用更糟。
+    """
+    global _cfg, _cfg_at
+    with _cfg_lock:
+        _cfg = None
+        _cfg_at = 0.0
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def effective_tiers(cfg: dict | None = None) -> tuple[Tier, ...]:
+    """生效的档位定义：DB 配置 > 内置默认。
+
+    只做**形状**过滤（非空 str），不在这里做策略校验 —— 策略校验属于写入时的
+    后台 API（要给出明确报错），读取路径只求「能用默认就用默认，坏数据不崩」。
+    """
+    cfg = cfg if cfg is not None else _cfg_snapshot()
+    raw = cfg.get("tiers")
+    if not isinstance(raw, list) or not (MIN_TIERS <= len(raw) <= MAX_TIERS):
+        return GATE_TIERS
+    out: list[Tier] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return GATE_TIERS
+        model = item.get("model")
+        desc = item.get("description")
+        if not isinstance(model, str) or not model.strip():
+            return GATE_TIERS
+        if not isinstance(desc, str) or not desc.strip():
+            return GATE_TIERS
+        out.append(Tier(model.strip(), desc.strip()))
+    # 重复档位 id 会让 criteria 静默覆盖、白名单丢档 → 视为坏配置，退回默认
+    if len({t.model for t in out}) != len(out):
+        return GATE_TIERS
+    return tuple(out)
+
+
+def effective_questions(cfg: dict | None = None) -> dict:
+    """生效的提问定义：档位可配 → `capability.criteria` 必须跟着重建。
+
+    key 与 type 固定（解析契约），只有 instructions 文案可被覆盖。
+    """
+    cfg = cfg if cfg is not None else _cfg_snapshot()
+    tiers = effective_tiers(cfg)
+    custom = cfg.get("questions") if isinstance(cfg.get("questions"), dict) else {}
+
+    out: dict = {
+        "capability": {
+            "type": "choice",
+            "instructions": QUESTIONS["capability"]["instructions"],
+            "criteria": {t.model: t.description for t in tiers},
+        },
+    }
+    for k in ("capability", "needs_reasoning", "needs_long_context"):
+        spec = custom.get(k)
+        if isinstance(spec, dict):
+            text = spec.get("instructions")
+            if isinstance(text, str) and text.strip():
+                out.setdefault(k, {"type": QUESTION_TYPES[k]})["instructions"] = text.strip()
+    for k in ("needs_reasoning", "needs_long_context"):
+        out.setdefault(k, {"type": QUESTION_TYPES[k],
+                           "instructions": QUESTIONS[k]["instructions"]})
+    return out
+
+
+def allowed_models(cfg: dict | None = None) -> frozenset[str]:
+    """生效的模型白名单（由档位派生）。
+
+    替代原先的模块级 `_ALLOWED_MODELS`：档位可配后必须动态计算。
+    仍**天然排除 `auto`** —— 只要写入时拒绝了 auto（后台 API 会拒），
+    这里就永远不含它，路由权不会被交回上游。
+    """
+    return frozenset(t.model for t in effective_tiers(cfg))
+
+
+#: 各配置项的**代码内置默认值**。用于 `resolve()` 判断「当前值到底来自环境变量
+#: 还是内置默认」——光比 `settings.X` 分不出来，因为 config.py 自己就带默认值。
+_DEFAULTS: dict[str, str] = {
+    "api_key": "",
+    "base_url": "https://api.typesafe.ai",
+    "mode": "off",
+    "model": DEFAULT_MODEL,
+}
+
+
+def resolve(name: str, cfg: dict | None = None) -> tuple[str, str]:
+    """解析一项运行时配置，返回 (值, 来源)。
+
+    来源：``db`` > ``env`` > ``default``。空串一律视为「未配置」而跳过，
+    这样后台把 key 清空就能干净地退回环境变量。
+
+    「来源」是给后台 UI 显示用的（用户要能看出「我到底在用后台值还是环境变量」），
+    所以 `env` 与 `default` 要分准：与内置默认值相同即报 `default`。
+    """
+    cfg = cfg if cfg is not None else _cfg_snapshot()
+    raw = cfg.get(name)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip(), "db"
+    env_map = {
+        "api_key": settings.TYPESAFE_API_KEY,
+        "base_url": settings.TYPESAFE_BASE_URL,
+        "mode": settings.ROUTER_GATE,
+        "model": DEFAULT_MODEL,
+    }
+    env_val = (env_map.get(name) or "").strip()
+    default = _DEFAULTS.get(name, "")
+    if env_val and env_val != default:
+        return env_val, "env"
+    return (env_val or default), "default"
 
 
 @dataclass
@@ -177,8 +369,18 @@ def _cache_ttl() -> int:
 
 
 def api_key() -> str:
-    """TypeSafe API Key（`TYPESAFE_API_KEY`）。为空时门限整体禁用。"""
-    return settings.TYPESAFE_API_KEY
+    """生效的 Jev API Key：后台配置 > `TYPESAFE_API_KEY`。为空时门限整体禁用。"""
+    return resolve("api_key")[0]
+
+
+def base_url() -> str:
+    """生效的 API 基址：后台配置 > `TYPESAFE_BASE_URL`（为兼容服务留的口子）。"""
+    return resolve("base_url")[0]
+
+
+def gate_model() -> str:
+    """生效的门限模型名：后台配置 > `jev-latest`。"""
+    return resolve("model")[0] or DEFAULT_MODEL
 
 
 #: 复用的 HTTP 客户端。**必须复用**：`httpx.post(...)` 每次调用都会新建 Client，
@@ -220,11 +422,15 @@ def close_client() -> None:
 def gate_mode(header_value: str | None = None) -> str:
     """决定这次请求走哪种门限模式：``off`` / ``shadow`` / ``on``。
 
-    优先级：请求头 > 环境变量。服务端 ``off`` 是锁死的 —— 客户端不能靠头打开。
-    非 off 时，请求头 ``X-Route-Mode: off`` 可**逐请求关闭**门限（逃生门：
-    环境是 on 时，个别客户端仍可要回纯上游 auto）；``on`` 逐请求强制生效。
+    优先级：请求头 > 服务端配置（后台 > 环境变量）。服务端 ``off`` 是锁死的 ——
+    客户端不能靠头打开。非 off 时，请求头 ``X-Route-Mode: off`` 可**逐请求关闭**
+    门限（逃生门：服务端是 on 时，个别客户端仍可要回纯上游 auto）；
+    ``on`` 逐请求强制生效。
+
+    **判定分支结构刻意与改造前逐字一致**，只把「env 值」换成 `resolve("mode")`
+    —— 现有 12 项 gate_mode 测试就是这条不变式的回归网。
     """
-    env = settings.ROUTER_GATE
+    env = resolve("mode")[0].strip().lower()
     if env in ("0", "off", "false", "no"):
         return "off"
     env_mode = "on" if env in ("on", "1", "true", "yes", "active") else "shadow"
@@ -363,12 +569,18 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
     if not state:
         return GateResult(active=False, shadow=shadow, fallback="empty_state")
 
+    # 一次取配置快照，保证同一次判断里的档位/提问/白名单来自**同一份配置**
+    # （分次取的话，中途被后台改配置会出现「按新档位提问、按旧白名单校验」的错配）
+    cfg = _cfg_snapshot()
+    questions = effective_questions(cfg)
+    whitelist = allowed_models(cfg)
+
     t0 = time.perf_counter()
     try:
         res = _client().post(
-            f"{settings.TYPESAFE_BASE_URL}{_GATE_PATH}",
+            f"{base_url()}{_GATE_PATH}",
             headers={"Authorization": f"Bearer {key}"},
-            json={"state": state, "model": DEFAULT_MODEL, "questions": QUESTIONS},
+            json={"state": state, "model": gate_model(), "questions": questions},
             # 超时逐请求传：客户端是长期复用的单例，而 settings 可能在运行期被改
             # （测试会改；.env 热改后重启也能生效）。把它烘进 Client 会读不到新值。
             timeout=_timeout(),
@@ -388,11 +600,12 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
                           fallback="bad_response")
 
     # 白名单校验：Jev 可能返回候选清单外的值（幻觉 / prompt 注入）。
-    # 注意校的是 `_ALLOWED_MODELS` 而不是全部已启用模型 —— 门限只认这三个档位。
+    # 注意校的是**生效档位集合**而不是全部已启用模型 —— 门限只认档位；
+    # 档位可配后由 `allowed_models(cfg)` 动态给出（写入时已拒绝 auto）。
     # `picked` 的类型必须先确认：它来自模型输出，可能是 null/数字/对象/数组，
     # 直接 `in frozenset` 会抛 TypeError: unhashable、直接切片会抛 TypeError
     # —— 两处都在上面那个 try 之外时就是实打实的 500。
-    if not isinstance(picked, str) or picked not in _ALLOWED_MODELS:
+    if not isinstance(picked, str) or picked not in whitelist:
         return GateResult(ms=ms, shadow=shadow, confidence=conf,
                           picked=str(picked)[:_MAX_PICKED],
                           fallback=f"not_allowed:{str(picked)[:32]}")

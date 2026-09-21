@@ -12,7 +12,8 @@ from admin.config import settings
 from admin.db import SessionLocal, init_db, wait_database_ready
 from admin.models import SystemSetting
 from admin.routers import (accounts, app_source, client_profile, groups, growth,
-                           keys, logs, models, proxy, schedules, stats, sync)
+                           keys, logs, models, proxy, router_gate, schedules,
+                           stats, sync)
 from admin.ratelimit import clear_failures, get_client_ip, is_locked, record_failure
 from admin.security import (
     create_admin_token,
@@ -72,6 +73,7 @@ app.include_router(stats.router)
 app.include_router(growth.router)
 app.include_router(client_profile.router)
 app.include_router(app_source.router)
+app.include_router(router_gate.router)
 
 
 @app.on_event("startup")

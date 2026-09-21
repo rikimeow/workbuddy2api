@@ -607,6 +607,95 @@
 
         <div id="appSourceMsg" class="text-sm text-slate-500 mt-3"></div>
       </div>
+
+      <!-- Jev 路由门限（接管 auto 的本地智能路由） -->
+      <div id="routerGateBlock" class="card p-5 mt-4">
+        <div class="flex flex-wrap justify-between items-center gap-2 mb-1">
+          <h3 class="text-sm font-medium"><i class="fa-solid fa-route mr-1"></i> 智能路由门限（Jev）</h3>
+          <span id="rgModeBadge" class="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">加载中…</span>
+        </div>
+        <p class="text-xs text-slate-400 mb-4">
+          用 TypeSafe Jev 判断请求需要哪档模型能力，再路由到对应档位，替代「把 auto 原样透传给上游」。
+          留空即用环境变量 / 默认值。<b>修改后立即生效（无需重启）</b>。
+        </p>
+
+        <!-- A. 运行模式 -->
+        <label class="block text-sm mb-1">运行模式</label>
+        <div class="flex flex-wrap gap-2 mb-2" id="rgModeRadios">
+          <label class="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg border cursor-pointer hover:bg-slate-50">
+            <input type="radio" name="rgMode" value="off" /> <span>关闭</span>
+            <span class="text-[11px] text-slate-400">完全不调用，零延迟</span>
+          </label>
+          <label class="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg border cursor-pointer hover:bg-slate-50">
+            <input type="radio" name="rgMode" value="shadow" /> <span>影子（只记录）</span>
+            <span class="text-[11px] text-slate-400">路由不变，判断写入日志</span>
+          </label>
+          <label class="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg border cursor-pointer hover:bg-slate-50" id="rgModeOnLabel">
+            <input type="radio" name="rgMode" value="on" /> <span>生效</span>
+            <span class="text-[11px] text-slate-400">按档位替换模型</span>
+          </label>
+        </div>
+        <div id="rgModeHint" class="text-[11px] text-slate-400 mb-3"></div>
+
+        <!-- B. 凭据 -->
+        <label class="block text-sm mb-1">API Key（TypeSafe Jev，或兼容服务的 Key）</label>
+        <div class="flex gap-2 mb-1">
+          <input id="rgApiKey" type="password" class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" placeholder="留空则用环境变量 TYPESAFE_API_KEY" />
+          <button onclick="rgToggleKey()" class="px-3 py-1.5 rounded-lg border text-sm" title="显示/隐藏"><i class="fa-solid fa-eye"></i></button>
+        </div>
+        <p id="rgKeyState" class="text-[11px] text-slate-400 mb-3"></p>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
+          <div>
+            <label class="block text-sm mb-1">API 基址</label>
+            <input id="rgBaseUrl" class="w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="留空 = https://api.typesafe.ai" />
+            <p class="text-[11px] text-slate-400 mt-1">换成兼容服务的地址即可对接其它 Jev 实现。</p>
+          </div>
+          <div>
+            <label class="block text-sm mb-1">门限模型</label>
+            <input id="rgModel" class="w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="留空 = jev-latest" />
+            <p class="text-[11px] text-slate-400 mt-1">钉住版本号（如 jev-1.13.0）可避免官方发版导致判断漂移。</p>
+          </div>
+        </div>
+
+        <!-- C. 档位定义 -->
+        <div class="border-t pt-3 mt-1 mb-3">
+          <div class="flex justify-between items-center mb-1">
+            <label class="text-sm font-medium">档位定义</label>
+            <button onclick="rgAddTier()" class="text-xs px-2 py-1 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-plus mr-1"></i>添加档位</button>
+          </div>
+          <p class="text-[11px] text-slate-400 mb-3">
+            每档 = 一个上游模型 id + 一段能力描述。<b>描述是判断质量的命门</b>：
+            Jev 靠它区分档位，写得越具体互斥越准（避免「好 / 一般 / 差」这类没边界的说法）。
+            模型 id 不能是 <code>auto</code>（那会把路由权交回上游）。
+          </p>
+          <div id="rgTiers" class="space-y-2"></div>
+          <div id="rgTierWarn" class="text-[11px] text-amber-600 mt-2"></div>
+        </div>
+
+        <!-- D. 提问文案 -->
+        <div class="border-t pt-3 mb-3">
+          <label class="text-sm font-medium">提问文案（instructions）</label>
+          <p class="text-[11px] text-slate-400 mb-3">
+            key 与题型由代码固定（解析契约，改了会读不到答案），<b>只能改措辞</b>。
+            措辞直接影响判断倾向，改完建议先用影子模式观察。
+          </p>
+          <div class="space-y-2" id="rgQuestions"></div>
+          <details class="mt-2">
+            <summary class="text-[11px] text-slate-400 cursor-pointer">查看最终发给 Jev 的 JSON</summary>
+            <pre id="rgJsonPreview" class="text-[11px] bg-slate-50 border rounded-lg p-2 mt-1 overflow-auto max-h-52 font-mono"></pre>
+          </details>
+        </div>
+
+        <!-- E. 操作 -->
+        <div class="flex flex-wrap gap-2 items-center">
+          <button onclick="rgSave()" class="px-3 py-1.5 rounded-lg btn-primary text-sm"><i class="fa-solid fa-floppy-disk mr-1"></i>保存</button>
+          <button onclick="rgTest()" class="px-3 py-1.5 rounded-lg border text-sm hover:bg-slate-50"><i class="fa-solid fa-plug mr-1"></i>测试连接</button>
+          <button onclick="rgReset()" class="px-3 py-1.5 rounded-lg border text-sm hover:bg-slate-50 text-red-600"><i class="fa-solid fa-rotate-left mr-1"></i>恢复默认</button>
+          <span id="rgMsg" class="text-sm text-slate-500"></span>
+        </div>
+        <div id="rgTestResult" class="text-xs mt-2"></div>
+      </div>
     </section>
   </main>
 </div>
@@ -917,6 +1006,7 @@ function activateTab(name, opts) {
   if (name === "usage") loadUsageStats();
   if (name === "client") loadClientProfile();
   if (name === "settings") loadAppSource();
+  if (name === "settings") loadRouterGate();
 }
 
 document.querySelectorAll(".tab-btn").forEach(b => b.onclick = () => activateTab(b.dataset.tab));
@@ -2728,6 +2818,182 @@ async function searchSource(){
         <span class="text-sky-600">${esc(h.file)}:${h.line}</span>
         <div class="text-slate-500 break-all">${esc(h.text)}</div>
       </div>`).join("");
+}
+
+/* ==================== Jev 路由门限 ==================== */
+let _rgState = null;          // 最近一次 GET 的结果
+const _RG_Q_LABELS = {        // question key → 中文标签（key 本身不可改）
+  capability:      "选择能力档位（Choice，决定路由）",
+  needs_reasoning: "是否需要多步推理（仅记录）",
+  needs_long_context: "是否需要长上下文（仅记录）",
+};
+
+async function loadRouterGate(){
+  const block = $("#routerGateBlock");
+  if(!block) return;
+  const r = await api("/api/router-gate");
+  if(!r.ok){
+    // 404 = 该功能在此版本不存在；整块隐藏，不给用户看死按钮
+    if(r.status === 404){ block.classList.add("hidden"); return; }
+    $("#rgMsg").innerHTML = `<span class="text-red-500">加载失败（HTTP ${r.status}）</span>`;
+    return;
+  }
+  block.classList.remove("hidden");
+  const d = await r.json();
+  _rgState = d;
+
+  // A. 模式
+  document.querySelectorAll('input[name="rgMode"]').forEach(el => { el.checked = (el.value === d.mode); });
+  const ON = '生效（按档位替换模型）', SH = '影子（只记录，路由不变）', OFF = '关闭';
+  const badge = $("#rgModeBadge");
+  if(d.mode === "on"){
+    badge.textContent = "已开启 · 生效中"; badge.className = "text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700";
+  } else if(d.mode === "shadow"){
+    badge.textContent = "影子模式"; badge.className = "text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700";
+  } else {
+    badge.textContent = "已关闭"; badge.className = "text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500";
+  }
+  // 「生效」需要 Key：没 Key 就禁用该选项并说明原因（服务端也会硬拒，这只是体验）
+  const onInput = document.querySelector('input[name="rgMode"][value="on"]');
+  if(onInput){
+    onInput.disabled = !d.can_enable;
+    $("#rgModeOnLabel").className = "flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg border " +
+      (d.can_enable ? "cursor-pointer hover:bg-slate-50" : "opacity-50 cursor-not-allowed");
+  }
+  $("#rgModeHint").innerHTML = d.can_enable
+    ? `当前来源：<code>${esc(d.mode_source)}</code>（db = 后台设置 / env = 环境变量 / default = 内置默认）`
+    : `<span class="text-amber-600">${esc(d.blocked_reason)}</span>`;
+  // radio 只需绑一次（loadRouterGate 可能被反复调用，避免叠加监听）
+  if(!document._rgModeBound){
+    document.querySelectorAll('input[name="rgMode"]').forEach(el =>
+      el.addEventListener("change", rgPreviewJson));
+    document._rgModeBound = true;
+  }
+
+  // B. 凭据：key 永不回显，只给掩码提示
+  $("#rgApiKey").value = "";
+  $("#rgApiKey").placeholder = d.api_key_configured
+    ? `已配置：${esc(d.api_key_masked)}（留空 = 不改动；输入新值可覆盖）`
+    : "留空则用环境变量 TYPESAFE_API_KEY";
+  $("#rgKeyState").innerHTML = d.api_key_configured
+    ? `Key 来源：<code>${esc(d.api_key_source)}</code>`
+    : `<span class="text-amber-600">未配置 Key —— 无法开启「生效」模式</span>`;
+  // 只读字段直接回显；可写字段留空表示「不改动」
+  $("#rgBaseUrl").placeholder = d.base_url ? `当前：${d.base_url}` : "留空 = https://api.typesafe.ai";
+  $("#rgBaseUrl").value = "";
+  $("#rgModel").placeholder = d.model ? `当前：${d.model}` : "留空 = jev-latest";
+  $("#rgModel").value = "";
+
+  // C. 档位
+  $("#rgTiers").innerHTML = "";
+  d.tiers.forEach(t => _rgAddTierRow(t.model, t.description));
+  $("#rgTierWarn").innerHTML = (d.warnings||[]).map(w => `<div>⚠ ${esc(w)}</div>`).join("");
+
+  // D. 提问文案（key 固定，只让改措辞）
+  $("#rgQuestions").innerHTML = Object.keys(d.questions).map(k => `
+    <div>
+      <div class="text-[11px] text-slate-500 mb-1"><code>${k}</code> · ${esc(_RG_Q_LABELS[k]||"")}</div>
+      <textarea data-rgq="${k}" rows="2" class="w-full border rounded-lg px-3 py-2 text-sm">${esc(d.questions[k])}</textarea>
+    </div>`).join("");
+  rgPreviewJson();
+}
+
+function _rgAddTierRow(model, desc){
+  const box = $("#rgTiers");
+  const row = document.createElement("div");
+  row.className = "rg-tier flex flex-col md:flex-row gap-2 items-start";
+  row.innerHTML = `
+    <input class="rg-tier-model border rounded-lg px-3 py-2 text-sm font-mono md:w-52" placeholder="模型 id（如 fast-model）" value="${esc(model||"")}" />
+    <textarea class="rg-tier-desc flex-1 border rounded-lg px-3 py-2 text-sm" rows="1" placeholder="能力描述（Jev 靠它区分档位，写具体、互斥）">${esc(desc||"")}</textarea>
+    <button class="text-xs px-2 py-1 rounded-lg border hover:bg-slate-50 text-red-600 whitespace-nowrap" title="删除该档位"><i class="fa-solid fa-trash"></i></button>`;
+  row.querySelector("button").onclick = () => { row.remove(); rgPreviewJson(); };
+  row.querySelectorAll("input,textarea").forEach(el => el.addEventListener("input", rgPreviewJson));
+  box.appendChild(row);
+}
+
+function rgAddTier(){
+  const n = $("#rgTiers").querySelectorAll(".rg-tier").length;
+  if(n >= (_rgState?.limits?.max_tiers || 4)){ toast(`最多 ${_rgState?.limits?.max_tiers||4} 个档位`,"err"); return; }
+  _rgAddTierRow("", "");
+  rgPreviewJson();
+}
+
+function _rgCollect(){
+  const tiers = [...$("#rgTiers").querySelectorAll(".rg-tier")].map(row => ({
+    model: (row.querySelector(".rg-tier-model")?.value || "").trim(),
+    description: (row.querySelector(".rg-tier-desc")?.value || "").trim(),
+  }));
+  const questions = {};
+  document.querySelectorAll("[data-rgq]").forEach(t => { questions[t.dataset.rgq] = t.value; });
+  return {
+    mode: document.querySelector('input[name="rgMode"]:checked')?.value || "off",
+    api_key: $("#rgApiKey").value.trim(),
+    base_url: $("#rgBaseUrl").value.trim(),
+    model: $("#rgModel").value.trim(),
+    tiers, questions,
+  };
+}
+
+function rgPreviewJson(){
+  // 预览「档位 + 提问」最终发给 Jev 的形状（只读，帮用户确认改对了）
+  const c = _rgCollect();
+  const criteria = {};
+  c.tiers.forEach(t => { if(t.model) criteria[t.model] = t.description; });
+  const preview = {
+    capability: { type: "choice", instructions: c.questions.capability || "", criteria },
+    needs_reasoning: { type: "noul", instructions: c.questions.needs_reasoning || "" },
+    needs_long_context: { type: "noul", instructions: c.questions.needs_long_context || "" },
+  };
+  const el = $("#rgJsonPreview");
+  if(el) el.textContent = JSON.stringify(preview, null, 2);
+}
+
+function rgToggleKey(){
+  const i = $("#rgApiKey");
+  if(i) i.type = i.type === "password" ? "text" : "password";
+}
+
+async function rgSave(){
+  const c = _rgCollect();
+  // 只把**用户填了值**的字段发出去：留空 = 不改动。
+  // 但档位与提问是整块提交（它们是列表/对象，不存在「局部不动」的语义）。
+  const body = { mode: c.mode, tiers: c.tiers, questions: c.questions };
+  if(c.api_key) body.api_key = c.api_key;          // 留空 = 不改
+  if(c.base_url) body.base_url = c.base_url;
+  if(c.model) body.model = c.model;
+
+  const r = await api("/api/router-gate", {
+    method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ toast(d.detail || "保存失败", "err"); return; }
+  toast("门限配置已保存");
+  $("#rgApiKey").value = "";
+  await loadRouterGate();
+}
+
+async function rgTest(){
+  const el = $("#rgTestResult");
+  el.innerHTML = '<span class="text-slate-400">测试中…</span>';
+  const r = await api("/api/router-gate/test", { method: "POST" });
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ el.innerHTML = `<span class="text-red-500">${esc(d.detail||"测试失败")}</span>`; return; }
+  if(d.ok){
+    const s = d.sample ? ` · 判为 <code>${esc(d.sample.picked)}</code>（置信度 ${d.sample.confidence}）` : "";
+    el.innerHTML = `<span class="text-emerald-600">✓ ${esc(d.detail)}（${d.latency_ms}ms）`
+      + ` · ${esc(d.base_url)} / ${esc(d.model)}</span>${s}`;
+  } else {
+    el.innerHTML = `<span class="text-red-500">✗ ${esc(d.detail)}`
+      + (d.latency_ms ? `（${d.latency_ms}ms）` : "") + `</span>`;
+  }
+}
+
+async function rgReset(){
+  if(!await uiConfirm({message:"清空后台门限配置，全部退回环境变量 / 默认值？", title:"恢复默认"})) return;
+  const r = await api("/api/router-gate/reset", { method: "POST" });
+  if(!r.ok){ toast("恢复失败","err"); return; }
+  toast("已恢复默认");
+  await loadRouterGate();
 }
 
 /* ==================== 设置 ==================== */
