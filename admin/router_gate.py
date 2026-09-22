@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -95,6 +96,20 @@ NIGHT_END_HOUR = 8
 #: 刻意很小 —— 目的是让 Jev 知道「在改什么东西」（类型/体量），不是让它读全文；
 #: 全文已由 request 之外的信息承载，而这里多发一个字都是**出境数据 + token 成本**。
 RECENT_OUTPUT_CHARS = 500
+
+#: 检测「用户指向了外部大材料」的正则（URL / 本地文件路径 / 飞书等文档链接）。
+#:
+#: 为什么需要它：`token_bucket` 只能测「消息文本有多长」，但**真实的长材料往往
+#: 不是贴在消息里，而是给个链接或文件路径**（实测本机 WorkBuddy 真实请求：
+#: 「https://meitu.feishu.cn/wiki/... 帮我总结这份文档」→ 65 字符 → 恒判 short）。
+#: 这类请求恰恰是 `hy4-preview`（长文档档）该服务的，光靠字符数永远测不出来。
+_EXTERNAL_REF_RE = re.compile(
+    r"https?://\S+"                          # URL（含各类文档/wiki 链接）
+    r"|[A-Za-z]:[\\/][^\s\"'，。；]+"          # Windows 绝对路径 C:\... 或 C:/...
+    r"|\\\\[^\s]+"                            # UNC 路径 \\server\share
+    r"|~[/\\][^\s\"'，。；]+"                  # ~/xxx
+    r"|(?:^|[\s，。；：])(?:\.\.?/)+[^\s\"'，。；]+"  # 相对路径 ./xxx ../xxx
+)
 
 
 @dataclass(frozen=True)
@@ -629,6 +644,7 @@ def extract_state(body: dict) -> dict:
       * ``is_refinement``—— 是否在「多轮迭代同一份产出」（见 `_turn_info`）
       * ``recent_output``—— 上一条 assistant 回复的开头（≤500 字符），
         仅在 `is_refinement` 为真时有值；让 Jev 能看到「在改什么东西」
+      * ``has_external_ref``—— 请求是否提到外部材料（URL / 文件路径）
       * ``time``        —— 本地时间 HH:MM
       * ``is_night``    —— 是否在夜间免费时段（默认 23:00~08:00）
       * ``token_bucket``—— short / medium / long（按字符数分档）
@@ -643,6 +659,7 @@ def extract_state(body: dict) -> dict:
         "turn_index": turn_index,
         "is_refinement": is_refinement,
         "recent_output": _recent_output(body) if is_refinement else "",
+        "has_external_ref": _has_external_ref(body),
         "time": _now_hhmm(),
         "is_night": _is_night(),
         "token_bucket": _token_bucket(body),
@@ -720,6 +737,23 @@ def _recent_output(body: dict) -> str:
             if text.strip():
                 return text[:RECENT_OUTPUT_CHARS]
     return ""
+
+
+def _has_external_ref(body: dict) -> bool:
+    """请求里是否提到外部材料（URL / 文件路径）。
+
+    只看**最后一条 user 消息**：判断「本次请求是否指向外部材料」，历史消息里的
+    链接不代表这次要读它（agentic 会话里历史会累积大量链接）。
+
+    这是对 `token_bucket` 的补充而非替代：
+      * `token_bucket` 测「消息文本有多长」（贴了大段材料时有效）
+      * `has_external_ref` 测「是否指向了外部材料」（给链接/路径时有效）
+    真实长文档任务常是后者，光看字符数会系统性漏判（见 `_EXTERNAL_REF_RE`）。
+    """
+    text = _last_user_text(body)
+    if not text:
+        return False
+    return bool(_EXTERNAL_REF_RE.search(text))
 
 
 def _last_user_text(body: dict) -> str:
