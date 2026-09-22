@@ -436,15 +436,28 @@ import itertools
 _CHAT_SEQ = itertools.count(1)
 
 
-def _log_chat_row(ttfb_ms, latency_ms, model, mode, uid, status, toks, error_kind=""):
-    """向 stdout 打印一行表格日志，便于排查慢请求与风控。"""
+def _log_chat_row(ttfb_ms, latency_ms, model, mode, uid, status, toks, error_kind="",
+                  completion_tokens=None):
+    """向 stdout 打印一行表格日志，便于排查慢请求与风控。
+
+    `toks` 是**总 token**（输入+输出，用于显示规模）。
+    `t/s` 必须用**输出 token ÷ 生成耗时** —— 踩过的坑：早期直接拿
+    `toks / latency_ms`，分子含输入、分母含等首字节的时间，于是
+    「72 万输入 + 142 输出」的请求被算成 `116523 t/s`（虚高 3 个数量级）。
+    现在：优先用传入的 `completion_tokens`；拿不到时**不出 t/s**（显示 "-"），
+    宁可不显示也不要给一个误导性的数字。
+    """
     seq = next(_CHAT_SEQ)
     now = datetime.now().strftime("%H:%M:%S")
     model = (model or "-")[:11]
     tok_field = "-" if toks is None else str(toks)
     tps = "-"
-    if toks is not None and latency_ms and latency_ms > 0:
-        tps = f"{toks * 1000 / latency_ms:.1f}"
+    # 生成耗时 = 总耗时 - 首字节等待；两者都有值且为正才算
+    if (completion_tokens is not None and completion_tokens > 0
+            and latency_ms and latency_ms > 0):
+        gen_ms = latency_ms - (ttfb_ms or 0)
+        if gen_ms > 0:
+            tps = f"{completion_tokens * 1000 / gen_ms:.1f}"
     ttfb = "-" if ttfb_ms is None or ttfb_ms <= 0 else f"{ttfb_ms}ms"
     uid_prefix = (uid or "-")[:8]
     latency = f"{latency_ms}ms" if latency_ms is not None else "-"
@@ -2090,7 +2103,8 @@ async def chat_completions(
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
                             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
                             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, mode, final_uid,
-                                                status_out, total_toks, error_kind="success")
+                                                status_out, total_toks, error_kind="success",
+                                                completion_tokens=usage["completion_tokens"])
                             # 粘性跟随最终成功号：让多轮对话收敛到「对该会话持续成功」
                             # 的那个账号，而不是每轮重新抽签。
                             if sticky_key and held_uid:
@@ -2538,7 +2552,8 @@ async def responses_proxy(
                             total_toks = usage["total_tokens"] or usage["completion_tokens"]
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
                             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
-                            seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "resp", final_uid, 200, total_toks, error_kind="success")
+                            seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "resp", final_uid, 200, total_toks, error_kind="success",
+                                                completion_tokens=cost_info["completion_tokens"])
                             updated = sess_i.updated_json()
                             sess_i.close()
                             if sticky_key and held_uid:
@@ -2973,7 +2988,8 @@ async def anthropic_messages(
                             latency_ms = int((time.perf_counter() - request_start) * 1000)
                             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
                             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "anthropic", final_uid, 200,
-                                                total_toks, error_kind="success")
+                                                total_toks, error_kind="success",
+                                                completion_tokens=usage["completion_tokens"])
                             updated = sess_i.updated_json()
                             sess_i.close()
                             if sticky_key and held_uid:
