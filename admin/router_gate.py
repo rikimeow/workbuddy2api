@@ -356,6 +356,182 @@ def resolve(name: str, cfg: dict | None = None) -> tuple[str, str]:
     return (env_val or default), "default"
 
 
+# ---------------------------------------------------------------------------
+# 门限服务分组（providers）
+# ---------------------------------------------------------------------------
+#: 一个门限服务分组：一套独立的 (Key, 基址, 模型)。
+#:
+#: 存在的意义是**备份与切换**：官方 TypeSafe 抖动或限流时，可以切到同一门限
+#: 模型的其他托管方（实测硅基流动的 `Kev-4B` 与官方 Jev 判断高度一致，见
+#: AGENTS.md「门限服务分组」一节），而不用改代码、不用重启。
+@dataclass(frozen=True)
+class Provider:
+    """一个门限服务分组。`api_key` 为空 = 该组不可用。"""
+
+    id: str
+    name: str
+    api_key: str
+    base_url: str
+    model: str
+    #: 关掉的组不参与 failover（但仍可被手动选中，便于排查）。
+    enabled: bool = True
+    #: 是否为「代码内置、由环境变量派生」的官方组（供后台区分显示）。
+    builtin: bool = False
+
+    @property
+    def usable(self) -> bool:
+        """能不能拿去发请求：有 Key + 有基址（模型缺省走 DEFAULT_MODEL）。"""
+        return bool(self.api_key and self.base_url)
+
+
+#: 官方组的固定 id —— 表单里首次出现时用它，且它有一个特殊语义：
+#: 未单独填 Key 时**继承 `TYPESAFE_API_KEY` 环境变量**，这样已配好 env 的
+#: 部署切成 providers 结构后不用重新录一次 Key。
+DEFAULT_PROVIDER_ID = "typesafe"
+
+#: 后台存进 DB 的 providers 结构里，每个分组的字段名。
+PROVIDER_FIELDS = ("id", "name", "api_key", "base_url", "model", "enabled")
+
+#: 分组数量上限（工程取舍：真正会用手动切换的备份不会多，列表越长越难维护）。
+MAX_PROVIDERS = 8
+
+#: failover 时，**每个后续候选**额外获得的尝试窗口（秒）。
+#:
+#: 它不是候选的超时（超时预算另算），而是「还值得再试一次」的判据：
+#: 设 0 就等于「主候选失败即放弃」，备份形同虚设。0.8s 是实测取值 ——
+#: 同一门限模型跨托管商（官方 vs 硅基流动）的成功调用耗时都在 ~0.9-1.3s，
+#: 而 0.8s 足以覆盖「连接已建立、只是响应偏慢」的常见情形，
+#: 又不至于让用户在失败路径上多等一个数量级。
+FAILOVER_TRY = 0.8
+
+#: 用户很可能把**完整端点**填进 `base_url`（官方文档给的 base_url 就是
+#: `https://.../v1/systemone`）。而代码会再拼一次 `_GATE_PATH`，于是变成
+#: `.../v1/systemone/v1/systemone` → 404。实测确认过这个 404，所以这里做容错：
+#: 填完整端点、或只填域名，两种写法都能用。
+_ENDPOINT_SUFFIX_RE = re.compile(r"/v1/systemone/?$", re.IGNORECASE)
+
+
+def normalize_base_url(url: str) -> str:
+    """把「域名」或「完整端点」统一成基址（去掉 `/v1/systemone` 后缀与尾斜杠）。"""
+    u = (url or "").strip()
+    u = _ENDPOINT_SUFFIX_RE.sub("", u)
+    return u.rstrip("/")
+
+
+def _legacy_values(cfg: dict) -> tuple[str, str, str]:
+    """遗留的单组扁平配置 `(api_key, base_url, model)`。
+
+    老的 DB 配置（以及只有环境变量的部署）用的就是这三个扁平字段。
+    保留它作为「没有 providers 时的唯一分组」，**老配置无需迁移**即可继续工作。
+    """
+    key = resolve("api_key", cfg)[0]
+    url = normalize_base_url(resolve("base_url", cfg)[0])
+    model = resolve("model", cfg)[0] or DEFAULT_MODEL
+    return key, url, model
+
+
+def _coerce_provider(item: dict, existing: dict[str, "Provider"] | None = None) -> Provider | None:
+    """把 DB 里一条分组记录转成 `Provider`；形状不合格返回 None（跳过而非崩）。
+
+    `api_key` 为空的处理（三条例外，都是有意的）：
+      1. 是**掩码**（含 `****`）→ 当作空。后台只会把掩码发给前端，若前端照原样回传，
+         不拦就会把 `sk-xxxx****yyyy` 这串假 Key 存成真 Key，之后每次调用都 401。
+      2. 同 id 的旧记录里有 Key → 沿用。这是「空串 = 不改动」在分组粒度上的延续：
+         前端拿不回明文，不做这个合并就会**一保存就把 Key 抹掉**。
+      3. 官方组（`DEFAULT_PROVIDER_ID`）且仍然为空 → 继承 `TYPESAFE_API_KEY` 环境变量。
+    """
+    pid = str(item.get("id") or "").strip()
+    if not pid:
+        return None
+    key = str(item.get("api_key") or "").strip()
+    if "****" in key:
+        key = ""
+    if not key and existing and pid in existing:
+        key = existing[pid].api_key
+    if not key and pid == DEFAULT_PROVIDER_ID:
+        key = (settings.TYPESAFE_API_KEY or "").strip()
+    model = str(item.get("model") or "").strip() or DEFAULT_MODEL
+    return Provider(
+        id=pid,
+        name=(str(item.get("name") or "").strip() or pid),
+        api_key=key,
+        base_url=normalize_base_url(str(item.get("base_url") or "")),
+        model=model,
+        enabled=bool(item.get("enabled", True)),
+    )
+
+
+def effective_providers(cfg: dict | None = None) -> tuple[Provider, ...]:
+    """生效的分组列表。**永远非空** —— 没有配就退回「官方单组」。
+
+    DB 里的 `providers` 只做形状过滤（同 `effective_tiers` 的思路）：
+    坏数据跳过、全坏则整体退回默认，而不是让请求路径崩在配置上。
+    """
+    cfg = cfg if cfg is not None else _cfg_snapshot()
+    raw = cfg.get("providers")
+    if isinstance(raw, list) and raw:
+        # 先建一份「旧记录」索引：合并被掩码挡掉的 Key 时，同 id 的那条记录
+        # 就是上一轮存的真 Key 所在。注意 Key 已是明文，所以只需一轮就能建好。
+        old: dict[str, Provider] = {}
+        for item in raw:
+            if isinstance(item, dict):
+                p = _coerce_provider(item, None)
+                if p is not None:
+                    old.setdefault(p.id, p)
+        out: list[Provider] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            p = _coerce_provider(item, old)
+            if p is None or p.id in seen:
+                continue          # 缺 id / 重复 id：跳过（写入时已硬拦，这里只兜底）
+            seen.add(p.id)
+            out.append(p)
+        if out:
+            return tuple(out[:MAX_PROVIDERS])
+    key, url, model = _legacy_values(cfg)
+    return (Provider(id=DEFAULT_PROVIDER_ID, name="官方 (TypeSafe)",
+                     api_key=key, base_url=url, model=model,
+                     enabled=True, builtin=True),)
+
+
+def active_provider_id(cfg: dict | None = None) -> str:
+    """当前选中的分组 id。选中的组不存在时退回第一个（而不是报错）。"""
+    cfg = cfg if cfg is not None else _cfg_snapshot()
+    want = str(cfg.get("active_provider") or "").strip()
+    provs = effective_providers(cfg)
+    if want and any(p.id == want for p in provs):
+        return want
+    return provs[0].id
+
+
+def active_provider(cfg: dict | None = None) -> Provider:
+    """当前生效的分组。"""
+    provs = effective_providers(cfg)
+    want = active_provider_id(cfg)
+    for p in provs:
+        if p.id == want:
+            return p
+    return provs[0]
+
+
+def failover_candidates(cfg: dict | None = None) -> tuple[Provider, ...]:
+    """按尝试顺序返回候选分组：**当前选中组排第一**，其余可用的组依次兜底。
+
+    只纳入 `usable`（有 Key + 基址）且 `enabled` 的组 —— 没配 Key 的组拿去也是
+    必然失败，白等一个超时。
+    """
+    cfg = cfg if cfg is not None else _cfg_snapshot()
+    provs = effective_providers(cfg)
+    active = active_provider(cfg)
+    out = [active] if active.usable else []
+    for p in provs:
+        if p.id != active.id and p.usable and p.enabled:
+            out.append(p)
+    return tuple(out)
+
+
 @dataclass
 class GateResult:
     """一次门限判断的结果。`active=False` 表示「不生效，请按原 auto 走」。"""
@@ -412,6 +588,26 @@ def _timeout() -> float:
     return max(0.2, settings.ROUTER_GATE_TIMEOUT)
 
 
+def _candidate_timeout(t0: float, idx: int, n: int) -> float | None:
+    """第 `idx` 个候选可用的超时（秒）；返回 None = 预算已耗尽，不要再试。
+
+    预算模型（为什么不是「总预算对所有候选平均分」）：
+      * **主候选拿完整 `_timeout()`** —— 加备份不该让主组的判断被更早掐断
+        （那会凭空制造超时、降低判断质量）。单候选时结果与改动前逐字相同；
+      * 每个**后续**候选额外获得 `FAILOVER_TRY` 的尝试窗口，所以最坏总耗时是
+        `_timeout() + FAILOVER_TRY × (n-1)`。2 组时 = 2.5 + 0.8 = 3.3s，
+        只比改动前多 0.8s，且**仅当主组真的失败时才发生**。
+      * 早先的实现是「共享一个总预算」，那会有一个致命后果：主候选超时用光预算后
+        后续候选的剩余额度被钳到最小值，条件恒真 → **超时场景下永不兜底**，
+        而「主组抖动/超时」恰恰是最需要备份的场景。
+    """
+    if idx == 0:
+        return _timeout()
+    total = _timeout() + FAILOVER_TRY * max(0, n - 1)
+    left = total - (time.perf_counter() - t0)
+    return left if left > 0.05 else None
+
+
 def _max_chars() -> int:
     return max(200, settings.ROUTER_GATE_MAX_CHARS)
 
@@ -429,18 +625,23 @@ def _min_conf() -> float:
 
 
 def api_key() -> str:
-    """生效的 Jev API Key：后台配置 > `TYPESAFE_API_KEY`。为空时门限整体禁用。"""
-    return resolve("api_key")[0]
+    """**当前生效分组**的 Key，为空时门限整体禁用。
+
+    改为「读 active provider」的原因：`TYPESAFE_API_KEY` 与这组三元组原先各读各的，
+    配了分组之后若还从这里取 env 值，就会出现「用 A 组的 Key 打 B 组的基址」——
+    必然 401，而且报错信息不会提示这个错配。
+    """
+    return active_provider().api_key
 
 
 def base_url() -> str:
-    """生效的 API 基址：后台配置 > `TYPESAFE_BASE_URL`（为兼容服务留的口子）。"""
-    return resolve("base_url")[0]
+    """**当前生效分组**的 API 基址（已归一化，去掉 `/v1/systemone` 后缀）。"""
+    return active_provider().base_url
 
 
 def gate_model() -> str:
-    """生效的门限模型名：后台配置 > `jev-latest`。"""
-    return resolve("model")[0] or DEFAULT_MODEL
+    """**当前生效分组**的门限模型名。"""
+    return active_provider().model or DEFAULT_MODEL
 
 
 #: 复用的 HTTP 客户端。**必须复用**：`httpx.post(...)` 每次调用都会新建 Client，
@@ -873,9 +1074,9 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
     active = mode == "on"
     shadow = mode == "shadow"
 
-    key = api_key()
-    if not key:
-        return GateResult(active=False, shadow=shadow, fallback="no_api_key")
+    # 一次取配置快照，保证同一次判断里的分组/档位/提问/白名单来自**同一份配置**
+    # （分次取的话，中途被后台改配置会出现「按新档位提问、按旧白名单校验」的错配）
+    cfg = _cfg_snapshot()
 
     ck = sticky_key or cache_key(body)
     cached = _cache_get(ck)
@@ -889,41 +1090,73 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
             model=cached.picked if active else "",
         )
 
+    # 候选分组：当前选中的排第一，其余可用的依次兜底（见 `failover_candidates`）。
+    # 没有任何可用分组（都没配 Key）= 门限整体禁用，与原来的 `no_api_key` 同义。
+    candidates = failover_candidates(cfg)
+    if not candidates:
+        return GateResult(active=False, shadow=shadow, fallback="no_api_key")
+
     state = extract_state(body)
     # state 现在是 dict（含 time/token_bucket/模态等旁路字段），所以要看
     # `request` 是否真的有内容 —— 空请求没必要花一次 Jev 调用。
     if not state.get("request"):
         return GateResult(active=False, shadow=shadow, fallback="empty_state")
 
-    # 一次取配置快照，保证同一次判断里的档位/提问/白名单来自**同一份配置**
-    # （分次取的话，中途被后台改配置会出现「按新档位提问、按旧白名单校验」的错配）
-    cfg = _cfg_snapshot()
     questions = effective_questions(cfg)
     whitelist = allowed_models(cfg)
 
     t0 = time.perf_counter()
-    try:
-        res = _client().post(
-            f"{base_url()}{_GATE_PATH}",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"state": state, "model": gate_model(), "questions": questions},
-            # 超时逐请求传：客户端是长期复用的单例，而 settings 可能在运行期被改
-            # （测试会改；.env 热改后重启也能生效）。把它烘进 Client 会读不到新值。
-            timeout=_timeout(),
-        )
-        ms = int((time.perf_counter() - t0) * 1000)
-        if res.status_code != 200:
-            return GateResult(ms=ms, shadow=shadow, fallback=f"http_{res.status_code}")
-        picked, conf, reasoning, long_ctx = _parse(res.json())
-    except httpx.TimeoutException:
-        return GateResult(ms=int((time.perf_counter() - t0) * 1000), shadow=shadow,
-                          fallback="timeout")
-    except Exception as exc:  # noqa: BLE001
-        # 网络异常与响应形状异常都归到这里：**任何**非预期情况都不许抛出，
-        # 否则会一路冒到端点变成 500（端点没有 try，admin/server.py 也没有全局 handler）。
-        _logger.warning("门限调用/解析失败：%s", exc)
-        return GateResult(ms=int((time.perf_counter() - t0) * 1000), shadow=shadow,
-                          fallback="bad_response")
+    ms = 0
+    failed: list[str] = []
+    picked = conf = reasoning = long_ctx = None
+    for i, prov in enumerate(candidates):
+        # 预算已耗尽就不再试（见 `_candidate_timeout` 的说明）。
+        remaining = _candidate_timeout(t0, i, len(candidates))
+        if remaining is None:
+            failed.append("budget_exhausted")
+            break
+        try:
+            res = _client().post(
+                f"{prov.base_url}{_GATE_PATH}",
+                headers={"Authorization": f"Bearer {prov.api_key}"},
+                json={"state": state, "model": prov.model or DEFAULT_MODEL,
+                      "questions": questions},
+                # 超时逐请求传：客户端是长期复用的单例，而 settings 可能在运行期被改
+                # （测试会改；.env 热改后重启也能生效）。把它烘进 Client 会读不到新值。
+                timeout=remaining,
+            )
+            ms = int((time.perf_counter() - t0) * 1000)
+            if res.status_code != 200:
+                failed.append(f"http_{res.status_code}")
+                _logger.warning("门限分组「%s」返回 HTTP %s，尝试下一个候选",
+                                prov.id, res.status_code)
+                continue
+            picked, conf, reasoning, long_ctx = _parse(res.json())
+            break
+        except httpx.TimeoutException:
+            ms = int((time.perf_counter() - t0) * 1000)
+            failed.append("timeout")
+            _logger.warning("门限分组「%s」超时，尝试下一个候选", prov.id)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            # 网络异常与响应形状异常都归到这里：**任何**非预期情况都不许抛出，
+            # 否则会一路冒到端点变成 500（端点没有 try，admin/server.py 也没有全局 handler）。
+            ms = int((time.perf_counter() - t0) * 1000)
+            failed.append("bad_response")
+            _logger.warning("门限分组「%s」调用/解析失败：%s", prov.id, exc)
+            continue
+
+    if picked is None:
+        # 全部候选都失败。**只有一个候选时原因保持裸字符串**（`http_500` / `timeout` …），
+        # 因为那是既有日志特征：AGENTS.md 与排障习惯都按裸值写的，
+        # 加了前缀会让「老问题突然搜不到」。多候选时才带组名前缀 —— 那时
+        # 「哪个组失败」才是必要信息，`gate_note` 列宽 255 也放得下紧凑列表。
+        if len(candidates) == 1:
+            detail = failed[0] if failed else "no_candidate"
+        else:
+            detail = ";".join(f"{p.id}:{why}" for p, why
+                             in zip(candidates, failed))[:200] or "no_candidate"
+        return GateResult(ms=ms, shadow=shadow, fallback=detail)
 
     # 白名单校验：Jev 可能返回候选清单外的值（幻觉 / prompt 注入）。
     # 注意校的是**生效档位集合**而不是全部已启用模型 —— 门限只认档位；

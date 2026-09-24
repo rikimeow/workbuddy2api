@@ -637,25 +637,21 @@
         </div>
         <div id="rgModeHint" class="text-[11px] text-slate-400 mb-3"></div>
 
-        <!-- B. 凭据 -->
-        <label class="block text-sm mb-1">API Key（TypeSafe Jev，或兼容服务的 Key）</label>
-        <div class="flex gap-2 mb-1">
-          <input id="rgApiKey" type="password" class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" placeholder="留空则用环境变量 TYPESAFE_API_KEY" />
-          <button onclick="rgToggleKey()" class="px-3 py-1.5 rounded-lg border text-sm" title="显示/隐藏"><i class="fa-solid fa-eye"></i></button>
-        </div>
-        <p id="rgKeyState" class="text-[11px] text-slate-400 mb-3"></p>
-
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
-          <div>
-            <label class="block text-sm mb-1">API 基址</label>
-            <input id="rgBaseUrl" class="w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="留空 = https://api.typesafe.ai" />
-            <p class="text-[11px] text-slate-400 mt-1">换成兼容服务的地址即可对接其它 Jev 实现。</p>
+        <!-- B. 门限服务分组（providers） -->
+        <div class="border-t pt-3 mt-1 mb-3">
+          <div class="flex justify-between items-center mb-1">
+            <label class="text-sm font-medium">门限服务分组</label>
+            <button onclick="rgAddProvider()" class="text-xs px-2 py-1 rounded-lg border hover:bg-slate-50"><i class="fa-solid fa-plus mr-1"></i>添加分组</button>
           </div>
-          <div>
-            <label class="block text-sm mb-1">门限模型</label>
-            <input id="rgModel" class="w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="留空 = jev-latest" />
-            <p class="text-[11px] text-slate-400 mt-1">钉住版本号（如 jev-1.13.0）可避免官方发版导致判断漂移。</p>
-          </div>
+          <p class="text-[11px] text-slate-400 mb-3">
+            每组 = 一套 <b>Key + 基址 + 模型</b>（如官方 TypeSafe 一组、兼容服务一组）。
+            <b>单选决定用哪组</b>；选中的组调用失败时会<b>自动兜底</b>到其它勾了「参与兜底」的可用组，
+            所以备份组平时也可以留着。<b>Key 永不回显</b>（只给掩码），留空 = 不改动。<br />
+            基址填域名即可（如 <code>https://api.siliconflow.cn</code>）；
+            填成完整端点（<code>.../v1/systemone</code>）会自动纠正，不会拼成重复路径。
+          </p>
+          <div id="rgProviders" class="space-y-2"></div>
+          <div id="rgProviderWarn" class="text-[11px] text-amber-600 mt-2"></div>
         </div>
 
         <!-- C. 档位定义 -->
@@ -2871,19 +2867,13 @@ async function loadRouterGate(){
     document._rgModeBound = true;
   }
 
-  // B. 凭据：key 永不回显，只给掩码提示
-  $("#rgApiKey").value = "";
-  $("#rgApiKey").placeholder = d.api_key_configured
-    ? `已配置：${esc(d.api_key_masked)}（留空 = 不改动；输入新值可覆盖）`
-    : "留空则用环境变量 TYPESAFE_API_KEY";
-  $("#rgKeyState").innerHTML = d.api_key_configured
-    ? `Key 来源：<code>${esc(d.api_key_source)}</code>`
-    : `<span class="text-amber-600">未配置 Key —— 无法开启「生效」模式</span>`;
-  // 只读字段直接回显；可写字段留空表示「不改动」
-  $("#rgBaseUrl").placeholder = d.base_url ? `当前：${d.base_url}` : "留空 = https://api.typesafe.ai";
-  $("#rgBaseUrl").value = "";
-  $("#rgModel").placeholder = d.model ? `当前：${d.model}` : "留空 = jev-latest";
-  $("#rgModel").value = "";
+  // B. 分组
+  $("#rgProviders").innerHTML = "";
+  (d.providers||[]).forEach(p => _rgAddProviderRow(p));
+  if(!(d.providers||[]).length){  // 理论上服务端永远至少给一组；兜底防白屏
+    _rgAddProviderRow({id:"typesafe", name:"官方 (TypeSafe)", base_url:"https://api.typesafe.ai", model:"jev-latest", enabled:true});
+  }
+  rgSyncProviderPicker();
 
   // C. 档位
   $("#rgTiers").innerHTML = "";
@@ -2919,6 +2909,82 @@ function rgAddTier(){
   rgPreviewJson();
 }
 
+// ---- 分组（providers） ----
+function _rgAddProviderRow(p){
+  p = p || {};
+  const box = $("#rgProviders");
+  const row = document.createElement("div");
+  row.className = "rg-prov border rounded-lg p-2.5 bg-slate-50/60 space-y-2";
+  row.dataset.pid = p.id || "";
+  row.innerHTML = `
+    <div class="flex items-center gap-2 flex-wrap">
+      <input type="radio" name="rgActiveProv" class="rg-prov-active mt-0.5" title="选为当前使用的分组" />
+      <input class="rg-prov-name border rounded-lg px-2 py-1 text-sm w-40" placeholder="显示名（如 硅基流动）" value="${esc(p.name||"")}" />
+      <input class="rg-prov-id border rounded-lg px-2 py-1 text-sm font-mono w-36" placeholder="id（唯一，如 sf）" value="${esc(p.id||"")}" />
+      <label class="text-xs flex items-center gap-1 text-slate-600" title="关掉后不参与自动兜底（仍可手动选中）">
+        <input type="checkbox" class="rg-prov-enabled" ${p.enabled===false?"":"checked"} />参与兜底
+      </label>
+      <span class="rg-prov-state text-[11px]"></span>
+      <button class="rg-prov-test text-xs px-2 py-1 rounded-lg border hover:bg-white ml-auto" title="只测这一组"><i class="fa-solid fa-plug mr-1"></i>测试本组</button>
+      <button class="rg-prov-del text-xs px-2 py-1 rounded-lg border hover:bg-white text-red-600" title="删除该分组"><i class="fa-solid fa-trash"></i></button>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+      <input type="password" class="rg-prov-key border rounded-lg px-2 py-1 text-sm font-mono md:col-span-2"
+             placeholder="${p.api_key_configured ? "已配置："+esc(p.api_key_masked||"")+"（留空 = 不改动）" : "API Key（留空则用环境变量）"}" />
+      <input class="rg-prov-model border rounded-lg px-2 py-1 text-sm font-mono"
+             placeholder="模型（如 jev-latest / Kev-4B）" value="${esc(p.model||"")}" />
+    </div>
+    <input class="rg-prov-url border rounded-lg px-2 py-1 text-sm font-mono w-full"
+           placeholder="API 基址（如 https://api.siliconflow.cn）" value="${esc(p.base_url||"")}" />
+    <div class="rg-prov-result text-[11px]"></div>`;
+
+  // 当前生效组
+  const radio = row.querySelector(".rg-prov-active");
+  radio.checked = (p.id === _rgState?.active_provider);
+  radio.addEventListener("change", rgSyncProviderPicker);
+  row.querySelector(".rg-prov-del").onclick = () => {
+    if($("#rgProviders").querySelectorAll(".rg-prov").length <= 1){ toast("至少保留一个分组","err"); return; }
+    row.remove(); rgSyncProviderPicker(); rgPreviewJson();
+  };
+  row.querySelector(".rg-prov-test").onclick = () => rgTestProvider(row);
+  box.appendChild(row);
+}
+
+function rgAddProvider(){
+  const n = $("#rgProviders").querySelectorAll(".rg-prov").length;
+  const mx = _rgState?.limits?.max_providers || 8;
+  if(n >= mx){ toast(`最多 ${mx} 个分组`,"err"); return; }
+  _rgAddProviderRow({enabled:true});
+}
+
+function rgSyncProviderPicker(){
+  // 选中的那个分组决定 `active_provider`；没有勾选时由服务端退回第一个分组。
+  const rows = [...$("#rgProviders").querySelectorAll(".rg-prov")];
+  rows.forEach(r => {
+    const on = r.querySelector(".rg-prov-active").checked;
+    r.classList.toggle("ring-2", on);
+    r.classList.toggle("ring-emerald-300", on);
+    r.querySelector(".rg-prov-state").innerHTML = on
+      ? '<span class="text-emerald-600">当前使用</span>' : "";
+  });
+}
+
+function _rgProviderId(row){
+  // id 留空时用显示名兜底，好让「只填了名字」的组也能存下去
+  return (row.querySelector(".rg-prov-id").value || row.querySelector(".rg-prov-name").value || "").trim();
+}
+
+function _rgCollectProviders(){
+  return [...$("#rgProviders").querySelectorAll(".rg-prov")].map(row => ({
+    id: _rgProviderId(row),
+    name: (row.querySelector(".rg-prov-name").value || "").trim(),
+    api_key: (row.querySelector(".rg-prov-key").value || "").trim(),
+    base_url: (row.querySelector(".rg-prov-url").value || "").trim(),
+    model: (row.querySelector(".rg-prov-model").value || "").trim(),
+    enabled: row.querySelector(".rg-prov-enabled").checked,
+  }));
+}
+
 function _rgCollect(){
   const tiers = [...$("#rgTiers").querySelectorAll(".rg-tier")].map(row => ({
     model: (row.querySelector(".rg-tier-model")?.value || "").trim(),
@@ -2928,9 +2994,10 @@ function _rgCollect(){
   document.querySelectorAll("[data-rgq]").forEach(t => { questions[t.dataset.rgq] = t.value; });
   return {
     mode: document.querySelector('input[name="rgMode"]:checked')?.value || "off",
-    api_key: $("#rgApiKey").value.trim(),
-    base_url: $("#rgBaseUrl").value.trim(),
-    model: $("#rgModel").value.trim(),
+    providers: _rgCollectProviders(),
+    active_provider: [...$("#rgProviders").querySelectorAll(".rg-prov")]
+      .filter(r => r.querySelector(".rg-prov-active").checked)
+      .map(_rgProviderId)[0] || "",
     tiers, questions,
   };
 }
@@ -2949,19 +3016,15 @@ function rgPreviewJson(){
   if(el) el.textContent = JSON.stringify(preview, null, 2);
 }
 
-function rgToggleKey(){
-  const i = $("#rgApiKey");
-  if(i) i.type = i.type === "password" ? "text" : "password";
-}
-
 async function rgSave(){
   const c = _rgCollect();
   // 只把**用户填了值**的字段发出去：留空 = 不改动。
-  // 但档位与提问是整块提交（它们是列表/对象，不存在「局部不动」的语义）。
-  const body = { mode: c.mode, tiers: c.tiers, questions: c.questions };
-  if(c.api_key) body.api_key = c.api_key;          // 留空 = 不改
-  if(c.base_url) body.base_url = c.base_url;
-  if(c.model) body.model = c.model;
+  // 但档位、提问、分组都是整块提交（列表/对象不存在「局部不动」的语义）；
+  // 分组里的 Key 留空由服务端按「同 id 继承旧值」处理，所以整块回传也不会抹掉 Key。
+  const body = {
+    mode: c.mode, tiers: c.tiers, questions: c.questions,
+    providers: c.providers, active_provider: c.active_provider,
+  };
 
   const r = await api("/api/router-gate", {
     method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body),
@@ -2969,23 +3032,42 @@ async function rgSave(){
   const d = await r.json().catch(()=>({}));
   if(!r.ok){ toast(d.detail || "保存失败", "err"); return; }
   toast("门限配置已保存");
-  $("#rgApiKey").value = "";
   await loadRouterGate();
 }
 
 async function rgTest(){
   const el = $("#rgTestResult");
   el.innerHTML = '<span class="text-slate-400">测试中…</span>';
-  const r = await api("/api/router-gate/test", { method: "POST" });
+  const active = _rgState?.active_provider || "";
+  const r = await api("/api/router-gate/test" + (active ? "?provider_id=" + encodeURIComponent(active) : ""),
+                      { method: "POST" });
   const d = await r.json().catch(()=>({}));
   if(!r.ok){ el.innerHTML = `<span class="text-red-500">${esc(d.detail||"测试失败")}</span>`; return; }
   if(d.ok){
     const s = d.sample ? ` · 判为 <code>${esc(d.sample.picked)}</code>（置信度 ${d.sample.confidence}）` : "";
     el.innerHTML = `<span class="text-emerald-600">✓ ${esc(d.detail)}（${d.latency_ms}ms）`
-      + ` · ${esc(d.base_url)} / ${esc(d.model)}</span>${s}`;
+      + ` · ${esc(d.provider||"")} · ${esc(d.base_url)} / ${esc(d.model)}</span>${s}`;
   } else {
     el.innerHTML = `<span class="text-red-500">✗ ${esc(d.detail)}`
       + (d.latency_ms ? `（${d.latency_ms}ms）` : "") + `</span>`;
+  }
+}
+
+async function rgTestProvider(row){
+  // 逐组测试：备份组必须能单独验证，否则「备份永远没被验证过」。
+  // 注意测的是**磁盘上已保存的配置**（未保存的改动不参与），结果里会说明。
+  const out = row.querySelector(".rg-prov-result");
+  const pid = _rgProviderId(row);
+  if(!pid){ out.innerHTML = '<span class="text-red-500">先填分组 id 或显示名</span>'; return; }
+  out.innerHTML = '<span class="text-slate-400">测试中…</span>';
+  const r = await api("/api/router-gate/test?provider_id=" + encodeURIComponent(pid), { method: "POST" });
+  const d = await r.json().catch(()=>({}));
+  if(d.ok){
+    const s = d.sample ? ` · 判为 <code>${esc(d.sample.picked)}</code>（${d.sample.confidence}）` : "";
+    out.innerHTML = `<span class="text-emerald-600">✓ 可用（${d.latency_ms}ms）· 模型 ${esc(d.model)}</span>${s}`;
+  } else {
+    out.innerHTML = `<span class="text-red-500">✗ ${esc(d.detail||"失败")}</span>`
+      + `<span class="text-slate-400"> · 测的是已保存的配置（改了记得先保存）</span>`;
   }
 }
 
