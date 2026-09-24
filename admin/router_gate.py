@@ -552,16 +552,29 @@ class GateResult:
     fallback: str = ""
     #: 是否命中会话缓存（命中时不产生额外延迟）。
     cached: bool = False
+    #: **实际应答的这个结果的分组 id**（failover 时即最终成功的那个）。
+    #: 为空 = 还没调用过（如 no_api_key / empty_state）。
+    #:
+    #: 为什么必须记：分组的核心价值是「主组挂了有备份顶上」，但若日志里看不出
+    #: 到底哪个组应答了，就无法回答「备份有没有被用上」「主组失败多频繁」
+    #: —— 而那正是判断这套机制是否值得继续投入（乃至抽成插件）的依据。
+    #: 旧实现在这里完全没有可观测性，failover 是否发生只能靠猜。
+    provider: str = ""
 
     def summary(self) -> str:
-        """压成一行放进 UsageLog.gate_note（列宽 255，够用）。"""
+        """压成一行放进 UsageLog.gate_note（列宽 255，够用）。
+
+        `via=` 在**末尾**追加（不是开头）：既有断言用 `startswith("shadow gate=")`
+        匹配前缀，加在尾部不会破坏它，也不会打乱人工扫读的习惯顺序。
+        """
         if self.fallback:
             return f"fallback={self.fallback} ms={self.ms}"
         prefix = "shadow " if self.shadow else ""
+        via = f" via={self.provider}" if self.provider else ""
         return (
             f"{prefix}gate={self.picked} conf={self.confidence:.2f} "
             f"reason={self.reasoning:.2f} long={self.long_context:.2f} "
-            f"ms={self.ms}{' cached' if self.cached else ''}"
+            f"ms={self.ms}{' cached' if self.cached else ''}{via}"
         )
 
 
@@ -1109,6 +1122,7 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
     ms = 0
     failed: list[str] = []
     picked = conf = reasoning = long_ctx = None
+    used_provider = ""
     for i, prov in enumerate(candidates):
         # 预算已耗尽就不再试（见 `_candidate_timeout` 的说明）。
         remaining = _candidate_timeout(t0, i, len(candidates))
@@ -1132,6 +1146,7 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
                                 prov.id, res.status_code)
                 continue
             picked, conf, reasoning, long_ctx = _parse(res.json())
+            used_provider = prov.id
             break
         except httpx.TimeoutException:
             ms = int((time.perf_counter() - t0) * 1000)
@@ -1158,6 +1173,14 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
                              in zip(candidates, failed))[:200] or "no_candidate"
         return GateResult(ms=ms, shadow=shadow, fallback=detail)
 
+    # 兜底发生了：主候选失败、由后面的候选顶上。**必须留痕** ——
+    # 它既是「备份到底有没有用」的答案，也是「主组是不是不稳」的信号。
+    # 失败的候选 `gate_note` 里只有 `via=` 最终成功的那个，所以这里把
+    # 试过谁、为什么失败一并写进告警日志（日志不占 255 列宽的约束）。
+    if used_provider and used_provider != candidates[0].id:
+        _logger.warning("门限主分组「%s」失败，已由「%s」兜底；失败详情：%s",
+                        candidates[0].id, used_provider, ";".join(failed) or "无")
+
     # 白名单校验：Jev 可能返回候选清单外的值（幻觉 / prompt 注入）。
     # 注意校的是**生效档位集合**而不是全部已启用模型 —— 门限只认档位；
     # 档位可配后由 `allowed_models(cfg)` 动态给出（写入时已拒绝 auto）。
@@ -1182,12 +1205,14 @@ def classify(body: dict, sticky_key: str = "", mode: str = "shadow") -> GateResu
         # 而不是把这个悬而未决的判断钉住整个会话窗口。
         return GateResult(ms=ms, shadow=shadow, confidence=conf, picked=picked,
                           reasoning=reasoning, long_context=long_ctx,
+                          provider=used_provider,
                           fallback=f"low_confidence:{conf:.2f}<{min_conf:g}")
 
     out = GateResult(
         model=picked if active else "", active=active, shadow=shadow,
         picked=picked, confidence=conf,
         reasoning=reasoning, long_context=long_ctx, ms=ms,
+        provider=used_provider,
     )
     _cache_put(ck, out)
     return out
