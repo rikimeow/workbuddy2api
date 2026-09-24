@@ -172,8 +172,20 @@ def _validate_providers(providers: list[ProviderIn], cfg: dict) -> list[dict]:
             status_code=400,
             detail=f"分组数量需在 1~{rg.MAX_PROVIDERS} 之间，当前 {len(providers)} 个")
 
-    # 旧记录索引：用于 Key 继承与「掩码回传」的拦截
-    old = {p.id: p for p in rg.effective_providers(cfg)}
+    # 旧记录索引：只收录**确实存在 DB 里**的 Key，用于「留空/掩码 = 不改动」。
+    # 不能用 `rg.effective_providers(cfg)`：没有 providers 配置时它会返回
+    # 那个「Key 来自环境变量」的遗留单组，于是继承就等于把 env 固化进 DB
+    # —— 之后改 `TYPESAFE_API_KEY` 不生效（DB 值优先），而用户看到的是「改了没用」。
+    # 官方组靠**读取期**继承 env（`_coerce_provider`），所以这里不收 env 值也不影响可用性。
+    old: dict[str, str] = {}
+    raw_old = cfg.get("providers")
+    if isinstance(raw_old, list):
+        for item in raw_old:
+            if isinstance(item, dict):
+                oid = str(item.get("id") or "").strip()
+                okey = str(item.get("api_key") or "").strip()
+                if oid and okey and "****" not in okey:
+                    old.setdefault(oid, okey)
     out: list[dict] = []
     seen: set[str] = set()
     for i, p in enumerate(providers, 1):
@@ -194,9 +206,8 @@ def _validate_providers(providers: list[ProviderIn], cfg: dict) -> list[dict]:
             # 前端把掩码原样回传：当「不改」处理，而不是存一串假 Key 进去
             key = ""
         if not key and pid in old:
-            key = old[pid].api_key
-        if not key and pid == rg.DEFAULT_PROVIDER_ID:
-            key = (settings.TYPESAFE_API_KEY or "").strip()
+            # 同 id 继承**上一轮显式存进 DB 的** Key（前端拿不回明文，不继承会一保存就抹掉）
+            key = old[pid]
 
         out.append({
             "id": pid,
