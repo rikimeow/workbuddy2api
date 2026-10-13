@@ -81,8 +81,9 @@ class Settings:
     ANTHROPIC_MODEL_SONNET = os.getenv("ADMIN_ANTHROPIC_MODEL_SONNET", "glm-5.2")
     ANTHROPIC_MODEL_HAIKU = os.getenv("ADMIN_ANTHROPIC_MODEL_HAIKU", "glm-5.3-flash")
 
-    # /v1/messages 的 harness 脱敏开关（与 converter 的 /gw 端点同款处理）。
-    # Claude Code 的 system prompt / tools 是固定模板，内含 "DoS / exploit / credential"
+    # harness 脱敏开关（/v1/messages、/v1/chat/completions、/v1/responses
+    # 与 converter 的 /gw 端点同款处理）。
+    # system prompt / tools 是固定模板，内含 "DoS / exploit / credential"
     # 这类合规声明词，会被上游内容审核误判并整条拒绝，典型报错就是
     #   400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}
     # 开启后会压缩 harness 并给敏感词插零宽空格。默认开启 —— 关掉大概率直接发不出去。

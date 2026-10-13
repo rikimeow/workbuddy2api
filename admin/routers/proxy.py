@@ -107,6 +107,45 @@ except Exception:  # pragma: no cover - 降级分支
     _DESENSITIZE_AVAILABLE = False
     desensitize_body = None
 
+def _desensitize_chat_body(chat_body: dict) -> dict:
+    """harness 脱敏（CC / OpenAI 反代 / converter /gw 共用同一套）。
+
+    上游内容审核会把 system/tools 里的合规声明词（DoS / exploit / credential…）
+    误判成敏感内容并整条拒绝（典型 11128 "unapproved channel"）。
+    /v1/messages 早就做了这一步；/v1/chat/completions、/v1/responses 若不同步，
+    就会出现「CC 能用、OpenAI 反代发不出去」。
+    """
+    if not (_DESENSITIZE_AVAILABLE and settings.ANTHROPIC_DESENSITIZE):
+        return chat_body
+    try:
+        raw_len = len(json.dumps(chat_body, ensure_ascii=False))
+        out = desensitize_body(
+            chat_body,
+            roles=("system", "developer"),
+            desensitize_harness_user=True,
+            desensitize_tools=True,
+            compact_harness=not settings.ANTHROPIC_NO_COMPACT,
+            strip_tool_metadata=True,
+        )
+        _logger.info("harness 脱敏 %d -> %d 字节（compact=%s）",
+                     raw_len, len(json.dumps(out, ensure_ascii=False)),
+                     not settings.ANTHROPIC_NO_COMPACT)
+        return out
+    except Exception as e:
+        _logger.warning("harness 脱敏失败，按原样发送：%s", e)
+        return chat_body
+
+# 上游流式 delta 的「空占位字段」归一（tool_calls:[] / function_call:null 等），
+# 外加「提交前缓冲」封装。这些空值会被一部分客户端误判成「工具调用开始」，
+# 把一次思考切成几十上百块。与 converter 的 /gw 端点共用同一实现，避免两处行为漂移。
+try:
+    from upstream_compat import StreamCommitBuffer, StreamDeltaNormalizer
+    _STREAM_NORMALIZER_AVAILABLE = True
+except Exception:  # pragma: no cover - 降级分支
+    _STREAM_NORMALIZER_AVAILABLE = False
+    StreamDeltaNormalizer = None
+    StreamCommitBuffer = None
+
 router = APIRouter(tags=["proxy"])
 
 
@@ -2034,8 +2073,12 @@ async def chat_completions(
 
     # 会话粘性键与会话头族在**轮转循环外**算一次，循环内所有尝试复用同一份：
     # 换号重试若换了会话 ID，上游看到的是 N 个并发会话而不是一次对话的一次重试。
+    # 先按原始 body 取会话键，再脱敏 —— 零宽字符不应改变会话身份。
     sticky_key = pool.session_key_for(body)
     session_hdr = _session_headers(body, "")
+    # 与 /v1/messages 同一套 harness 脱敏：OpenAI 反代不过这道过滤，
+    # system/tools 里的合规声明词会被上游内容审核整条拒掉（11128）。
+    body = _desensitize_chat_body(body)
 
     async def _stream(aggregate: bool = False):
         """带账号轮换 + 在途租约 + 退避 + 错误状态机 + 表格日志的流式代理。
@@ -2433,8 +2476,11 @@ async def responses_proxy(
 
     # 会话粘性键与会话头族：在轮转循环外算一次，循环内所有尝试复用同一份
     # （换号重试若换了会话 ID，上游看到的是 N 个并发会话而非一次对话的一次重试）。
+    # 先按原始 chat_body 取会话键，再脱敏 —— 零宽字符不应改变会话身份。
     sticky_key = pool.session_key_for(chat_body)
     session_hdr = _session_headers(chat_body, "")
+    # 与 /v1/messages 同一套 harness 脱敏（OpenAI Responses 也要过这道过滤）。
+    chat_body = _desensitize_chat_body(chat_body)
 
     if not client_wants_stream:
         # 非流式：内部重试，成功后聚合为单一 Response 对象
@@ -2814,22 +2860,7 @@ async def anthropic_messages(
     # "unapproved channel"）。这里做与 converter /gw 端点完全相同的 harness 压缩 +
     # 零宽空格脱敏：模型读到的仍是原词，后端的关键词匹配失效。少了这一步，
     # Claude Code 的真实请求基本发不出去（简单 hello 测试却会通过，很容易误判）。
-    if _DESENSITIZE_AVAILABLE and settings.ANTHROPIC_DESENSITIZE:
-        try:
-            _raw_len = len(json.dumps(chat_body, ensure_ascii=False))
-            chat_body = desensitize_body(
-                chat_body,
-                roles=("system", "developer"),
-                desensitize_harness_user=True,
-                desensitize_tools=True,
-                compact_harness=not settings.ANTHROPIC_NO_COMPACT,
-                strip_tool_metadata=True,
-            )
-            _logger.info("harness 脱敏 %d -> %d 字节（compact=%s）",
-                         _raw_len, len(json.dumps(chat_body, ensure_ascii=False)),
-                         not settings.ANTHROPIC_NO_COMPACT)
-        except Exception as e:
-            _logger.warning("harness 脱敏失败，按原样发送：%s", e)
+    chat_body = _desensitize_chat_body(chat_body)
 
     # 先做 Anthropic 名称映射（claude-* → 白名单模型或 auto），再门限接管映射结果里的 auto
     requested = _map_anthropic_model(db, payload.get("model", "auto"), key)
