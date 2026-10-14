@@ -16,7 +16,8 @@ from dotenv import load_dotenv
 # 加载项目根目录的 .env（无论运行时 CWD 在哪都能找到）。
 # 不会覆盖已经存在的系统环境变量（便于容器 / systemd 注入）。
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-load_dotenv(os.path.join(_ROOT, ".env"))
+if os.getenv("WORKBUDDY_DESKTOP") != "1" and os.getenv("WORKBUDDY_ANDROID") != "1":
+    load_dotenv(os.path.join(_ROOT, ".env"))
 
 _logger = logging.getLogger(__name__)
 
@@ -28,6 +29,10 @@ class Settings:
         "mysql+pymysql://root:root@127.0.0.1:3306/workbuddy_admin?charset=utf8mb4",
     )
     REDIS_URL = os.getenv("ADMIN_REDIS_URL", "redis://127.0.0.1:6379/0")
+    # Per-key burst bounds; use 0 explicitly to disable a bound.
+    GATEWAY_RATE_PER_MINUTE = int(os.getenv("ADMIN_GATEWAY_RATE_PER_MINUTE", "60"))
+    GATEWAY_MAX_CONCURRENT = int(os.getenv("ADMIN_GATEWAY_MAX_CONCURRENT", "4"))
+    GATEWAY_LIMIT_BACKEND = os.getenv("ADMIN_GATEWAY_LIMIT_BACKEND", "auto").lower()
 
     # 后端（CodeBuddy / WorkBuddy）
     BACKEND = os.getenv("ADMIN_BACKEND", "https://copilot.tencent.com")
@@ -102,8 +107,21 @@ class Settings:
     # 腾讯 CodeBuddy/WorkBuddy 后端通过 X-IDE-Name 头识别客户端，默认 "WorkBuddy"。
     UPSTREAM_CLIENT_NAME = os.getenv("ADMIN_UPSTREAM_CLIENT_NAME", "WorkBuddy")
 
-    # 账号选择策略：remain（剩余最多优先）/ lru（最久未用优先）/ weighted（三因子加权随机）
-    ACCOUNT_SELECT = os.getenv("ADMIN_ACCOUNT_SELECT", "remain")
+    # 账号选择策略。
+    #
+    # **所有策略都先按「积分到期紧迫度」硬分组**（7 天内到期的号一定先用完，
+    # 见 admin/pool.py 的 expiry_key / admin/routers/proxy.py 的 _select_account），
+    # 这里的取值只决定**同一紧迫度档位内部**的先后：
+    #   expiring 到期最近优先（**默认**）—— 严格「先用快过期的」
+    #   oldest   最老录入优先 —— 到期数据缺失时的次优选择
+    #   remain   剩余最多优先
+    #   lru      最久未用优先
+    #   weighted 三因子加权随机（余额 ×10 + 快过期 ×8 + 闲置补偿）
+    #
+    # 默认从 oldest 改成 expiring：oldest 只是「老号离到期近」这个**相关代理指标**，
+    # 真正要的是「离到期近」。现在有了逐包到期快照（credits_soonest_expire_at），
+    # 可以直接用真实到期时间排序，不必再靠录入时间猜。
+    ACCOUNT_SELECT = os.getenv("ADMIN_ACCOUNT_SELECT", "expiring")
 
     # ---------- 开发 / 测试辅助工具 ----------
     #: 逆向产物（客户端源码）管理：后台一键拆包 app.asar、手动指定安装目录。
@@ -134,6 +152,9 @@ class Settings:
     #: 注意：Key 绑定了模型分组时**一律不透传**（分组要限制模型集合，
     #: 而上游 auto 会挑到组外的模型），见 _pick_best_model。
     AUTO_PASSTHROUGH = os.getenv("ADMIN_AUTO_PASSTHROUGH", "1") != "0"
+    # Shared across all candidate models. Does not interrupt an active stream.
+    MAX_TOTAL_ATTEMPTS = int(os.getenv("ADMIN_POOL_MAX_TOTAL_ATTEMPTS", "6"))
+    RETRY_WINDOW_SECONDS = float(os.getenv("ADMIN_POOL_RETRY_WINDOW", "90"))
     #: 软限流（429）冷却基数（秒）；连续触发按 2 倍指数退避，封顶 SOFT_RATE_MAX。
     SOFT_RATE_SECONDS = int(os.getenv("ADMIN_POOL_SOFT_RATE", "600"))
     #: 软冷却指数退避封顶（秒）。默认 2h，与参考实现一致。
@@ -147,8 +168,8 @@ class Settings:
     #: 「当前模型请求繁忙 / 请求过于频繁，请稍后重试」——上游自己给的建议
     #: 就是「稍后重试」，官方 UI 文案也是「请切换模型或稍后重试」。
     #: 给它 600 秒会把一次**瞬时**抖动放大成 10 分钟的整池停摆：
-    #: 一次请求轮转 3 个号，几个并发请求就能把 15 个号的池子全部冷掉
-    #: （2026-09-23 线上故障即为此：16 个号 76 秒内全部 soft_rate，
+    #: 一次请求轮转 3 个号，几个并发请求就能把整个号池全部冷掉
+    #: （2026-09-23 线上故障即为此：xx 个号 76 秒内全部 soft_rate，
     #: 冷却到 10 分钟后，期间所有请求直接 503）。
     REQUEST_RATE_SECONDS = int(os.getenv("ADMIN_POOL_REQUEST_RATE", "20"))
     #: 纯请求速率限流的指数退避封顶（秒）。留足退避余量但不至于停摆太久。
@@ -162,6 +183,7 @@ class Settings:
     SESSION_DEAD_THRESHOLD = int(os.getenv("ADMIN_POOL_SESSION_DEAD_THRESHOLD", "3"))
     #: 模型级限流（code 6004）时的兜底退避（秒），无上游重置时间时使用。
     MODEL_SOFT_RATE_SECONDS = int(os.getenv("ADMIN_POOL_MODEL_SOFT_RATE", "600"))
+    MODEL_DAILY_COOLDOWN_SECONDS = int(os.getenv("ADMIN_POOL_MODEL_DAILY_COOLDOWN", "86400"))
     #: 该后端无此模型（code 11102）的负缓存 TTL（秒）。重试无意义，只能换模型/换号。
     MODEL_BLOCK_SECONDS = int(os.getenv("ADMIN_POOL_MODEL_BLOCK", "21600"))
 

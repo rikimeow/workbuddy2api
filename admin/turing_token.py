@@ -50,6 +50,12 @@ _warm_lock = threading.Lock()
 
 
 def _node_bin() -> str | None:
+    if os.getenv("WORKBUDDY_DESKTOP") == "1":
+        from desktop.common import data_dir
+        from desktop.runtime import node_dir
+        private = node_dir(data_dir()) / "node.exe"
+        if private.is_file():
+            return str(private)
     return shutil.which("node") or shutil.which("node.exe")
 
 
@@ -65,6 +71,8 @@ def get_device_token(force: bool = False) -> str | None:
 
     force=True 时忽略缓存（含负缓存），重新向 SDK 索取（用于排查 / 测试）。
     """
+    if os.getenv("WORKBUDDY_ANDROID") == "1":
+        return None
     now = time.time()
     if not force:
         with _lock:
@@ -73,6 +81,12 @@ def get_device_token(force: bool = False) -> str | None:
             # 负缓存命中：直接返回，避免在请求路径上同步 fork node 阻塞事件循环。
             if _cache["fail_ts"] and now - _cache["fail_ts"] < _FAIL_TTL:
                 return None
+
+        # A cache miss must never fork Node synchronously inside the ASGI event loop.
+        # Serve the last token while a single background worker refreshes it.
+        warmup()
+        with _lock:
+            return _cache["token"]
 
     node = _node_bin()
     if not node or not _HELPER.is_file():
@@ -106,6 +120,7 @@ def get_device_token(force: bool = False) -> str | None:
         out = subprocess.run(
             [node, str(_HELPER)],
             capture_output=True, text=True, timeout=_RUN_TIMEOUT, env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception:
         _mark_failure(now)
@@ -142,13 +157,19 @@ def warmup() -> None:
     """
     def _run() -> None:
         try:
-            get_device_token()
+            get_device_token(force=True)
         except Exception:
             pass
+        finally:
+            _warm_lock.release()
 
-    with _warm_lock:
+    if _warm_lock.acquire(blocking=False):
         t = threading.Thread(target=_run, daemon=True, name="wb-turing-warmup")
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            _warm_lock.release()
+            raise
 
 
 def clear_cache() -> None:

@@ -10,3 +10,5 @@ PyJWT
 cryptography
 # 从 .env 读取配置
 python-dotenv
+# 版本检查（浏览器后台与桌面版共用）
+packaging>=24.0

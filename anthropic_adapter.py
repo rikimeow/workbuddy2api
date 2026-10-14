@@ -12,9 +12,12 @@ Anthropic Messages API 参考：https://docs.anthropic.com/en/docs/messages
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # ID 生成
@@ -71,7 +74,13 @@ def anthropic_request_to_chat(body: dict) -> dict:
     if "tool_choice" in body:
         tc = body["tool_choice"]
         if isinstance(tc, dict):
-            chat["tool_choice"] = {"type": tc.get("type", "any"), "function": {"name": tc.get("name", "")}}
+            choice_type = tc.get("type", "any")
+            if choice_type in ("auto", "any", "none"):
+                chat["tool_choice"] = "required" if choice_type == "any" else choice_type
+            elif choice_type == "tool":
+                chat["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+            else:
+                chat["tool_choice"] = dict(tc)
         elif isinstance(tc, str):
             chat["tool_choice"] = tc if tc in ("none", "auto", "required") else {"type": "function", "function": {"name": tc}}
 
@@ -117,6 +126,30 @@ def _extract_system_text(system) -> str:
     return ""
 
 
+def _image_block_to_chat_part(block: dict) -> dict:
+    """Preserve Anthropic base64/URL images; reject invalid sources instead of losing them."""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("image.source must be an object")
+    source_type = source.get("type")
+    if source_type == "base64":
+        media = source.get("media_type") or "image/png"
+        data = source.get("data")
+        if not isinstance(media, str) or not media.strip().startswith("image/"):
+            raise ValueError("image.source.media_type must be an image MIME type")
+        if not isinstance(data, str) or not data.strip():
+            raise ValueError("image.source.data must be a nonempty base64 string")
+        url = f"data:{media.strip()};base64,{data.strip()}"
+    elif source_type == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("image.source.url must be a nonempty string")
+        url = url.strip()
+    else:
+        raise ValueError("image.source.type must be base64 or url")
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 def _convert_anthropic_message(msg: dict) -> list[dict]:
     """将单个 Anthropic 消息转换为 OpenAI 格式的消息（可能为多条）。"""
     role = msg.get("role", "")
@@ -134,26 +167,38 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     blocks = content
 
     # 检查是否包含 tool_result（role=user 时）
+    #
+    # OpenAI/上游要求：assistant.tool_calls 之后必须**紧接**对应的 role:tool。
+    # 因此 tool_result 必须先输出；user 文本/图片只能排在 tool 结果之后，
+    # 绝不能 insert 到最前——否则会切断配对，上游报 11148。
     if role == "user":
-        result: list[dict] = []
-        text_parts: list[str] = []
+        tool_msgs: list[dict] = []
+        content_parts: list[dict] = []
+        has_images = False
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             bt = block.get("type", "")
             if bt == "text":
-                text_parts.append(block.get("text", ""))
+                content_parts.append({"type": "text", "text": block.get("text", "")})
+            elif bt == "image":
+                content_parts.append(_image_block_to_chat_part(block))
+                has_images = True
             elif bt == "tool_result":
-                # tool_result → 独立的 tool 消息
-                tc_id = block.get("tool_use_id", "")
-                output = block.get("content", "")
-                if isinstance(output, list):
-                    output = "".join(
-                        b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"
-                    )
-                result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
-        if text_parts:
-            result.insert(0, {"role": "user", "content": "".join(text_parts)})
+                # tool_result → 独立的 tool 消息（必须紧随 assistant.tool_calls）
+                tc_id = block.get("tool_use_id") or ""
+                if not tc_id:
+                    # 空 id 无法与 tool_use 配对，上送必触发 11148；直接丢弃
+                    _logger.debug("drop tool_result with empty tool_use_id")
+                    continue
+                output = _tool_result_to_text(block.get("content", ""))
+                if block.get("is_error"):
+                    output = f"Error: {output}" if output else "Error: tool execution failed"
+                tool_msgs.append({"role": "tool", "tool_call_id": tc_id, "content": output})
+        result = list(tool_msgs)
+        if content_parts:
+            content = content_parts if has_images else "".join(part["text"] for part in content_parts)
+            result.append({"role": "user", "content": content})
         return result
 
     # assistant 角色
@@ -167,8 +212,9 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
             if bt == "text":
                 text_parts.append(block.get("text", ""))
             elif bt == "tool_use":
+                # 键缺失或值为 null/"" 都要生成新 id，保证与 tool_result 可配对
                 tc = {
-                    "id": block.get("id", _rand_id("call_")),
+                    "id": block.get("id") or _rand_id("call_"),
                     "type": "function",
                     "function": {
                         "name": block.get("name", ""),
@@ -188,6 +234,34 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 其他角色：尝试提取文本
     text = _extract_blocks_text(blocks)
     return [{"role": role, "content": text}] if text else []
+
+
+def _tool_result_to_text(output) -> str:
+    """把 Anthropic tool_result.content 转成纯文本。
+
+    - str → 原样
+    - list → 拼接 text 块；非 text 块序列化为短 JSON，避免静默丢成空串
+    - 其它/None → 空串
+    """
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        return str(output)
+    parts: list[str] = []
+    for b in output:
+        if not isinstance(b, dict):
+            parts.append(str(b))
+            continue
+        if b.get("type") == "text":
+            parts.append(b.get("text", "") or "")
+        else:
+            try:
+                parts.append(json.dumps(b, ensure_ascii=False)[:500])
+            except Exception:
+                parts.append(f"<{b.get('type') or 'block'}>")
+    return "".join(parts)
 
 
 def _extract_blocks_text(blocks: list) -> str:

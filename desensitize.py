@@ -148,6 +148,8 @@ _CODEX_SYSTEM_MARKERS = (
     "Within this context, Codex refers to",
     "# How you work",
     "You are Claude Code",         # Claude Code system prompt
+    "You are a Claude agent",      # Claude Code system prompt (Agent SDK 版)
+    "Claude Agent SDK",            # Claude Code system prompt (Agent SDK 版)
 )
 
 _PERMISSIONS_MARKERS = (
@@ -210,9 +212,91 @@ _RUNTIME_TAIL_SUMMARY = (
 )
 
 _CODEX_CORE_SUMMARY = (
-    "You are a coding assistant in Codex CLI. Be precise, helpful, concise, and safe. "
-    "Inspect the repository, use available tools when needed, follow repository instructions, "
-    "and keep the user informed with concise progress updates."
+    "You are a coding assistant. Be precise, helpful, concise, and safe.\n\n"
+    "# Doing tasks\n"
+    "The user will primarily request software engineering tasks: fixing bugs, adding features, "
+    "refactoring code, explaining code, and more. When given an unclear instruction, consider it "
+    "in the context of software engineering and the current working directory.\n\n"
+    "- Understand existing code before suggesting modifications. Read files before editing.\n"
+    "- Do not propose changes to code you haven't read.\n"
+    "- Do not add features, refactor code, or make improvements beyond what was asked.\n"
+    "- Do not create files unless absolutely necessary. Prefer editing existing files.\n"
+    "- Avoid giving time estimates or predictions. Focus on what needs to be done.\n"
+    "- If an approach fails, diagnose why before switching tactics.\n"
+    "- Break down and manage work with TaskCreate for complex multi-step tasks.\n"
+    "- Mark each task as completed as soon as it is done.\n\n"
+    "# Using tools\n"
+    "- To read files use Read (NOT cat/head/tail). To edit use Edit (NOT sed/awk).\n"
+    "- To create files use Write (NOT echo/cat heredoc). To search files use Glob (NOT find/ls).\n"
+    "- To search content use Grep (NOT grep/rg). Reserve Bash for system commands only.\n"
+    "- Run tests after making changes to verify correctness.\n"
+    "- Use the Agent tool for complex research or multi-step independent work.\n"
+    "- Use AskUserQuestion when requirements are ambiguous or you need decisions.\n"
+    "- Use EnterPlanMode for non-trivial implementation tasks before writing code.\n\n"
+    "# Code quality\n"
+    "- Only add comments where the logic is not self-evident.\n"
+    "- Do not add docstrings, type annotations, or refactoring to code you didn't change.\n"
+    "- Do not add error handling for scenarios that can't happen.\n"
+    "- Do not introduce security vulnerabilities (command injection, XSS, SQL injection, OWASP top 10).\n"
+    "- If you notice insecure code you wrote, fix it immediately.\n"
+    "- Three similar lines of code is better than a premature abstraction.\n"
+    "- Avoid backwards-compatibility hacks. Delete unused code completely.\n\n"
+    "# File operations\n"
+    "- To read files use Read (NOT cat/head/tail/sed).\n"
+    "- To edit files use Edit (NOT sed/awk). To create files use Write (NOT echo/cat).\n"
+    "- To search files use Glob (NOT find/ls). To search content use Grep (NOT grep/rg).\n"
+    "- Prefer editing an existing file to creating a new one.\n\n"
+    "# Running commands\n"
+    "- Use Bash for system commands and terminal operations requiring shell execution.\n"
+    "- Prefer running tests after code changes.\n"
+    "- Avoid destructive operations (deleting files, force-push, reset --hard) without user confirmation.\n"
+    "- NEVER update git config. NEVER run destructive git commands unless explicitly requested.\n"
+    "- NEVER commit changes unless the user explicitly asks.\n"
+    "- Only create commits when requested by the user.\n\n"
+    "# Communication\n"
+    "- All responses in Chinese (中文). Technical terms and code identifiers stay in original form.\n"
+    "- Keep text output short and direct. Lead with the answer or action, not the reasoning.\n"
+    "- Skip filler words, preamble, and unnecessary transitions.\n"
+    "- If you can say it in one sentence, don't use three.\n"
+    "- Focus on: decisions needing user input, high-level status updates, errors or blockers.\n"
+    "- When referencing code, include file_path:line_number format.\n\n"
+    "# Safety\n"
+    "- Refuse destructive techniques, mass targeting, or detection evasion for malicious purposes.\n"
+    "- Dual-use security tools require clear authorization: pentesting, CTF, security research, or defensive use.\n"
+    "- Never write exploits, exploit PoCs, malware, or attack any system regardless of ownership.\n"
+    "- Do not generate or guess URLs unless confident they help with programming.\n"
+    "- You may use URLs provided by the user or found in local files.\n\n"
+    "# Verification\n"
+    "- After completing a task, verify changes work (run tests, check syntax).\n"
+    "- Report what was changed, where files were added/modified.\n"
+    "- If blocked or stuck, diagnose the issue before trying a different approach.\n"
+    "- Use the Agent tool with specialized agents for testing and review when appropriate.\n\n"
+    "# Task management\n"
+    "- Use TaskCreate to track multi-step work (3+ steps).\n"
+    "- Mark tasks in_progress when starting, completed when done.\n"
+    "- Use TaskList to check available work and progress.\n"
+    "- Prefer working on tasks in ID order (lowest ID first).\n\n"
+    "# Memory\n"
+    "- You have a persistent memory system. Save important user preferences, feedback, and project context.\n"
+    "- When the user explicitly asks to remember something, save it immediately.\n"
+    "- When recalling from memory, verify the information is still current before acting on it.\n\n"
+    "# Plan mode\n"
+    "- For non-trivial implementation tasks, use EnterPlanMode to design the approach first.\n"
+    "- Write a clear plan with steps, then use ExitPlanMode for user approval.\n"
+    "- Do not start implementation until the user approves the plan.\n\n"
+    "# Git workflow\n"
+    "- When committing: run git status, git diff, git log in parallel first.\n"
+    "- Draft a concise commit message focused on the why, not the what.\n"
+    "- Stage specific files by name, not git add -A.\n"
+    "- Never push unless the user explicitly asks.\n"
+    "- When creating PRs: summarize changes, include test plan, use gh pr create.\n\n"
+    "# Skills\n"
+    "- When a skill matches the user's request, use the Skill tool to invoke it.\n"
+    "- Available skills are listed in system-reminder messages. Use them proactively when relevant.\n"
+    "- Do not invoke a skill that is already running.\n\n"
+    "Follow repository instructions, CLAUDE.md files, and coding conventions when present. "
+    "Keep the user informed with concise progress updates. "
+    "When running tests or builds, summarize results clearly."
 )
 
 
@@ -257,6 +341,40 @@ def _looks_like_harness_user_message(content) -> bool:
     """判断 user 消息是否其实是 Codex/CLI 注入的上下文，而非用户自然输入。"""
     text = _content_to_text(content)
     return any(marker in text for marker in _HARNESS_USER_MARKERS)
+
+
+def _extract_user_payload(text: str) -> str:
+    """去掉 harness 注入块/尾部元数据，**保留用户真实输入**。
+
+    Claude Code 常把提问和 <system-reminder> 写进同一条 user 消息：
+        "<system-reminder>...</system-reminder>\\n\\nWhat is 1+1?"
+    此前 compact 会整条换成固定摘要，把用户提问一并吞掉（首轮只回
+    "I'm ready to help..."）。这里只剥注入块，剩什么就留什么。
+    """
+    if not text:
+        return ""
+    out = text
+    for start_tag, end_tag, _replacement in _RUNTIME_BLOCK_REPLACEMENTS:
+        out = re.sub(
+            r"\s*" + re.escape(start_tag) + r".*?" + re.escape(end_tag) + r"\s*",
+            "\n",
+            out,
+            flags=re.DOTALL,
+        )
+        # 未闭合的尾块（截断/异常注入）：从起始标签截到结尾
+        if start_tag in out and end_tag not in out:
+            out = re.sub(r"\s*" + re.escape(start_tag) + r".*$", "\n", out, flags=re.DOTALL)
+
+    tail_indexes = [out.find(marker) for marker in _RUNTIME_TAIL_MARKERS if marker in out]
+    if tail_indexes:
+        out = out[: min(idx for idx in tail_indexes if idx >= 0)]
+
+    for _start, _end, replacement in _RUNTIME_BLOCK_REPLACEMENTS:
+        out = out.replace(replacement, " ")
+    out = out.replace(_RUNTIME_TAIL_SUMMARY, " ")
+
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
 
 
 def _prune_runtime_fragments(role: str, text: str) -> str:
@@ -310,16 +428,13 @@ def _prune_runtime_fragments(role: str, text: str) -> str:
         else:
             pruned = _CODEX_CORE_SUMMARY
 
-    if role == "user" and _looks_like_harness_user_message(pruned):
-        if (
-            "# AGENTS.md instructions" in pruned
-            or "<environment_context>" in text
-            or "<skills_instructions>" in text
-        ):
-            return (
-                "Repository instructions and durable user context are provided. "
-                "Follow repository guidance while answering the user's actual request."
-            )
+    if role == "user" and _looks_like_harness_user_message(text):
+        residual = _extract_user_payload(text)
+        # 有真实提问就保留；纯 harness 才换成摘要，避免吞掉用户输入
+        return residual if residual else (
+            "Repository instructions and durable user context are provided. "
+            "Follow repository guidance while answering the user's actual request."
+        )
 
     pruned = re.sub(r"\n{3,}", "\n\n", pruned).strip()
     return pruned
@@ -327,19 +442,16 @@ def _prune_runtime_fragments(role: str, text: str) -> str:
 
 def _compact_harness_message(role: str, content) -> str | None:
     """把 Codex / Claude Code 注入的超长运行时提示压缩成短摘要，降低审核误伤。"""
+    # A text summary cannot represent attachments; keep multimodal blocks intact.
+    if isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") != "text" for block in content
+    ):
+        return None
     text = _content_to_text(content)
     if not text:
         return None
     if role == "system" and any(marker in text for marker in _CODEX_SYSTEM_MARKERS):
-        if "You are Claude Code" in text:
-            return (
-                "You are a coding assistant. Be precise, helpful, concise, and safe. "
-                "Use available tools when needed, follow repository instructions, and keep the user informed."
-            )
-        return (
-            "You are a coding assistant in Codex CLI. Be precise, helpful, concise, and safe. "
-            "Use available tools when needed, follow repository instructions, and keep the user informed."
-        )
+        return _CODEX_CORE_SUMMARY
     if any(marker in text for marker in _PERMISSIONS_MARKERS):
         return (
             "Runtime permissions apply: filesystem access may be sandboxed, network may be restricted, "
@@ -350,6 +462,10 @@ def _compact_harness_message(role: str, content) -> str | None:
             "Runtime skill metadata is available. Use relevant skills only when explicitly requested or clearly applicable."
         )
     if role == "user" and _looks_like_harness_user_message(content):
+        residual = _extract_user_payload(text)
+        if residual:
+            # 用户提问和 harness 混在同一块：只剥注入，保留提问
+            return residual
         return (
             "Repository instructions and environment context are provided. Follow repository guidance "
             "while answering the user's actual request."

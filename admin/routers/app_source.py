@@ -109,15 +109,22 @@ def _status_payload() -> dict:
 
 def _node_version() -> str:
     """Node 版本（仅作展示：本工具不需要 Node，但用户常以为需要）。"""
-    import shutil
     import subprocess
-    exe = shutil.which("node")
+    from admin.turing_token import _node_bin
+    exe = _node_bin()
     if not exe:
         return ""
     try:
+        cached = getattr(_node_version, "_cached", None)
+        if cached and cached[0] == exe:
+            return cached[1]
         r = subprocess.run([exe, "--version"], capture_output=True,
-                           text=True, timeout=5)
-        return (r.stdout or "").strip()
+                           text=True, timeout=5,
+                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        version = (r.stdout or "").strip() if r.returncode == 0 else ""
+        if version:
+            _node_version._cached = (exe, version)
+        return version
     except Exception:
         return ""
 

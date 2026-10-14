@@ -11,12 +11,13 @@ import logging
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 import upstream_compat
 from admin import backend
+from admin.account_binding import scope_accounts
 from admin.config import settings
 from admin.db import get_db
 from admin.models import Account, ModelConfig
@@ -92,6 +93,17 @@ def list_configs(
     }
 
 
+@router.get("/busy")
+def model_busy(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """Upstream capacity is independent of local enablement and cooldowns."""
+    from admin.model_busy import get_busy_levels, LABELS
+    models = [row.model_id for row in db.query(ModelConfig.model_id).distinct().all()]
+    result = get_busy_levels(db, models)
+    return {"items": [{"model_id": model, "busy_level": level, "busy_label": LABELS[level]}
+                      for model, level in result["levels"].items()],
+            "observed_at": result["observed_at"], "stale": result["stale"]}
+
+
 def _do_sync_models(db: Session) -> dict:
     """从后端拉取可用模型列表并同步到本地数据库（upsert）。
 
@@ -103,7 +115,7 @@ def _do_sync_models(db: Session) -> dict:
     因此这里走 ``upstream_compat.normalize_catalog`` 的分类结果，只取 ``chat``：
     它按官方 CLI 名单 + tags（text-to-image）+ 输出长度过滤，与 /gw 路径同源。
     """
-    acc = db.query(Account).filter(
+    acc = scope_accounts(db.query(Account)).filter(
         Account.status == "active", Account.balance_remain > 0
     ).first()
     if not acc:
@@ -247,6 +259,7 @@ _SPEED_TEST_PROMPT = [{"role": "user", "content": "用一句话介绍一下你�
 @router.post("/speed-test")
 async def speed_test(
     body: dict,
+    request: Request,
     _: bool = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -265,7 +278,7 @@ async def speed_test(
     messages = body.get("messages") or _SPEED_TEST_PROMPT
 
     # 选可用账号（与代理一致：active 且余额>0，剩余最多优先）
-    acc = db.query(Account).filter(
+    acc = scope_accounts(db.query(Account)).filter(
         Account.status == "active", Account.balance_remain > 0
     ).order_by(Account.balance_remain.desc()).first()
     if not acc:
@@ -279,8 +292,14 @@ async def speed_test(
                     f"但没有任何「启用且余额大于 0」的账号"
                     f"（本接口不判断在途与冷却状态）"))
 
+    from admin.routers.proxy import _blocking_call
+    from admin import upstream_http
     sess = backend.AccountSession(acc.auth_json)
-    headers = sess.get_headers()
+    try:
+        headers = await _blocking_call(sess.get_headers)
+    except BaseException:
+        sess.close()
+        raise
     url = f"{settings.BACKEND}/v2/chat/completions"
     payload = {
         "model": model,
@@ -306,12 +325,12 @@ async def speed_test(
             pass
 
     try:
-        async with httpx.AsyncClient(timeout=120, limits=backend.HTTP_LIMITS) as client:
+        async with upstream_http.client(request, 120, backend.HTTP_LIMITS) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as r:
                 if r.status_code >= 400:
                     detail = await r.aread()
                     msg = detail.decode("utf-8", "replace")[:300]
-                    _persist()
+                    await _blocking_call(_persist)
                     sess.close()
                     raise HTTPException(status_code=r.status_code, detail=f"上游返回错误: {msg}")
                 async for chunk in r.aiter_text():
@@ -350,11 +369,11 @@ async def speed_test(
     except HTTPException:
         raise
     except Exception as e:
-        _persist()
+        await _blocking_call(_persist)
         sess.close()
         raise HTTPException(status_code=502, detail=f"测速请求失败: {e}")
 
-    _persist()
+    await _blocking_call(_persist)
     sess.close()
 
     total_dur = t_end - t0

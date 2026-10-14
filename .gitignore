@@ -63,6 +63,12 @@ tests/
 *_test.py
 test/
 
+# ===== 内部分析文档（不提交） =====
+# docs/ 里是协议逆向取证与排查记录，含**未脱敏的真实手机号、真实 token
+# 片段、以及本地账号池的真实数据**（例：某次实测记录里直接写了手机号）。
+# 这些属于内部资料而非产品代码，一律不上传；需要时本地保留。
+docs/
+
 # ===== 逆向取证 / 本地诊断脚本（不提交） =====
 # 这些脚本依赖本机安装包、真实账号、一次性排查结论（有的还含已被证伪的假设），
 # 属于本地工具而非产品代码，一律不上传。
@@ -74,3 +80,43 @@ scripts/run_daemon.ps1
 # ===== 强制保留（即便以点开头也要提交） =====
 !.gitignore
 !.env.example
+
+# ===== 本地诊断脚本 / 探针（含真实凭证备份，绝不入库）=====
+_zcode_probe/
+_chrome_profile*/
+
+# Desktop build outputs (never package local credentials or databases)
+.desktop-build/
+build/
+dist/
+desktop/assets/*.ico
+desktop/assets/*.png
+
+!scripts/build_desktop.py
+!tests/
+tests/*
+!tests/test_desktop.py
+!tests/test_android.py
+!tests/test_mobile_latency.py
+!tests/test_android_http.py
+!tests/test_credentials.py
+!tests/test_account_automation.py
+!tests/test_key_account_binding.py
+!tests/test_anthropic_tool_pairing.py
+!tests/test_desensitize_user_payload.py
+!tests/test_key_concurrent_limit.py
+!scripts/build_android.py
+android/.gradle/
+android/local.properties
+android/**/build/
+*.jks
+*.keystore
+
+
+# Local SQLite databases (runtime data)
+workbuddy_admin.db
+workbuddy_admin.db-shm
+workbuddy_admin.db-wal
+
+# Local credentials file
+登录密码.txt

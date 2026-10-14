@@ -13,6 +13,8 @@ from typing import Optional
 from admin.config import settings
 
 try:
+    if settings.GATEWAY_LIMIT_BACKEND == "memory":
+        raise RuntimeError("Desktop uses memory rate limits")
     import redis as _redis_mod
 
     _redis = _redis_mod.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=1, socket_timeout=1)

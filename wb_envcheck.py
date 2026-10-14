@@ -140,7 +140,8 @@ def check_modules() -> list[Item]:
 def _node_version(node: str) -> str:
     try:
         out = subprocess.run([node, "--version"], capture_output=True,
-                             text=True, timeout=8, check=False)
+                             text=True, timeout=8, check=False,
+                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         return (out.stdout or "").strip()
     except Exception:
         return ""

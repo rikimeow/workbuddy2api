@@ -472,6 +472,8 @@ class _WorkBuddyInstall:
                 or self._ov("install_dir"))
 
     def _find_install_dir(self) -> Path | None:
+        if os.getenv("WORKBUDDY_ANDROID") == "1":
+            return None
         # 显式给了 app.asar 文件路径且它存在 -> 直接由它反推安装目录，
         # 跳过整个扫描（用户最明确的意图，优先满足）。
         a = self._explicit_asar()

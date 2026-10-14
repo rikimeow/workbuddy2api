@@ -11,7 +11,7 @@
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -23,6 +23,13 @@ router = APIRouter(prefix="/api/stats", tags=["stats"])
 
 #: 视为「成功」的 error_kind 取值（空串 = 历史数据未分类，同样按成功计）
 _OK_KINDS = ("", "success")
+
+
+@router.get("/model-health")
+def model_health_stats(hours: int = Query(default=24, ge=1, le=168),
+                       _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    from admin.health import model_health
+    return model_health(db, hours)
 
 
 def _window(days: int) -> datetime:
@@ -141,7 +148,10 @@ def usage_stats(
     key_names = {k.id: k.name for k in db.query(ApiKey).all()}
 
     # ── 趋势（按天/按小时分桶）──────────────────────────────────────────
-    if granularity == "hour":
+    if db.get_bind().dialect.name == "sqlite":
+        bucket = func.strftime("%Y-%m-%d %H:00" if granularity == "hour" else "%Y-%m-%d",
+                               UsageLog.created_at)
+    elif granularity == "hour":
         bucket = func.date_format(UsageLog.created_at, "%Y-%m-%d %H:00")
     else:
         bucket = func.date_format(UsageLog.created_at, "%Y-%m-%d")

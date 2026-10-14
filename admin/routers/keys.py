@@ -4,10 +4,12 @@ import secrets
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from admin.account_binding import validate_binding
 from admin.db import get_db
-from admin.models import ApiKey, ModelGroup
+from admin.models import Account, ApiKey, ModelGroup
 from admin.security import hash_key, require_admin
 
 router = APIRouter(prefix="/api/keys", tags=["keys"])
@@ -19,6 +21,9 @@ class KeyIn(BaseModel):
     unlimited: bool = False
     note: str = ""
     group_id: int = 0  # 0 = 不绑定分组（可用全部启用模型）
+    account_id: int | None = None  # 0 / NULL = 公共池
+    # 该 Key 并发上限：None=跟随全局；0=不限；N=最多 N 路在途
+    max_concurrent: int | None = None
 
 
 def _gen_key() -> str:
@@ -46,6 +51,7 @@ def _decode_key(encoded: str) -> str:
 def list_keys(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
     rows = db.query(ApiKey).order_by(ApiKey.id.desc()).all()
     group_names = {g.id: g.name for g in db.query(ModelGroup).all()}
+    account_names = {a.id: a.name or a.uid for a in db.query(Account).all()}
     items = [
         {
             "id": k.id,
@@ -55,15 +61,29 @@ def list_keys(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
             "credit_limit": k.credit_limit,
             "credit_used": k.credit_used,
             "unlimited": bool(k.unlimited),
+            "max_concurrent": k.max_concurrent,
             "status": k.status,
             "note": k.note,
             "group_id": int(k.group_id or 0),
             "group_name": group_names.get(int(k.group_id or 0), ""),
+            "account_id": k.account_id,
+            "account_name": account_names.get(k.account_id, ""),
             "created_at": k.created_at.isoformat() if k.created_at else None,
         }
         for k in rows
     ]
     return {"items": items}
+
+
+def _normalize_max_concurrent(value) -> int | None:
+    """规范化并发上限：None=跟随全局；0=不限；N>=1=最多 N 路。非法值回退 None。"""
+    if value is None or value == "":
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
 
 
 def _validate_group(db: Session, group_id: int) -> int:
@@ -78,6 +98,7 @@ def _validate_group(db: Session, group_id: int) -> int:
 def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
     raw = _gen_key()
     gid = _validate_group(db, body.group_id)
+    aid = validate_binding(db, body.account_id)
     k = ApiKey(
         name=body.name or "未命名",
         key_hash=hash_key(raw),
@@ -85,11 +106,13 @@ def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depe
         key_full=_encode_key(raw),
         credit_limit=body.credit_limit,
         unlimited=1 if body.unlimited else 0,
+        max_concurrent=_normalize_max_concurrent(body.max_concurrent),
         note=body.note,
         group_id=gid,
+        account_id=aid,
     )
     db.add(k)
-    db.commit()
+    _commit_key(db)
     db.refresh(k)
     # 明文 key 仅此返回一次
     return {
@@ -99,7 +122,9 @@ def create_key(body: KeyIn, _: bool = Depends(require_admin), db: Session = Depe
         "key_prefix": k.key_prefix,
         "credit_limit": k.credit_limit,
         "unlimited": bool(k.unlimited),
+        "max_concurrent": k.max_concurrent,
         "group_id": int(k.group_id or 0),
+        "account_id": k.account_id,
     }
 
 
@@ -146,12 +171,16 @@ def patch_key(key_id: int, body: dict, _: bool = Depends(require_admin), db: Ses
     k = db.query(ApiKey).filter(ApiKey.id == key_id).first()
     if not k:
         raise HTTPException(status_code=404, detail="Key 不存在")
+    if "account_id" in body:
+        k.account_id = validate_binding(db, body["account_id"], key_id)
     if "name" in body:
         k.name = body["name"]
     if "credit_limit" in body:
         k.credit_limit = float(body["credit_limit"])
     if "unlimited" in body:
         k.unlimited = 1 if body["unlimited"] else 0
+    if "max_concurrent" in body:
+        k.max_concurrent = _normalize_max_concurrent(body["max_concurrent"])
     if "status" in body and body["status"] in ("active", "revoked"):
         k.status = body["status"]
     if "note" in body:
@@ -160,8 +189,16 @@ def patch_key(key_id: int, body: dict, _: bool = Depends(require_admin), db: Ses
         k.group_id = _validate_group(db, body["group_id"])
     if body.get("reset_used"):
         k.credit_used = 0
-    db.commit()
+    _commit_key(db)
     return {"id": k.id, "ok": True}
+
+
+def _commit_key(db):
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "该账号已被其他 API Key 独占绑定，请刷新后重试") from None
 
 
 @router.delete("/{key_id}")
