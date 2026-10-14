@@ -68,6 +68,8 @@ test/
 # 属于本地工具而非产品代码，一律不上传。
 # scripts/daemon.ps1 是部署脚本，保留。
 scripts/*.py
+# run_daemon.ps1 含本机部署凭据（DB/JWT/密码/API Key），**绝不能提交**。
+scripts/run_daemon.ps1
 
 # ===== 强制保留（即便以点开头也要提交） =====
 !.gitignore
