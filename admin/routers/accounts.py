@@ -51,6 +51,53 @@ def _uid_of(auth_json: str) -> str:
         return ""
 
 
+def _encrypted_cred_error(auth_json: str) -> str | None:
+    """凭据被桌面端加密时返回给用户看的错误文案，否则 None。
+
+    为什么必须在**入库前**拦住：加密的 token 是 dict，`parse_auth_meta()` 会把
+    它 str() 成一长串 `{'$wbEncrypted': 1, ...}` 当昵称，而 uid 仍是明文，
+    所以 `db.add()` 照样成功、余额刷新失败也不会回滚 —— 结果池里多一个
+    状态为 active 但永远 401 的号，被轮询到就可能触发熔断。
+    （导入路径的 `_refresh_balance()` 失败只记 errors，记录已经 commit 了。）
+    """
+    try:
+        data = json.loads(auth_json)
+    except Exception:
+        return None      # 非法 JSON 交给调用方的既有分支处理
+    if isinstance(data, dict) and _is_encrypted_cred(data):
+        return ("该凭据已被桌面端加密（$wbEncrypted / AES-256-GCM），本项目无法解密，"
+                "导入后也无法使用。桌面端自 2026-09-25 起启用该保护；"
+                "请改用加密之前产生的明文 .info。")
+    return None
+
+
+def _is_encrypted_cred(data) -> bool:
+    """这份 .info 的 token 是否被加密。与 converter.credential_is_encrypted 同语义。
+
+    这里不 import converter 的同名函数：accounts 路由只需要这个纯判定，
+    而 converter 的命令行依赖（uvicorn 等）不该被后台的导入路径拖进来。
+    """
+    if not isinstance(data, dict):
+        return False
+    auth = data.get("auth") or {}
+    for k in ("accessToken", "refreshToken"):
+        v = auth.get(k)
+        if isinstance(v, dict) and v.get("$wbEncrypted") == 1:
+            return True
+    return False
+
+
+def _display_nickname(meta_nick: str) -> str:
+    """昵称可用于展示时返回它，否则返回空串。
+
+    只负责过滤字面量 "null"/"none" 这类无意义值 —— 加密后的昵称在
+    `backend.parse_auth_meta()` 里就已经被拦成空串了（见该函数说明），
+    所以这里不会拿到 `{'$wbEncrypted': ...}` 的字面量。
+    """
+    s = (meta_nick or "").strip()
+    return "" if s.lower() in ("null", "none") else s
+
+
 def _existing_uid_index(db: Session) -> dict[str, Account]:
     """uid -> 已存在的账号记录（同 uid 有多条时保留 id 最小的那条）。
 
@@ -201,6 +248,9 @@ def add_account(body: AccountIn, _: bool = Depends(require_admin), db: Session =
         json.loads(body.auth_json)
     except Exception:
         raise HTTPException(status_code=400, detail="auth_json 不是合法 JSON")
+    enc = _encrypted_cred_error(body.auth_json)
+    if enc:
+        raise HTTPException(status_code=400, detail=enc)
     # 按 uid 去重：同一个人重复添加只会产生垃圾记录，
     # 而且会让批量任务对同一个号跑多次（白等、看起来像卡住）
     dup = _find_dup(db, body.auth_json)
@@ -233,6 +283,10 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
             json.loads(it.auth_json)
         except Exception:
             errors.append("跳过一条：auth_json 非法 JSON")
+            continue
+        enc = _encrypted_cred_error(it.auth_json)
+        if enc:
+            errors.append(f"跳过一条：{enc}")
             continue
         uid = _uid_of(it.auth_json)
         if uid and uid in seen:
@@ -323,6 +377,15 @@ def scan_local(_: bool = Depends(require_admin)):
             pass
     items = []
     seen_uids = set()  # 按 uid 去重
+    # 先收集全部候选，再按「可用性优先」排序后去重。
+    #
+    # 为什么不边扫边去重：同一 uid 可能同时存在明文与**加密**文件
+    # （桌面端加密后，旧明文文件仍留在原目录）。谁先被看到取决于文件名的
+    # 字典序，而 `workbuddy-desktop.info` 恰好排在所有时间戳文件**之后**，
+    # 于是「实时登录文件优先」这个注释里的意图其实没生效 —— 被保留的是最旧
+    # 的那个文件。加密与明文混在一起时，这个顺序直接决定列表里显示的是
+    # 「能导入的」还是「显示已加密、点不了导入」的那份，所以要显式排序。
+    cands: list[dict] = []
     for f in sorted(glob.glob(os.path.join(d, "*.info"))):
         base = os.path.basename(f)
         if base.endswith(".bak") or ".bak-" in base:
@@ -332,11 +395,6 @@ def scan_local(_: bool = Depends(require_admin)):
         except Exception:
             continue
         meta = backend.parse_auth_meta(json.dumps(data))
-        uid = meta.get("uid") or ""
-        # 同 uid 只保留一份（优先保留无时间戳后缀的"实时登录"文件）
-        if uid in seen_uids:
-            continue
-        seen_uids.add(uid)
         # 提取 token 到期时间
         auth = data.get("auth") or {}
         expires_at = auth.get("expiresAt") or 0
@@ -346,18 +404,31 @@ def scan_local(_: bool = Depends(require_admin)):
                 expires_str = datetime.fromtimestamp(expires_at / 1000).strftime("%Y-%m-%d %H:%M:%S")
             except (OSError, ValueError):
                 expires_str = str(expires_at)
-        # 提取昵称：过滤字面量 "null" 字符串
-        raw_nick = meta.get("nickname") or ""
-        nickname = raw_nick if raw_nick.strip().lower() not in ("null", "", "none") else ""
-        items.append({
+        cands.append({
             "file": base,
-            "uid": uid,
-            "nickname": nickname,
+            "uid": meta.get("uid") or "",
+            # 提取昵称：过滤字面量 "null" 字符串；加密昵称已被 parse_auth_meta 拦空
+            "nickname": _display_nickname(meta.get("nickname")),
             "domain": meta.get("domain") or "",
-            "is_active": (uid == active_uid),
             "expires_at": expires_str,
             "expires_ts": expires_at,
+            # 加密的凭据导进来也用不了（AES-256-GCM，密钥在原生模块里），
+            # 标出来让前端禁用「导入」按钮，别让用户点了才发现。
+            "encrypted": _is_encrypted_cred(data),
+            # 实时登录文件（无时间戳后缀）
+            "_live": 0 if base == "workbuddy-desktop.info" else 1,
         })
+
+    # 优先级：明文 > 加密；实时登录文件 > 时间戳快照；token 到期更晚 > 更早。
+    cands.sort(key=lambda c: (c["encrypted"], c["_live"], -c["expires_ts"], c["file"]))
+    for c in cands:
+        uid = c["uid"]
+        if uid in seen_uids:
+            continue
+        seen_uids.add(uid)
+        c.pop("_live", None)
+        c["is_active"] = (uid == active_uid)
+        items.append(c)
     return {"dir": d, "exists": True, "active_uid": active_uid, "items": items}
 
 
@@ -387,6 +458,9 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
             json.loads(auth)
         except Exception:
             errors.append(f"{name}: 读取/解析失败")
+            continue
+        if _is_encrypted_cred(json.loads(auth)):
+            errors.append(f"{name}: 凭据已被桌面端加密（$wbEncrypted），无法导入")
             continue
         meta = backend.parse_auth_meta(auth)
         uid = meta.get("uid")

@@ -1680,6 +1680,10 @@ async function scanLocal(){
   const scanUids = new Set((d.items||[]).map(it=>it.uid));
   const onlyInPool = [...poolUids].filter(u => u && !scanUids.has(u));
   const notePool = onlyInPool.length ? `<div class="mt-3 text-[11px] text-amber-700 bg-amber-50 rounded-lg px-3 py-2 border border-amber-100">提示：号池中还有 ${onlyInPool.length} 个账号（如 ${esc(onlyInPool.slice(0,3).join("、"))}${onlyInPool.length>3?' 等':''}）本机登录目录里找不到对应 .info 文件——它们通常是其它设备导入或登录态已清理，不会出现在下方扫描列表，属于正常情况。</div>` : "";
+  // 桌面端 2026-09-25 起把 .info 里的 token 加密（$wbEncrypted / AES-256-GCM），
+  // 密钥在原生模块内，本项目无法解密 —— 这类文件标了「已加密」且不能导入。
+  const encCount = (d.items||[]).filter(it=>it.encrypted).length;
+  const noteEnc = encCount ? `<div class="mt-3 text-[11px] text-slate-600 bg-slate-50 rounded-lg px-3 py-2 border border-slate-200">说明：${encCount} 个文件里的 token <b>已被桌面端加密</b>（<code>$wbEncrypted</code>，AES-256-GCM），本项目无法解密，故标记「已加密」且不可导入。<br>号池（<code>/v1/*</code>）使用数据库里保存的凭据，<b>不受影响</b>；只有 <code>/gw/v1/*</code> 依赖桌面端登录态，会因此不可用。加密之前产生的旧 .info 仍是明文，可以照常导入。</div>` : "";
   const scanTotal = (d.items||[]).length;
   const currentCount = (d.items||[]).filter(it=>it.is_active).length;
   const poolExisting = (d.items||[]).filter(it=>poolUids.has(it.uid)).length;
@@ -1696,6 +1700,8 @@ async function scanLocal(){
 
   const desktopRows = (d.items||[]).map(it => {
     const inPool = poolUids.has(it.uid);
+    // 加密的凭据导进来也用不了（密钥在原生模块里），直接禁用按钮
+    const blocked = inPool || it.encrypted;
     const shortUid = (it.uid||"").length > 12 ? it.uid.slice(0,8)+"..."+it.uid.slice(-4) : (it.uid||"-");
     const fileName = it.file ? it.file.replace(/^.*[\\\\/]/,'') : "-";
     const { expired, label } = makeExpLabel(it);
@@ -1716,7 +1722,8 @@ async function scanLocal(){
         <div class="flex flex-wrap items-center justify-end gap-1.5">
           ${it.is_active?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-emerald-100 text-emerald-700">当前</span>':''}
           ${inPool?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-indigo-100 text-indigo-700">号池已有</span>':''}
-          <button onclick="importOne('${encodeURIComponent(it.file)}')" ${inPool?'disabled':''} class="${inPool?'text-slate-300 cursor-not-allowed border-slate-100 bg-slate-50':'text-indigo-600 hover:text-indigo-800 border-indigo-100 hover:bg-indigo-50'} text-xs font-medium px-2 py-1 rounded border"><i class="fa-solid ${inPool?'fa-check':'fa-download'} mr-1"></i>${inPool?'已导入':'导入'}</button>
+          ${it.encrypted?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-amber-100 text-amber-700" title="桌面端已加密该文件里的 token，本项目无法解密，导入也用不了">已加密</span>':''}
+          <button onclick="importOne('${encodeURIComponent(it.file)}')" ${blocked?'disabled':''} class="${blocked?'text-slate-300 cursor-not-allowed border-slate-100 bg-slate-50':'text-indigo-600 hover:text-indigo-800 border-indigo-100 hover:bg-indigo-50'} text-xs font-medium px-2 py-1 rounded border"><i class="fa-solid ${inPool?'fa-check':'fa-download'} mr-1"></i>${inPool?'已导入':(it.encrypted?'不可用':'导入')}</button>
         </div>
       </td>
     </tr>`;
@@ -1724,6 +1731,7 @@ async function scanLocal(){
 
   const mobileCards = (d.items||[]).map(it => {
     const inPool = poolUids.has(it.uid);
+    const blocked = inPool || it.encrypted;
     const shortUid = (it.uid||"").length > 12 ? it.uid.slice(0,8)+"..."+it.uid.slice(-4) : (it.uid||"-");
     const fileName = it.file ? it.file.replace(/^.*[\\\\/]/,'') : "-";
     const { expired, label } = makeExpLabel(it);
@@ -1739,7 +1747,8 @@ async function scanLocal(){
           <div class="flex flex-wrap items-center gap-1.5 mt-2">
             ${it.is_active?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-emerald-100 text-emerald-700">当前</span>':''}
             ${inPool?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-indigo-100 text-indigo-700">号池已有</span>':''}
-            <button onclick="importOne('${encodeURIComponent(it.file)}')" ${inPool?'disabled':''} class="${inPool?'text-slate-300 cursor-not-allowed border-slate-100 bg-slate-50':'text-indigo-600 hover:text-indigo-800 border-indigo-100 hover:bg-indigo-50'} text-xs font-medium px-2 py-1 rounded border"><i class="fa-solid ${inPool?'fa-check':'fa-download'} mr-1"></i>${inPool?'已导入':'导入'}</button>
+            ${it.encrypted?'<span class="px-2 py-0.5 rounded-full text-[10px] bg-amber-100 text-amber-700">已加密</span>':''}
+            <button onclick="importOne('${encodeURIComponent(it.file)}')" ${blocked?'disabled':''} class="${blocked?'text-slate-300 cursor-not-allowed border-slate-100 bg-slate-50':'text-indigo-600 hover:text-indigo-800 border-indigo-100 hover:bg-indigo-50'} text-xs font-medium px-2 py-1 rounded border"><i class="fa-solid ${inPool?'fa-check':'fa-download'} mr-1"></i>${inPool?'已导入':(it.encrypted?'不可用':'导入')}</button>
           </div>
         </div>
       </div>
@@ -1768,7 +1777,7 @@ async function scanLocal(){
         </table>
       </div>
       <div class="md:hidden max-h-72 overflow-y-auto">${mobileCards}</div>
-    </div>${notePool}
+    </div>${noteEnc}${notePool}
     <div class="flex flex-col md:flex-row justify-between items-stretch md:items-center mt-4 pt-3 border-t border-slate-100 gap-3">
       <span class="text-xs text-slate-400">导入后自动用真实昵称命名，并刷新余额；已导入账号会被跳过。</span>
       <div class="flex gap-2 justify-end">

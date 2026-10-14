@@ -323,11 +323,35 @@ if _CONVERTER_EMBEDDED:
     _conv_cfg["api_key"] = os.getenv("CONVERTER_API_KEY", "")
 
     _log = logging.getLogger("admin.server")
+    if _conv_cfg.get("cred") is not None:
+        # 挑中的文件现在可能是「跳过加密文件后的那个」——不再等于固定的
+        # workbuddy-desktop.info，所以要打出来，否则排障时不知道在替谁发请求。
+        _cf = getattr(_conv_cfg["cred"], "path", None)
+        if _cf:
+            _log.info("/gw 使用桌面端凭据：%s", _cf)
+            if getattr(_cf, "name", "") != "workbuddy-desktop.info":
+                _log.warning(
+                    "/gw 未使用实时登录文件 workbuddy-desktop.info（它已被桌面端加密），"
+                    "而是回退到明文文件 %s —— 该文件的 token 可能较早、账号也可能不是"
+                    "当前登录的那个。若要固定使用某个明文文件，请用 CODEBUDDY_AUTH_DIR "
+                    "指向一个只放该文件的目录。", _cf.name,
+                )
     if _conv_cfg.get("cred") is None:
-        _log.warning(
-            "/gw 未取得桌面端登录凭据，/gw/v1/* 将返回 503。"
-            "请确认桌面端已登录，或用 CODEBUDDY_AUTH_DIR 指定 auth 目录。"
-        )
+        if _conv_cfg.get("cred_skip_reason") == "encrypted":
+            # 桌面端 2026-09-25 起加密了 .info 里的 token，纯 Python 解不开。
+            # 必须与「没登录」分开报，否则运维会一直去重登桌面端，白折腾。
+            _log.error(
+                "/gw 未取得可用的桌面端凭据：登录目录里的 .info 已被桌面端加密"
+                "（$wbEncrypted / AES-256-GCM），本项目无法解密 —— /gw/v1/* 将返回 503。"
+                "桌面端自 2026-09-25 起启用该保护，加密之前产生的旧 .info 仍是明文；"
+                "请把 CODEBUDDY_AUTH_DIR 指向一个只放明文 .info 的目录。"
+                "号池（/v1）使用库内凭据，不受影响。"
+            )
+        else:
+            _log.warning(
+                "/gw 未取得桌面端登录凭据，/gw/v1/* 将返回 503。"
+                "请确认桌面端已登录，或用 CODEBUDDY_AUTH_DIR 指定 auth 目录。"
+            )
 
     # ⚠️ fail-closed：没配 Key 就**不挂载** /gw，而不是挂上去裸奔。
     # 原来只打一条 warning 就照常 mount，等于「默认无鉴权」——

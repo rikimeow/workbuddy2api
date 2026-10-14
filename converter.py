@@ -207,17 +207,109 @@ def auth_dirs() -> list[Path]:
     return dirs
 
 
+# ---------------------------------------------------------------------------
+# 桌面端凭据加密（$wbEncrypted）识别
+#
+# WorkBuddy 桌面端 2026-09-25 起把 `.info` 里的敏感字段从明文字符串改成加密包装：
+#
+#     "accessToken": {"$wbEncrypted": 1, "envelope": "eyJzdWl0ZSI6MSwia2V5SWQi..."}
+#
+# envelope 解开是 `{suite, keyId, nonce, authTag, ciphertext}`，即 AES-256-GCM；
+# 密钥由原生模块派生（`electron.workbuddyStorage.loggerGet()` → turing_sdk.node
+# + TuringShieldSDK.dll，腾讯泰坦盾），**纯 Python 无法解密**。
+#
+# 旧代码不做任何判定，直接把 dict 拼进头里：
+#     Authorization: Bearer {'$wbEncrypted': 1, 'envelope': '...'}
+# 上游只回 401，日志里看不出原因 —— 这是此前最难受的排障盲区。所以这里统一
+# 「识别 + 明确拒绝」，绝不发出这种注定失败的请求。
+# ---------------------------------------------------------------------------
+
+def is_wb_encrypted(v) -> bool:
+    """该字段是否是桌面端的加密包装（`{$wbEncrypted: 1, envelope: ...}`）。"""
+    return isinstance(v, dict) and v.get("$wbEncrypted") == 1
+
+
+def credential_is_encrypted(data) -> bool:
+    """这份 .info 的 token 是否已被加密（加密后本项目无法使用）。"""
+    if not isinstance(data, dict):
+        return False
+    auth = data.get("auth") or {}
+    return (is_wb_encrypted(auth.get("accessToken"))
+            or is_wb_encrypted(auth.get("refreshToken")))
+
+
+def credential_file_encrypted(path) -> bool:
+    """读文件判断 token 是否被加密；读不了 / 解析失败一律返回 False。
+
+    返回 False 是有意的：解析失败不止「加密」一种原因，交给下游按原有逻辑报错，
+    避免把所有坏文件都误报成加密而带偏排障方向。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return credential_is_encrypted(json.load(f))
+    except Exception:
+        return False
+
+
+class CredentialEncryptedError(RuntimeError):
+    """凭据被桌面端加密，本项目无法解密。"""
+
+    def __init__(self, path=None):
+        msg = ("凭据已被桌面端加密（$wbEncrypted / AES-256-GCM），本项目无法解密。"
+               "桌面端自 2026-09-25 起启用该保护；加密之前的旧 .info 仍是明文、可直接使用。"
+               "要让 /gw 恢复可用，请把 CODEBUDDY_AUTH_DIR 指向一个只放明文 .info 的目录。")
+        if path:
+            msg = f"{msg} 文件：{path}"
+        super().__init__(msg)
+
+
 def find_auth_file() -> Path | None:
+    """定位一个**可用**（未被加密）的凭据文件；全都加密时返回 None。
+
+    候选顺序：实时登录文件（无时间戳后缀）→ 其余 .info 按修改时间新→旧。
+    按 mtime 而不是文件名排序，是因为历史文件都是「登录时刻的快照」，
+    最新的那个最可能仍然有效（token 未过期、refreshToken 未失效）。
+
+    遇到加密文件**跳过并继续找**，而不是拿它去发请求 —— 用了只会拼出注定 401 的
+    头（见上方说明）。跳过能让「桌面端刚升级、旧明文文件还在」的场景自动恢复；
+    真一个明文都没有时返回 None，并把原因记进 `CONFIG["cred_skip_reason"]`
+    （"encrypted"），由调用方给出 503 / 告警，而不是静默失败。
+    """
+    # 每次调用先清空，避免上一次的结论残留（例如先全加密、后来补了明文文件时，
+    # 若不清理，/health 会一直报「已加密」而这个说法已经不成立了）。
+    CONFIG["cred_skip_reason"] = ""
+    all_encrypted = False
     for d in auth_dirs():
         if not d.is_dir():
             continue
-        # 优先用桌面端实时登录文件（无时间戳后缀），避免被历史备份按字典序抢走
         live = d / "workbuddy-desktop.info"
+        cands: list[Path] = []
         if live.is_file():
-            return live
-        files = sorted(d.glob("*.info"))
-        if files:
-            return files[0]
+            cands.append(live)
+        others = [p for p in d.glob("*.info") if p != live]
+        try:
+            others.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            others.sort()
+        cands.extend(others)
+        if not cands:
+            continue
+
+        skipped: list[Path] = []
+        for p in cands:
+            if credential_file_encrypted(p):
+                skipped.append(p)
+                continue
+            if skipped:
+                _log(f"登录目录里有 {len(skipped)} 个凭据文件已被桌面端加密"
+                     f"（{', '.join(x.name for x in skipped)}），已跳过，"
+                     f"改用明文文件：{p.name}")
+            return p
+        if skipped:
+            all_encrypted = True
+            _log(f"登录目录 {d} 里的 .info 全部被桌面端加密（$wbEncrypted），"
+                 f"本项目无法解密，/gw 将不可用：{', '.join(x.name for x in skipped)}")
+    CONFIG["cred_skip_reason"] = "encrypted" if all_encrypted else ""
     return None
 
 
@@ -265,6 +357,10 @@ class CredentialManager:
         self._load_if_stale()
         if self._cached is None:
             raise RuntimeError(f"无法读取 auth 文件：{self.path}")
+        # 加密凭据在这里就拦下：拼进 header 只会得到上游 401，
+        # 而调用方看不到原因（见 is_wb_encrypted 的说明）。
+        if credential_is_encrypted(self._cached):
+            raise CredentialEncryptedError(self.path)
         return self._cached
 
     def _is_expired(self) -> bool:
@@ -557,7 +653,9 @@ app = FastAPI(title="codebuddy2openai", version="2.0",
               redoc_url="/redoc" if _ENABLE_DOCS else None,
               openapi_url="/openapi.json" if _ENABLE_DOCS else None)
 CONFIG: dict = {"api_key": "", "cred": None, "log_path": None,
-                "desensitize": False, "no_compact": False}  # cred: CredentialManager | None
+                "desensitize": False, "no_compact": False,
+                # "encrypted" = 登录目录里的 .info 全被桌面端加密（见 find_auth_file）
+                "cred_skip_reason": ""}  # cred: CredentialManager | None
 
 
 # ---------------------------------------------------------------------------
@@ -601,9 +699,23 @@ def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail={"error": {"message": "invalid api key", "type": "auth_error"}})
 
 
+_ENCRYPTED_CRED_MSG = (
+    "桌面端凭据已被加密（$wbEncrypted / AES-256-GCM），本项目无法解密。"
+    "桌面端自 2026-09-25 起启用该保护，因此 /gw 不可用；"
+    "把 CODEBUDDY_AUTH_DIR 指向只放明文 .info 的目录可恢复。"
+    "号池（/v1）不受影响，它用库里的凭据。"
+)
+
+
 def _cred() -> CredentialManager:
     if CONFIG["cred"] is None:
-        raise HTTPException(status_code=503, detail={"error": {"message": "未找到登录凭据，请先在桌面端登录 CodeBuddy/WorkBuddy", "type": "auth_error"}})
+        # 「全被加密」与「没登录」要分开说：两者的处置完全不同，
+        # 统一报「请先登录」会让人一直去登，而问题其实在加密上。
+        d = CONFIG.get("cred_skip_reason") or ""
+        msg = _ENCRYPTED_CRED_MSG if d == "encrypted" else \
+            "未找到登录凭据，请先在桌面端登录 CodeBuddy/WorkBuddy"
+        raise HTTPException(status_code=503,
+                            detail={"error": {"message": msg, "type": "auth_error"}})
     return CONFIG["cred"]
 
 
@@ -697,6 +809,7 @@ def health(authorization: Optional[str] = Header(default=None),
         "platform": sys.platform,
         "python": sys.version.split()[0],
         "credential_loaded": CONFIG["cred"] is not None,
+        "credential_issue": CONFIG.get("cred_skip_reason") or "",
         "mode": "direct-proxy (native function calling)",
     }
 
@@ -1564,7 +1677,17 @@ def preflight() -> bool:
         sys.stderr.write(f"已查目录  : {', '.join(str(d) for d in auth_dirs())}\n")
     ok = True
     if af is None:
-        sys.stderr.write("\n[警告] 未找到登录文件。请在桌面端完成登录（CodeBuddy/WorkBuddy）。\n")
+        if CONFIG.get("cred_skip_reason") == "encrypted":
+            # 与「没登录」区分开：这时桌面端**是**登录着的，再去登录也不会好，
+            # 唯一出路是喂一个明文 .info（见下面提示）。
+            sys.stderr.write(
+                "\n[警告] 登录目录里的凭据已被桌面端加密（$wbEncrypted / AES-256-GCM），"
+                "本项目无法解密 —— /gw 将返回 503。\n"
+                "        桌面端自 2026-09-25 起启用该保护；加密之前产生的旧 .info 仍是明文。\n"
+                "        恢复办法：把 CODEBUDDY_AUTH_DIR 指向一个只放明文 .info 的目录。\n"
+                "        注意：号池（/v1）不用这里的凭据，不受影响。\n")
+        else:
+            sys.stderr.write("\n[警告] 未找到登录文件。请在桌面端完成登录（CodeBuddy/WorkBuddy）。\n")
         ok = False
     else:
         try:

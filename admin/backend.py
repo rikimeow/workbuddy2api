@@ -198,18 +198,25 @@ def stable_device_id(uid: str, salt: str) -> str:
 
 
 def parse_auth_meta(auth_json: str) -> dict:
-    """从 .info 原文里抽取账号元信息（uid / enterpriseId / domain / 昵称）。"""
+    """从 .info 原文里抽取账号元信息（uid / enterpriseId / domain / 昵称）。
+
+    昵称只接受**字符串**：桌面端 2026-09-25 起把它换成加密包装
+    （`{"$wbEncrypted": 1, "envelope": ...}`），若照旧 `str()` 就会把这段
+    dict 字面量当成昵称存进号池 `name`，既没信息量又污染列表。
+    这里的 `isinstance` 判断是根因修复 —— 所有调用方（扫描/上传/导入）都受益。
+    """
     try:
         data = json.loads(auth_json)
     except Exception:
         return {}
     auth = data.get("auth") or {}
     acct = data.get("account") or {}
+    nick = acct.get("nickname")
     return {
         "uid": str(acct.get("uid") or ""),
         "enterprise_id": str(acct.get("enterpriseId") or ""),
         "domain": str(auth.get("domain") or ""),
-        "nickname": str(acct.get("nickname") or ""),
+        "nickname": nick if isinstance(nick, str) else "",
     }
 
 
